@@ -54,11 +54,14 @@ Integration with SwarmUI built-ins:
 
 | Operation | Time |
 |---|---|
-| Cold wake + model discovery (27 models) | ~15–40 s |
-| First generation after wake | ~64 s |
-| Warm generation (worker reused) | ~9 s |
+| Wake onto a FlashBoot-warm worker + model discovery (27 models) | ~15–40 s |
+| Fully cold worker (container start → Swarm serving → first image) | ~3–4 min |
+| First generation on an already-woken worker | ~64 s |
+| Warm generation (worker reused, model resident) | ~9 s |
 | Recovery from an invalidated remote session | ~9 s (session refreshed in place, no re-wake) |
 | Teardown to zero running workers / zero queued jobs | immediate on backend disable |
+
+A cold worker's proxy answers with **empty bodies** for the first few minutes — byte-identical to a dead worker. The backend retries, then waits it out rather than concluding the worker died, so a cold start costs one wake rather than a cascade of them.
 
 ## Development
 
