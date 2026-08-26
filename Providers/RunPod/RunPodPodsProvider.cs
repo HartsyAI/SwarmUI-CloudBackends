@@ -88,7 +88,7 @@ public class RunPodPodsProvider(string apiKey, string podId, int swarmPort) : IC
         };
     }
 
-    public Task StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
+    public Task<bool> StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
     {
         // Pods stay running on their own. We only ping SwarmUI to prevent session expiry.
         string workerUrl = worker.PublicUrl;
@@ -113,7 +113,8 @@ public class RunPodPodsProvider(string apiKey, string podId, int swarmPort) : IC
                 }
             }
         }, cancel);
-        return Task.CompletedTask;
+        // The pod is kept alive by a local ping loop, which is always started successfully.
+        return Task.FromResult(true);
     }
 
     public Task StopKeepaliveAsync()

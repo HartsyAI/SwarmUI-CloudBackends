@@ -67,15 +67,16 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     /// Outstanding jobs are cancelled only by <see cref="StopKeepaliveAsync"/>, where ending the worker
     /// is the desired outcome.
     /// </summary>
-    public async Task StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
+    public async Task<bool> StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
     {
         try
         {
             string jobId = await SubmitJobAsync(new JObject { ["action"] = "keepalive", ["duration"] = durationSeconds, ["interval"] = 30 }, cancel);
             _keepaliveJobIds[jobId] = 0;
             Logs.Debug($"[RunPodServerless] Keepalive job submitted: {jobId} (duration: {durationSeconds}s, outstanding: {_keepaliveJobIds.Count})");
+            return true;
         }
-        catch (Exception ex) { Logs.Warning($"[RunPodServerless] Failed to submit keepalive job (worker may scale down early): {ex.Message}"); }
+        catch (Exception ex) { Logs.Warning($"[RunPodServerless] Failed to submit keepalive job (worker may scale down early): {ex.Message}"); return false; }
     }
 
     public async Task StopKeepaliveAsync()

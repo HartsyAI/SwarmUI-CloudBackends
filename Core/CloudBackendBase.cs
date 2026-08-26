@@ -149,7 +149,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             }
             catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Remote session refresh failed ({ex.Message}), clearing worker state to force re-wake."); }
         }
-        await ClearWorkerStateAsync();
+        // Only clear if this same worker is still current: another request may have already recovered
+        // and published a live replacement while our GetNewSession was timing out against the dead one.
+        await ClearWorkerStateAsync(worker);
     }
 
     // ── SwarmUI backend lifecycle ─────────────────────────────────────────────
@@ -209,9 +211,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend
     {
         string name = Provider?.ProviderName ?? GetType().Name;
         Logs.Info($"[{name}] Backend {BackendData?.ID} shutting down...");
-        KeepaliveCts?.Cancel();
-        KeepaliveCts?.Dispose();
-        KeepaliveCts = null;
+        // Swap under the same lock GetOrWakeWorkerAsync uses: shutdown can land while other requests are
+        // still in flight (ShutdownBackendCleanly only drains down to MaxUsages), and disposing the CTS
+        // out from under them would throw ObjectDisposedException on .Token.
+        CancellationTokenSource oldCts;
+        await WorkerLock.WaitAsync(CancellationToken.None);
+        try { oldCts = KeepaliveCts; KeepaliveCts = null; }
+        finally { WorkerLock.Release(); }
+        oldCts?.Cancel();
+        oldCts?.Dispose();
         try { if (Provider is not null) await Provider.StopKeepaliveAsync(); }
         catch (Exception ex) { Logs.Verbose($"[{name}] StopKeepaliveAsync error: {ex.Message}"); }
         await ClearWorkerStateAsync();
@@ -257,46 +265,87 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     public async Task<CloudWorkerInfo> GetOrWakeWorkerAsync(int keepaliveDuration)
     {
-        await WorkerLock.WaitAsync();
+        await WorkerLock.WaitAsync(Program.GlobalProgramCancel);
         try
         {
             if (CurrentWorker is not null && DateTime.UtcNow < WorkerKeepaliveExpiry)
             {
                 int remaining = (int)(WorkerKeepaliveExpiry - DateTime.UtcNow).TotalSeconds;
-                Logs.Debug($"[{Provider.ProviderName}] Reusing worker {CurrentWorker.WorkerId} (expires in {remaining}s)");
+                Logs.Debug($"[{Provider?.ProviderName}] Reusing worker {CurrentWorker.WorkerId} (expires in {remaining}s)");
                 if (remaining < keepaliveDuration / 2)
                 {
                     // Extend by ADDING a keepalive, never by cancelling the running one: cancelling an
                     // in-progress job makes the provider terminate the worker executing it, which would
                     // kill the very worker we are trying to keep alive.
-                    Logs.Debug($"[{Provider.ProviderName}] Extending keepalive by {keepaliveDuration}s");
+                    Logs.Debug($"[{Provider?.ProviderName}] Extending keepalive by {keepaliveDuration}s");
                     KeepaliveCts ??= new CancellationTokenSource();
-                    _ = Provider.StartKeepaliveAsync(CurrentWorker, keepaliveDuration, KeepaliveCts.Token);
-                    WorkerKeepaliveExpiry = DateTime.UtcNow.AddSeconds(keepaliveDuration);
+                    // Queued keepalives ADD to the worker's life, so the expiry must accumulate too.
+                    // Resetting it to now+duration would make real worker life advance at twice wall-clock
+                    // (extend every duration/2, buy a full duration each time) - unbounded idle billing.
+                    if (await Provider.StartKeepaliveAsync(CurrentWorker, keepaliveDuration, KeepaliveCts.Token))
+                    {
+                        ExtendKeepaliveExpiry(keepaliveDuration);
+                    }
                 }
                 return CurrentWorker;
             }
-            Logs.Debug($"[{Provider.ProviderName}] Waking new worker (keepalive: {keepaliveDuration}s)");
+            Logs.Debug($"[{Provider?.ProviderName}] Waking new worker (keepalive: {keepaliveDuration}s)");
             // Cancel any stale keepalive BEFORE waking: a leftover blocking keepalive job would
             // queue-block the wakeup on the worker's single job slot (or spin up a second billed worker).
             KeepaliveCts?.Cancel();
             KeepaliveCts?.Dispose();
             KeepaliveCts = new CancellationTokenSource();
             try { await Provider.StopKeepaliveAsync(); }
-            catch (Exception ex) { Logs.Verbose($"[{Provider.ProviderName}] StopKeepalive before wake failed: {ex.Message}"); }
-            CurrentWorker = await Provider.WakeupWorkerAsync(BaseConfig.StartupTimeoutSec, BaseConfig.PollIntervalMs);
-            WorkerKeepaliveExpiry = DateTime.UtcNow.AddSeconds(keepaliveDuration);
-            _ = Provider.StartKeepaliveAsync(CurrentWorker, keepaliveDuration, KeepaliveCts.Token);
+            catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] StopKeepalive before wake failed: {ex.Message}"); }
+            CurrentWorker = await Provider.WakeupWorkerAsync(BaseConfig.StartupTimeoutSec, BaseConfig.PollIntervalMs, Program.GlobalProgramCancel);
+            // If keepalive could not be established, only trust the worker briefly - the provider will
+            // reap it on its idle timeout, and claiming a full keepalive window would strand every
+            // request in that window against a worker that is already gone.
+            bool alive = await Provider.StartKeepaliveAsync(CurrentWorker, keepaliveDuration, KeepaliveCts.Token);
+            WorkerKeepaliveExpiry = DateTime.UtcNow.AddSeconds(alive ? keepaliveDuration : 60);
             return CurrentWorker;
         }
         finally { WorkerLock.Release(); }
     }
 
-    public async Task ClearWorkerStateAsync()
+    /// <summary>Accumulates keepalive expiry from the later of 'now' and the existing expiry.</summary>
+    void ExtendKeepaliveExpiry(int keepaliveDuration)
     {
-        await WorkerLock.WaitAsync();
+        DateTime from = WorkerKeepaliveExpiry > DateTime.UtcNow ? WorkerKeepaliveExpiry : DateTime.UtcNow;
+        WorkerKeepaliveExpiry = from.AddSeconds(keepaliveDuration);
+    }
+
+    /// <summary>
+    /// Tops up the keepalive during a long wait (worker boot, model indexing) so the worker is not torn
+    /// down mid-operation. Only extends an existing worker - never wakes a replacement.
+    /// </summary>
+    public async Task RenewKeepaliveIfNeededAsync(CloudWorkerInfo worker, int keepaliveDuration)
+    {
+        await WorkerLock.WaitAsync(Program.GlobalProgramCancel);
         try
         {
+            if (!ReferenceEquals(CurrentWorker, worker) || DateTime.UtcNow < WorkerKeepaliveExpiry.AddSeconds(-90)) { return; }
+            Logs.Debug($"[{Provider?.ProviderName}] Renewing keepalive during long wait (+{keepaliveDuration}s)");
+            KeepaliveCts ??= new CancellationTokenSource();
+            if (await Provider.StartKeepaliveAsync(worker, keepaliveDuration, KeepaliveCts.Token))
+            {
+                ExtendKeepaliveExpiry(keepaliveDuration);
+            }
+        }
+        finally { WorkerLock.Release(); }
+    }
+
+    /// <summary>
+    /// Clears the cached worker. Pass <paramref name="expected"/> to only clear if that exact worker is
+    /// still current - otherwise a slow recovery path can wipe a worker another request just woke, which
+    /// then gets torn down by the next wake's keepalive cancel while it is mid-generation.
+    /// </summary>
+    public async Task ClearWorkerStateAsync(CloudWorkerInfo expected = null)
+    {
+        await WorkerLock.WaitAsync(Program.GlobalProgramCancel);
+        try
+        {
+            if (expected is not null && !ReferenceEquals(CurrentWorker, expected)) { return; }
             CurrentWorker = null;
             WorkerKeepaliveExpiry = DateTime.MinValue;
         }
@@ -321,6 +370,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             // refresh the remote session or wake a replacement worker.
             catch (SessionInvalidException) { throw; }
             catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Backend poll error (attempt {i + 1}): {ex.Message}"); }
+            // This wait can outlast the keepalive on a slow first boot - top it up rather than let the
+            // worker be reaped out from under the request we are waiting to serve.
+            await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
             await Task.Delay(pollMs);
         }
         Logs.Verbose($"[{Provider?.ProviderName}] Timed out waiting for worker backends; proceeding.");
@@ -409,7 +461,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                     catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] ListModels failed for '{subtype}': {ex.Message}"); }
                 })));
                 // Every subtype failed because the worker is gone - recover rather than re-polling a corpse.
-                if (workerDied && tempModels.IsEmpty()) { throw new SessionInvalidException(); }
+                // Any subtype lost to a dead worker means this listing is incomplete - recovering beats
+                // silently committing a partial model list as if the refresh had succeeded.
+                if (workerDied) { throw new SessionInvalidException(); }
                 int totalCount = tempModels.Values.Sum(l => l.Count);
                 if (totalCount > 0)
                 {
@@ -424,6 +478,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec)
                     throw new TimeoutException($"No models discovered on the worker within {maxWaitSec}s.");
                 AddLoadStatus("Waiting for Swarm to finish loading models on worker...");
+                await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
                 await Task.Delay(10_000);
             }
             catch (TimeoutException) { throw; }
@@ -462,12 +517,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         {
             CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
             await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
-            ClientWebSocket ws = await NetworkBackendUtils.ConnectWebsocket(worker.PublicUrl, "API/GenerateText2ImageWS", _ => { });
+            using ClientWebSocket ws = await NetworkBackendUtils.ConnectWebsocket(worker.PublicUrl.TrimEnd('/'), "API/GenerateText2ImageWS", _ => { });
             await ws.SendJson(BuildRequest(user_input, worker.SessionId), API.WebsocketTimeout);
+            bool interruptSent = false;
             while (true)
             {
-                if (user_input.InterruptToken.IsCancellationRequested)
+                if (user_input.InterruptToken.IsCancellationRequested && !interruptSent)
                 {
+                    // Send once: this loop runs per received message, and each InterruptAll carries a
+                    // 30s timeout, so re-sending would stall the drain until the socket finally closes.
+                    interruptSent = true;
                     try { await CallWorkerAPI(worker, "InterruptAll", new JObject { ["other_sessions"] = false }, 30); }
                     catch { /* best-effort */ }
                 }

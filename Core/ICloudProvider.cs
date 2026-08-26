@@ -28,7 +28,9 @@ public interface ICloudProvider : IDisposable
     /// Called after wakeup and again when the keepalive timer nears expiry.
     /// The <paramref name="cancel"/> token is cancelled by <see cref="StopKeepaliveAsync"/>.
     /// </summary>
-    Task StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default);
+    /// <returns>True if keepalive is actually established. False means the worker may be reaped early,
+    /// so the caller must not record a long keepalive expiry.</returns>
+    Task<bool> StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default);
 
     /// <summary>Stop keepalive jobs or background loops. Called on backend shutdown.</summary>
     Task StopKeepaliveAsync();

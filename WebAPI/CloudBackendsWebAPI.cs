@@ -24,8 +24,10 @@ public static class CloudBackendsWebAPI
     /// <summary>True if the session's user may act on this backend (each provider defines its own permission).</summary>
     static bool HasBackendPermission(CloudBackendBase backend, Session session)
     {
+        // Only a permission refusal means "not yours" - anything else is a real fault and must not be
+        // silently reported to the user as "no cloud backends are running".
         try { backend.CheckPermission(session); return true; }
-        catch (Exception) { return false; }
+        catch (SwarmReadableErrorException) { return false; }
     }
 
     /// <summary>Manually trigger a model refresh from workers for all running cloud backends the user may access.</summary>

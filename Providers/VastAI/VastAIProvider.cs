@@ -65,7 +65,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         throw new TimeoutException($"No Vast.ai worker available for '{endpointName}' within {maxWaitSeconds}s");
     }
 
-    public Task StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
+    public Task<bool> StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
     {
         string workerUrl = worker.PublicUrl;
         _ = Task.Run(async () =>
@@ -88,7 +88,8 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
                 }
             }
         }, cancel);
-        return Task.CompletedTask;
+        // Kept alive by a local ping loop, which is always started successfully.
+        return Task.FromResult(true);
     }
 
     public Task StopKeepaliveAsync()

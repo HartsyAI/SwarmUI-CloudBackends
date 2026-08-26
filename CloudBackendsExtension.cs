@@ -148,12 +148,16 @@ public class CloudBackendsExtension : Extension
                 if (m is T2IModel tm) { requestedModel = tm.Name; }
                 else if (m is string ms) { requestedModel = ms; }
                 if (string.IsNullOrWhiteSpace(requestedModel)) return;
+                string bareName = requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
+                    ? requestedModel[..^".safetensors".Length] : requestedModel;
+                // Never divert a model the user already has locally onto a paid cloud GPU - the worker's
+                // volume usually holds the same checkpoints, so this would silently bill for every gen.
+                if (Program.MainSDModels.Models.ContainsKey(requestedModel) || Program.MainSDModels.Models.ContainsKey(bareName)) return;
                 foreach (T b in Program.Backends.RunningBackendsOfType<T>())
                 {
                     var rem = b.RemoteModels;
                     if (rem is null) continue;
-                    string bare = requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
-                        ? requestedModel[..^".safetensors".Length] : requestedModel;
+                    string bare = bareName;
                     bool found = rem.Values.Any(dict =>
                         dict.ContainsKey(requestedModel) || dict.ContainsKey(bare)
                         || dict.Keys.Any(k => k.Equals(requestedModel.AfterLast('/'), StringComparison.OrdinalIgnoreCase))
