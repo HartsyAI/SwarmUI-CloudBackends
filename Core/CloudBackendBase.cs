@@ -79,7 +79,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
     protected abstract string GetApiKey(Session session);
 
     /// <summary>Throw <see cref="SwarmReadableErrorException"/> if the session user lacks permission.</summary>
-    protected abstract void CheckPermission(Session session);
+    public abstract void CheckPermission(Session session);
 
     // ── Session-invalid exception ─────────────────────────────────────────────
 
@@ -95,26 +95,51 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     public async Task RunWithSession(Func<Task> run)
     {
-        try { await run(); }
-        catch (SessionInvalidException)
-        {
-            Logs.Verbose($"[{Provider?.ProviderName}] Session invalid for backend {BackendData?.ID}, recreating...");
-            Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
-            await ClearWorkerStateAsync();
-            await RunWithSession(run);
-        }
+        await RunWithSession(async () => { await run(); return true; });
     }
 
     public async Task<T> RunWithSession<T>(Func<Task<T>> run)
     {
-        try { return await run(); }
-        catch (SessionInvalidException)
+        for (int attempt = 0; ; attempt++)
         {
-            Logs.Verbose($"[{Provider?.ProviderName}] Session invalid for backend {BackendData?.ID}, recreating...");
-            Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
-            await ClearWorkerStateAsync();
-            return await RunWithSession(run);
+            try { return await run(); }
+            catch (SessionInvalidException)
+            {
+                if (attempt >= 2)
+                {
+                    throw new SwarmReadableErrorException($"Remote worker session could not be recovered after {attempt + 1} attempts.");
+                }
+                Logs.Verbose($"[{Provider?.ProviderName}] Remote session invalid for backend {BackendData?.ID}, recovering (attempt {attempt + 1})...");
+                await TryRecoverRemoteSessionAsync();
+            }
         }
+    }
+
+    /// <summary>
+    /// Refreshes the remote worker's session in place (the worker handler caches its session and never revalidates it,
+    /// so a fresh GetNewSession against the worker is the only correct recovery). If the worker is unreachable,
+    /// clears worker state so the next attempt wakes a fresh worker.
+    /// </summary>
+    public async Task TryRecoverRemoteSessionAsync()
+    {
+        CloudWorkerInfo worker = CurrentWorker;
+        if (worker is not null)
+        {
+            try
+            {
+                using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(30));
+                JObject resp = await HttpClient.PostJson($"{worker.PublicUrl.TrimEnd('/')}/API/GetNewSession", [], null, cancel.Token);
+                string newSession = resp["session_id"]?.ToString();
+                if (!string.IsNullOrWhiteSpace(newSession))
+                {
+                    worker.SessionId = newSession;
+                    Logs.Verbose($"[{Provider?.ProviderName}] Remote session refreshed in place for worker {worker.WorkerId}.");
+                    return;
+                }
+            }
+            catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Remote session refresh failed ({ex.Message}), clearing worker state to force re-wake."); }
+        }
+        await ClearWorkerStateAsync();
     }
 
     // ── SwarmUI backend lifecycle ─────────────────────────────────────────────
@@ -139,6 +164,18 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         }
         Provider = CreateProvider(apiKey);
         Logs.Verbose($"[{Provider.ProviderName}] Backend #{BackendData?.ID} provider created. Endpoint: {BaseConfig.EndpointId}");
+        try
+        {
+            AddLoadStatus($"Validating {Provider.ProviderName} credentials and endpoint...");
+            using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(30));
+            await Provider.ValidateAsync(cancel.Token);
+        }
+        catch (Exception ex)
+        {
+            Status = BackendStatus.ERRORED;
+            AddLoadStatus($"ERROR: {Provider.ProviderName} validation failed: {ex.Message}");
+            return;
+        }
         MaxUsages = Math.Max(1, BaseConfig.MaxConcurrent);
         Status = BackendStatus.RUNNING;
         CanLoadModels = true;
@@ -150,7 +187,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 try
                 {
                     AddLoadStatus("Refreshing models from worker (background)...");
-                    await RefreshModelsFromWorkerAsync(Session);
+                    await RefreshModelsFromWorkerAsync();
                     AddLoadStatus("Model refresh complete.");
                 }
                 catch (Exception ex) { AddLoadStatus($"Model refresh failed: {ex.Message}"); }
@@ -187,7 +224,21 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         body["session_id"] = worker.SessionId;
         string url = $"{worker.PublicUrl.TrimEnd('/')}/API/{apiPath.TrimStart('/')}";
         Logs.Verbose($"[{Provider?.ProviderName}] POST {url}");
-        JObject result = await HttpClient.PostJson(url, body);
+        JObject result;
+        using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds)));
+        try
+        {
+            result = await HttpClient.PostJson(url, body, null, cancel.Token);
+        }
+        catch (OperationCanceledException) when (!Program.GlobalProgramCancel.IsCancellationRequested)
+        {
+            throw new SwarmReadableErrorException($"Worker API call '{apiPath}' timed out after {timeoutSeconds}s.");
+        }
+        catch (Exception ex) when (ex is System.Net.Http.HttpRequestException or Newtonsoft.Json.JsonException)
+        {
+            Logs.Verbose($"[{Provider?.ProviderName}] Worker at {worker.PublicUrl} unreachable or returned non-JSON ({ex.Message}) - treating worker as dead.");
+            throw new SessionInvalidException();
+        }
         AutoThrowException(result);
         return result;
     }
@@ -215,11 +266,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 return CurrentWorker;
             }
             Logs.Debug($"[{Provider.ProviderName}] Waking new worker (keepalive: {keepaliveDuration}s)");
-            CurrentWorker = await Provider.WakeupWorkerAsync(BaseConfig.StartupTimeoutSec, BaseConfig.PollIntervalMs);
-            WorkerKeepaliveExpiry = DateTime.UtcNow.AddSeconds(keepaliveDuration);
+            // Cancel any stale keepalive BEFORE waking: a leftover blocking keepalive job would
+            // queue-block the wakeup on the worker's single job slot (or spin up a second billed worker).
             KeepaliveCts?.Cancel();
             KeepaliveCts?.Dispose();
             KeepaliveCts = new CancellationTokenSource();
+            try { await Provider.StopKeepaliveAsync(); }
+            catch (Exception ex) { Logs.Verbose($"[{Provider.ProviderName}] StopKeepalive before wake failed: {ex.Message}"); }
+            CurrentWorker = await Provider.WakeupWorkerAsync(BaseConfig.StartupTimeoutSec, BaseConfig.PollIntervalMs);
+            WorkerKeepaliveExpiry = DateTime.UtcNow.AddSeconds(keepaliveDuration);
             _ = Provider.StartKeepaliveAsync(CurrentWorker, keepaliveDuration, KeepaliveCts.Token);
             return CurrentWorker;
         }
@@ -293,7 +348,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         catch (Exception ex) { Logs.Debug($"[{Provider?.ProviderName}] LoadModel failed: {ex.Message}"); return false; }
     }
 
-    public async Task RefreshModelsFromWorkerAsync(Session session = null)
+    public async Task RefreshModelsFromWorkerAsync()
     {
         CloudWorkerInfo worker = await GetOrWakeWorkerAsync(180);
         int maxWaitSec = Math.Max(BaseConfig.StartupTimeoutSec, 120);
@@ -329,8 +384,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                     }
                     catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] ListModels failed for '{subtype}': {ex.Message}"); }
                 })));
-                int sdCount = tempModels.TryGetValue("Stable-Diffusion", out List<string> sdList) ? sdList.Count : 0;
-                if (sdCount > 0)
+                int totalCount = tempModels.Values.Sum(l => l.Count);
+                if (totalCount > 0)
                 {
                     RemoteModels ??= new();
                     Models ??= new();
@@ -341,7 +396,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                     return;
                 }
                 if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec)
-                    throw new TimeoutException($"No Stable-Diffusion models discovered within {maxWaitSec}s.");
+                    throw new TimeoutException($"No models discovered on the worker within {maxWaitSec}s.");
                 AddLoadStatus("Waiting for Swarm to finish loading models on worker...");
                 await Task.Delay(10_000);
             }
@@ -359,22 +414,27 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
-        CheckPermission(user_input.SourceSession);
-        CloudWorkerInfo worker = await GetOrWakeWorkerAsync(180);
-        await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
-        JObject resp = await CallWorkerAPI(worker, "GenerateText2Image", BuildRequest(user_input, worker.SessionId), BaseConfig.GenerationTimeoutSec);
-        Image[] images = ExtractImages(resp);
-        if (images.Length is 0) throw new Exception("No images returned from remote worker.");
-        return images;
+        if (user_input.SourceSession is not null) CheckPermission(user_input.SourceSession);
+        return await RunWithSession(async () =>
+        {
+            // Worker acquisition must live INSIDE the retried lambda: on session recovery the
+            // worker (URL + session) may have been replaced, and a stale capture would retry forever.
+            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(180);
+            await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
+            JObject resp = await CallWorkerAPI(worker, "GenerateText2Image", BuildRequest(user_input, worker.SessionId), BaseConfig.GenerationTimeoutSec);
+            Image[] images = ExtractImages(resp);
+            if (images.Length is 0) throw new SwarmReadableErrorException("No images returned from remote worker.");
+            return images;
+        });
     }
 
     public override async Task GenerateLive(T2IParamInput user_input, string batchId, Action<object> takeOutput)
     {
-        CheckPermission(user_input.SourceSession);
-        CloudWorkerInfo worker = await GetOrWakeWorkerAsync(300);
-        await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
+        if (user_input.SourceSession is not null) CheckPermission(user_input.SourceSession);
         await RunWithSession(async () =>
         {
+            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(300);
+            await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
             ClientWebSocket ws = await NetworkBackendUtils.ConnectWebsocket(worker.PublicUrl, "API/GenerateText2ImageWS", _ => { });
             await ws.SendJson(BuildRequest(user_input, worker.SessionId), API.WebsocketTimeout);
             while (true)

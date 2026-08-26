@@ -15,8 +15,6 @@ public class RunPodServerlessBackend : CloudBackendBase
 {
     public class Settings : BaseSettings
     {
-        [ConfigComment("Use async /run endpoint (recommended for most setups).")]
-        public bool UseAsync = true;
     }
 
     public override BaseSettings BaseConfig => (Settings)SettingsRaw;
@@ -34,8 +32,9 @@ public class RunPodServerlessBackend : CloudBackendBase
         return key;
     }
 
-    protected override void CheckPermission(Session session)
+    public override void CheckPermission(Session session)
     {
+        if (session?.User is null) return;
         if (!session.User.HasPermission(CloudBackendsExtension.PermUseRunPodServerless))
             throw new SwarmReadableErrorException("You do not have permission to use RunPod Serverless backends.");
     }

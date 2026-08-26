@@ -44,6 +44,11 @@ public class CloudBackendsExtension : Extension
         "Allows using Vast.ai's serverless GPU endpoints for image generation.",
         PermissionDefault.POWERUSERS, CloudPermGroup));
 
+    public static readonly PermInfo PermCloudStatus = Permissions.Register(new PermInfo(
+        "cloudbackends_status", "Cloud Backends Status/Refresh",
+        "Allows viewing status of, and refreshing models from, cloud GPU backends (each backend still requires its own provider permission).",
+        PermissionDefault.POWERUSERS, CloudPermGroup));
+
     // ── Extension lifecycle ───────────────────────────────────────────────────
 
     public override void OnPreInit()

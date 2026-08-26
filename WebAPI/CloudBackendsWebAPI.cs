@@ -14,27 +14,35 @@ public static class CloudBackendsWebAPI
 {
     public static void Register()
     {
-        API.RegisterAPICall(RefreshModels, true, CloudBackendsExtension.PermUseRunPodServerless);
-        API.RegisterAPICall(GetStatus, false, CloudBackendsExtension.PermUseRunPodServerless);
-        API.RegisterAPICall(StopPod, true, CloudBackendsExtension.PermUseRunPodPods);
-        Logs.Verbose("[CloudBackendsWebAPI] Registered API routes: RefreshModels, GetStatus, StopPod");
+        API.RegisterAPICall(CloudRefreshModels, true, CloudBackendsExtension.PermCloudStatus);
+        API.RegisterAPICall(CloudGetStatus, false, CloudBackendsExtension.PermCloudStatus);
+        API.RegisterAPICall(CloudStopPod, true, CloudBackendsExtension.PermUseRunPodPods);
+        API.RegisterAPICall(CloudDebugInvalidateSession, true, Permissions.EditBackends);
+        Logs.Verbose("[CloudBackendsWebAPI] Registered API routes: CloudRefreshModels, CloudGetStatus, CloudStopPod, CloudDebugInvalidateSession");
     }
 
-    /// <summary>Manually trigger a model refresh from workers for all running cloud backends.</summary>
-    public static async Task<JObject> RefreshModels(Session session)
+    /// <summary>True if the session's user may act on this backend (each provider defines its own permission).</summary>
+    static bool HasBackendPermission(CloudBackendBase backend, Session session)
+    {
+        try { backend.CheckPermission(session); return true; }
+        catch (Exception) { return false; }
+    }
+
+    /// <summary>Manually trigger a model refresh from workers for all running cloud backends the user may access.</summary>
+    public static async Task<JObject> CloudRefreshModels(Session session)
     {
         try
         {
-            CloudBackendBase[] backends = [.. Program.Backends.RunningBackendsOfType<CloudBackendBase>()];
+            CloudBackendBase[] backends = [.. Program.Backends.RunningBackendsOfType<CloudBackendBase>().Where(b => HasBackendPermission(b, session))];
             if (backends.Length is 0)
-                return new JObject { ["success"] = false, ["error"] = "No cloud backends are currently running." };
+                return new JObject { ["success"] = false, ["error"] = "No cloud backends are currently running (that you have permission for)." };
             int refreshed = 0, failed = 0;
             foreach (CloudBackendBase backend in backends)
             {
                 try
                 {
                     Logs.Debug($"[CloudBackends] Refreshing models for backend #{backend.BackendData?.ID} ({backend.Provider?.ProviderName})...");
-                    await backend.RefreshModelsFromWorkerAsync(session);
+                    await backend.RefreshModelsFromWorkerAsync();
                     refreshed++;
                 }
                 catch (Exception ex)
@@ -53,18 +61,18 @@ public static class CloudBackendsWebAPI
         }
         catch (Exception ex)
         {
-            Logs.Error($"[CloudBackends] Error in RefreshModels: {ex.ReadableString()}");
+            Logs.Error($"[CloudBackends] Error in CloudRefreshModels: {ex.ReadableString()}");
             return new JObject { ["success"] = false, ["error"] = ex.Message };
         }
     }
 
-    /// <summary>Get status for all running cloud backends across all providers.</summary>
-    public static async Task<JObject> GetStatus(Session session)
+    /// <summary>Get status for all running cloud backends the user may access, across all providers.</summary>
+    public static Task<JObject> CloudGetStatus(Session session)
     {
         try
         {
             JArray statuses = [];
-            foreach (CloudBackendBase backend in Program.Backends.RunningBackendsOfType<CloudBackendBase>())
+            foreach (CloudBackendBase backend in Program.Backends.RunningBackendsOfType<CloudBackendBase>().Where(b => HasBackendPermission(b, session)))
             {
                 statuses.Add(new JObject
                 {
@@ -80,12 +88,12 @@ public static class CloudBackendsWebAPI
                     ["auto_refresh"] = backend.BaseConfig.AutoRefresh
                 });
             }
-            return new JObject { ["success"] = true, ["backends"] = statuses, ["total"] = statuses.Count };
+            return Task.FromResult(new JObject { ["success"] = true, ["backends"] = statuses, ["total"] = statuses.Count });
         }
         catch (Exception ex)
         {
-            Logs.Error($"[CloudBackends] Error in GetStatus: {ex.ReadableString()}");
-            return new JObject { ["success"] = false, ["error"] = ex.Message };
+            Logs.Error($"[CloudBackends] Error in CloudGetStatus: {ex.ReadableString()}");
+            return Task.FromResult(new JObject { ["success"] = false, ["error"] = ex.Message });
         }
     }
 
@@ -93,7 +101,7 @@ public static class CloudBackendsWebAPI
     /// Stop a RunPod GPU pod by backend ID.
     /// The pod remains stopped until the next generation request resumes it.
     /// </summary>
-    public static async Task<JObject> StopPod(Session session, string backend_id)
+    public static async Task<JObject> CloudStopPod(Session session, string backend_id)
     {
         try
         {
@@ -111,8 +119,28 @@ public static class CloudBackendsWebAPI
         }
         catch (Exception ex)
         {
-            Logs.Error($"[CloudBackends] Error in StopPod: {ex.ReadableString()}");
+            Logs.Error($"[CloudBackends] Error in CloudStopPod: {ex.ReadableString()}");
             return new JObject { ["success"] = false, ["error"] = ex.Message };
         }
+    }
+
+    /// <summary>
+    /// Debug/testing hook: corrupts the cached remote worker session ID for a cloud backend,
+    /// so the session-recovery path can be exercised deterministically (remote sessions
+    /// otherwise last ~31 days). Admin-only; no effect on the worker itself.
+    /// </summary>
+    public static Task<JObject> CloudDebugInvalidateSession(Session session, string backend_id)
+    {
+        if (!int.TryParse(backend_id, out int id))
+            return Task.FromResult(new JObject { ["success"] = false, ["error"] = "Invalid backend_id." });
+        CloudBackendBase backend = Program.Backends.RunningBackendsOfType<CloudBackendBase>()
+            .FirstOrDefault(b => b.BackendData?.ID == id);
+        if (backend is null)
+            return Task.FromResult(new JObject { ["success"] = false, ["error"] = $"No running cloud backend found with ID {id}." });
+        if (backend.CurrentWorker is null)
+            return Task.FromResult(new JObject { ["success"] = false, ["error"] = "Backend has no active worker session to invalidate." });
+        backend.CurrentWorker.SessionId = "swarm_debug_invalidated_session";
+        Logs.Info($"[CloudBackends] Debug: invalidated worker session for backend #{id}.");
+        return Task.FromResult(new JObject { ["success"] = true, ["message"] = $"Worker session invalidated for backend #{id}." });
     }
 }

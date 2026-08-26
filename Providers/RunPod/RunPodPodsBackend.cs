@@ -62,8 +62,9 @@ public class RunPodPodsBackend : CloudBackendBase
         return key;
     }
 
-    protected override void CheckPermission(Session session)
+    public override void CheckPermission(Session session)
     {
+        if (session?.User is null) return;
         if (!session.User.HasPermission(CloudBackendsExtension.PermUseRunPodPods))
             throw new SwarmReadableErrorException("You do not have permission to use RunPod GPU Pod backends.");
     }

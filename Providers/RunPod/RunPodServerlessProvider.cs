@@ -30,11 +30,23 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     {
         string jobId = await SubmitJobAsync(new JObject { ["action"] = "wakeup" }, cancel);
         Logs.Info($"[RunPodServerless] Wakeup job {jobId} submitted. Waiting for worker (max {maxWaitSeconds}s)...");
-        JObject output = await WaitForJobAsync(jobId, Math.Clamp(pollIntervalMs, 1000, 10000), maxWaitSeconds, cancel);
+        JObject output;
+        try
+        {
+            output = await WaitForJobAsync(jobId, Math.Clamp(pollIntervalMs, 1000, 10000), maxWaitSeconds, cancel);
+        }
+        catch (Exception)
+        {
+            // Don't leave the wakeup job queued: it would wake (and bill) a worker later with nobody listening.
+            await CancelJobAsync(jobId);
+            throw;
+        }
+        if (output["success"]?.Value<bool>() is false)
+            throw new SwarmReadableErrorException($"Worker wakeup failed: {output["error"]}");
         string publicUrl = output["public_url"]?.ToString();
         string sessionId = output["session_id"]?.ToString();
         if (string.IsNullOrEmpty(publicUrl) || string.IsNullOrEmpty(sessionId))
-            throw new Exception($"Wakeup job completed but did not return public_url/session_id. Output: {output}");
+            throw new SwarmReadableErrorException($"Wakeup job completed but did not return public_url/session_id. Output: {output}");
         Logs.Info($"[RunPodServerless] Worker ready: {output["worker_id"]} at {publicUrl}");
         return new CloudWorkerInfo
         {
@@ -49,8 +61,16 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     {
         try
         {
+            // Cancel the previous keepalive FIRST: it's a blocking job occupying the worker's single
+            // job slot - leaving it running bills for the old duration AND queues the new job behind it.
+            string prev = Interlocked.Exchange(ref _keepaliveJobId, null);
+            if (prev is not null)
+            {
+                await CancelJobAsync(prev, cancel);
+            }
             string jobId = await SubmitJobAsync(new JObject { ["action"] = "keepalive", ["duration"] = durationSeconds, ["interval"] = 30 }, cancel);
-            _keepaliveJobId = jobId;
+            Interlocked.Exchange(ref _keepaliveJobId, jobId);
+            cancel.Register(() => _ = CancelJobAsync(Interlocked.Exchange(ref _keepaliveJobId, null)));
             Logs.Debug($"[RunPodServerless] Keepalive job submitted: {jobId} (duration: {durationSeconds}s)");
         }
         catch (Exception ex) { Logs.Warning($"[RunPodServerless] Failed to submit keepalive job (worker may scale down early): {ex.Message}"); }
@@ -58,17 +78,25 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
 
     public async Task StopKeepaliveAsync()
     {
-        if (!string.IsNullOrEmpty(_keepaliveJobId))
+        string jobId = Interlocked.Exchange(ref _keepaliveJobId, null);
+        if (!string.IsNullOrEmpty(jobId))
         {
-            Logs.Debug($"[RunPodServerless] Cancelling keepalive job {_keepaliveJobId}...");
-            await CancelJobAsync(_keepaliveJobId);
-            _keepaliveJobId = null;
+            Logs.Debug($"[RunPodServerless] Cancelling keepalive job {jobId}...");
+            await CancelJobAsync(jobId);
         }
     }
 
     public void Dispose()
     {
-        StopKeepaliveAsync().GetAwaiter().GetResult();
+        // Backend Shutdown() already awaited StopKeepaliveAsync; this is a best-effort backstop.
+        // Fire-and-forget instead of sync-over-async to avoid deadlock risk.
+        _ = CancelJobAsync(Interlocked.Exchange(ref _keepaliveJobId, null));
+    }
+
+    public async Task ValidateAsync(CancellationToken cancel = default)
+    {
+        JObject health = await GetHealthAsync(cancel);
+        Logs.Debug($"[RunPodServerless] Endpoint {endpointId} health: workers={health["workers"]?.ToString(Newtonsoft.Json.Formatting.None)}, jobs={health["jobs"]?.ToString(Newtonsoft.Json.Formatting.None)}");
     }
 
     // ── RunPod REST API helpers ───────────────────────────────────────────────
@@ -118,10 +146,27 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
                 lastStatus = status;
             }
             if (status is "COMPLETED") return result["output"] as JObject ?? new JObject();
-            if (status is "FAILED") throw new Exception($"RunPod job {jobId} failed: {result["error"]}");
+            if (status is "FAILED") throw new SwarmReadableErrorException($"RunPod job {jobId} failed: {result["error"]}");
+            if (status is "CANCELLED" or "TIMED_OUT") throw new SwarmReadableErrorException($"RunPod job {jobId} ended without completing: {status}");
             await Task.Delay(pollIntervalMs, cancel);
         }
         throw new TimeoutException($"RunPod job {jobId} did not complete within {timeoutSec}s");
+    }
+
+    /// <summary>GET /health for the endpoint. Throws readable errors on bad key (401) or unknown endpoint (404).</summary>
+    public async Task<JObject> GetHealthAsync(CancellationToken cancel = default)
+    {
+        string url = $"https://api.runpod.ai/v2/{endpointId}/health";
+        using HttpRequestMessage req = new(HttpMethod.Get, url);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        using HttpResponseMessage res = await Http.SendAsync(req, cancel);
+        if (res.StatusCode is System.Net.HttpStatusCode.Unauthorized)
+            throw new SwarmReadableErrorException("RunPod API key was rejected (401). Check your key in User Settings -> API Keys.");
+        if (res.StatusCode is System.Net.HttpStatusCode.NotFound)
+            throw new SwarmReadableErrorException($"RunPod endpoint '{endpointId}' not found (404). Check the EndpointId backend setting.");
+        if (!res.IsSuccessStatusCode)
+            throw new SwarmReadableErrorException($"RunPod /health for endpoint '{endpointId}' failed: {res.StatusCode}");
+        return JObject.Parse(await res.Content.ReadAsStringAsync(cancel));
     }
 
     /// <summary>Cancel a queued or running job. Best-effort — does not throw.</summary>

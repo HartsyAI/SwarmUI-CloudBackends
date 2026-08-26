@@ -1,5 +1,3 @@
-using Hartsy.Extensions.CloudBackends.Core;
-
 namespace Hartsy.Extensions.CloudBackends.Core;
 
 /// <summary>
@@ -34,4 +32,11 @@ public interface ICloudProvider : IDisposable
 
     /// <summary>Stop keepalive jobs or background loops. Called on backend shutdown.</summary>
     Task StopKeepaliveAsync();
+
+    /// <summary>
+    /// Cheap validation of credentials and endpoint reachability, called once at backend init.
+    /// Throw <see cref="SwarmUI.Utils.SwarmReadableErrorException"/> on bad key / missing endpoint.
+    /// Default: no validation.
+    /// </summary>
+    Task ValidateAsync(CancellationToken cancel = default) => Task.CompletedTask;
 }
