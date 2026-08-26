@@ -39,6 +39,7 @@ public static class CloudBackendsWebAPI
             if (backends.Length is 0)
                 return new JObject { ["success"] = false, ["error"] = "No cloud backends are currently running (that you have permission for)." };
             int refreshed = 0, failed = 0;
+            JArray errors = [];
             foreach (CloudBackendBase backend in backends)
             {
                 try
@@ -51,14 +52,23 @@ public static class CloudBackendsWebAPI
                 {
                     Logs.Error($"[CloudBackends] Refresh failed for backend #{backend.BackendData?.ID}: {ex.Message}");
                     failed++;
+                    // Carry the reason back to the caller - a bare failure count leaves the user with
+                    // nothing to act on, and this is usually a fixable worker misconfiguration.
+                    errors.Add(new JObject { ["backend_id"] = backend.BackendData?.ID, ["error"] = ex.Message });
                 }
+            }
+            string message = $"Refreshed {refreshed} cloud backend(s), {failed} failed.";
+            if (failed > 0)
+            {
+                message += "\n" + string.Join("\n", errors.Select(e => $"Backend #{e["backend_id"]}: {e["error"]}"));
             }
             return new JObject
             {
                 ["success"] = true,
                 ["refreshed"] = refreshed,
                 ["failed"] = failed,
-                ["message"] = $"Refreshed {refreshed} cloud backend(s), {failed} failed."
+                ["errors"] = errors,
+                ["message"] = message
             };
         }
         catch (Exception ex)
