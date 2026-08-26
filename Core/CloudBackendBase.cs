@@ -63,12 +63,22 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         [ConfigComment("Per-generation timeout (seconds).")]
         public int GenerationTimeoutSec = 300;
 
+        [ConfigComment("How long to keep a woken worker alive after each request (seconds).\nThis is what you pay for while idle, so lower is cheaper - but it MUST exceed your longest single generation, or the worker can be torn down mid-generation.\nAutomatically raised to at least the generation timeout plus two minutes.")]
+        public int KeepaliveSeconds = 420;
+
         [ConfigComment("Refresh available models from the worker on backend init (background).")]
         public bool AutoRefresh = false;
     }
 
     /// <summary>Returns the subclass's settings cast to <see cref="BaseSettings"/>.</summary>
     public abstract BaseSettings BaseConfig { get; }
+
+    /// <summary>
+    /// Seconds to keep a woken worker alive. Deliberately NOT tied to <c>StartupTimeoutSec</c> (a cold-boot
+    /// budget, often many minutes) - using that as a keepalive bills a fully idle GPU for that long after the
+    /// last request. Floored at the generation timeout plus a buffer so a worker is never torn down mid-generation.
+    /// </summary>
+    public int KeepaliveDuration => Math.Max(Math.Max(60, BaseConfig.KeepaliveSeconds), BaseConfig.GenerationTimeoutSec + 120);
 
     // ── Abstract hooks for subclasses ─────────────────────────────────────────
 
@@ -341,7 +351,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         {
             return await RunWithSession(async () =>
             {
-                CloudWorkerInfo worker = await GetOrWakeWorkerAsync(Math.Max(180, BaseConfig.StartupTimeoutSec));
+                CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
                 await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
                 string desired = model?.Name ?? GetModelFromInput(input);
                 if (string.IsNullOrWhiteSpace(desired)) return false;
@@ -362,7 +372,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     async Task<bool> RefreshModelsInner()
     {
-        CloudWorkerInfo worker = await GetOrWakeWorkerAsync(180);
+        CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
         int maxWaitSec = Math.Max(BaseConfig.StartupTimeoutSec, 120);
         DateTime start = DateTime.UtcNow;
         while (true)
@@ -436,7 +446,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         {
             // Worker acquisition must live INSIDE the retried lambda: on session recovery the
             // worker (URL + session) may have been replaced, and a stale capture would retry forever.
-            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(180);
+            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
             await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
             JObject resp = await CallWorkerAPI(worker, "GenerateText2Image", BuildRequest(user_input, worker.SessionId), BaseConfig.GenerationTimeoutSec);
             Image[] images = ExtractImages(resp);
@@ -450,7 +460,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         if (user_input.SourceSession is not null) CheckPermission(user_input.SourceSession);
         await RunWithSession(async () =>
         {
-            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(300);
+            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
             await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
             ClientWebSocket ws = await NetworkBackendUtils.ConnectWebsocket(worker.PublicUrl, "API/GenerateText2ImageWS", _ => { });
             await ws.SendJson(BuildRequest(user_input, worker.SessionId), API.WebsocketTimeout);
