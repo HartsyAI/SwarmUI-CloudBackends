@@ -374,22 +374,35 @@ public abstract class CloudBackendBase : AbstractT2IBackend
     {
         int pollMs = Math.Clamp(BaseConfig.PollIntervalMs, 500, 5000);
         int attempts = Math.Max(1, (timeoutSec * 1000) / pollMs);
-        bool everReachable = false;
+        bool everReachable = false, everSawBackend = false;
+        DateTime start = DateTime.UtcNow;
         for (int i = 0; i < attempts; i++)
         {
             try
             {
                 JObject data = await CallWorkerAPI(worker, "ListBackends", new JObject { ["nonreal"] = true, ["full_data"] = true });
                 everReachable = true;
-                bool anyLoading = data.Properties().Select(p => p.Value).OfType<JObject>()
-                    .Any(b => string.Equals(b["status"]?.ToString(), "loading", StringComparison.OrdinalIgnoreCase));
+                JObject[] remoteBackends = [.. data.Properties().Select(p => p.Value).OfType<JObject>()];
+                bool anyLoading = remoteBackends.Any(b => string.Equals(b["status"]?.ToString(), "loading", StringComparison.OrdinalIgnoreCase));
+                // A just-booted Swarm reports NO backends at all, and "none are loading" would read as
+                // "all ready" - so require at least one actually running backend before proceeding.
+                bool anyRunning = remoteBackends.Any(b => string.Equals(b["status"]?.ToString(), "running", StringComparison.OrdinalIgnoreCase));
+                everSawBackend |= remoteBackends.Length > 0;
                 UpdateFeaturesFromWorker(data);
-                if (!anyLoading) return;
+                if (anyRunning && !anyLoading) { return; }
+                // Swarm is up and answering but lists no backends at all: that is a worker configuration
+                // problem, not boot lag, so say so promptly instead of burning the full startup timeout.
+                if (!everSawBackend && (DateTime.UtcNow - start).TotalSeconds > 90)
+                {
+                    throw new SwarmReadableErrorException($"Cloud worker '{worker.WorkerId}' is running SwarmUI, but that SwarmUI has no backends configured, so it cannot generate anything. Open the worker's SwarmUI at {worker.PublicUrl} under Server -> Backends and add a backend (or rebuild the worker image with one).");
+                }
+                Logs.Verbose($"[{Provider?.ProviderName}] Worker Swarm has {remoteBackends.Length} backend(s), running={anyRunning}, loading={anyLoading} (poll {i + 1}/{attempts})...");
             }
             // This IS the readiness wait: a not-yet-reachable worker is the normal cold-start case, so keep
             // polling instead of declaring it dead on the first empty response. If it never answers within
             // the whole timeout, propagate so RunWithSession recovers rather than proceeding blindly.
             catch (SessionInvalidException) { Logs.Verbose($"[{Provider?.ProviderName}] Worker not reachable yet (poll {i + 1}/{attempts})..."); }
+            catch (SwarmReadableErrorException) { throw; }
             catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Backend poll error (attempt {i + 1}): {ex.Message}"); }
             // This wait can outlast the keepalive on a slow first boot - top it up rather than let the
             // worker be reaped out from under the request we are waiting to serve.
@@ -401,7 +414,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             Logs.Warning($"[{Provider?.ProviderName}] Worker {worker.WorkerId} never became reachable within {timeoutSec}s.");
             throw new SessionInvalidException();
         }
-        Logs.Verbose($"[{Provider?.ProviderName}] Timed out waiting for worker backends to finish loading; proceeding.");
+        throw new SwarmReadableErrorException($"Cloud worker '{worker.WorkerId}' did not bring up a usable backend within {timeoutSec}s. Check the worker's SwarmUI at {worker.PublicUrl} under Server -> Backends.");
     }
 
     public void UpdateFeaturesFromWorker(JObject backendData)
@@ -437,9 +450,13 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 {
                     if (await TrySelectModel(worker, candidate)) { CurrentModelName = candidate; return true; }
                 }
-                return false;
+                throw new SwarmReadableErrorException($"Cloud worker '{worker.WorkerId}' refused to load model '{desired}'. Check that this model exists on the worker and that the worker's backend supports it.");
             });
         }
+        // Readable reasons MUST propagate: BackendHandler only records a fail reason for the user when
+        // LoadModel throws (BackendHandler.cs:1405). Returning false discards it and the user is left
+        // with a bare "All available backends failed to load the model ''".
+        catch (SwarmReadableErrorException) { throw; }
         catch (Exception ex) { Logs.Debug($"[{Provider?.ProviderName}] LoadModel failed: {ex.Message}"); return false; }
     }
 
