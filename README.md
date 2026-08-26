@@ -1,0 +1,63 @@
+# SwarmUI-CloudBackends
+
+A modular [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI) extension that runs your generations on cloud GPUs, waking workers on demand and scaling them to zero when idle. One shared core, thin per-provider adapters — adding a new cloud provider means implementing a small interface, not rebuilding a backend.
+
+Supersedes the older single-provider extensions `SwarmUI-Runpod-Serverless-Backend` and `SwarmUI-Vast.AI-Serverless-Backend` (do not install those alongside this — they collide on backend types, permissions, and API keys).
+
+## Provider status
+
+| Provider | Backend type | Status |
+|---|---|---|
+| RunPod Serverless | `runpod_serverless` | ✅ Supported — live-tested end to end |
+| RunPod Pods | `runpod_pods` | ⚠️ Experimental, untested. Resumes an existing pod only (`AutoCreate` is not implemented) |
+| Vast.ai Serverless | `vastai_serverless` | ⚠️ Experimental, untested. Requires a Vast worker image built around `workers/vastai/vast_handler.py` |
+
+## Architecture
+
+```
+ICloudProvider            CloudBackendBase : AbstractT2IBackend
+  WakeupWorkerAsync   ─┐    lazily wakes the worker on first Generate,
+  StartKeepaliveAsync  ├──▶ then talks directly to the remote SwarmUI's
+  StopKeepaliveAsync  ─┘    own API (GetNewSession / ListModels /
+  ValidateAsync             GenerateText2Image / GenerateText2ImageWS)
+
+CloudWorkerInfo { PublicUrl, SessionId, WorkerId, Version }
+```
+
+The remote worker runs a **full SwarmUI instance** (which manages its own ComfyUI). Once a worker is awake, every provider looks identical: a remote SwarmUI reachable at `PublicUrl`. Providers only know how to wake a GPU and keep it alive.
+
+Integration with SwarmUI built-ins:
+- Backend types registered normally — configure under **Server → Backends** (enable *Show Advanced*).
+- API keys stored per-user under **User Settings → API Keys** (`runpod_api`, `vastai_api`).
+- Remote models merged into the model browser via `ExtraModelProviders`; generating with a cloud-only model auto-routes to the cloud backend.
+- Permissions: `use_runpod_serverless`, `use_runpod_pods`, `use_vastai`.
+
+## RunPod Serverless setup
+
+1. Deploy the worker: [RunPod-Worker-SwarmUI](https://github.com/HartsyAI/RunPod-Worker-SwarmUI) (Docker Hub `kalebbroo/swarmui-runpod:latest`). Endpoint requirements:
+   - Network volume mounted at `/runpod-volume` (SwarmUI + models install there on first boot)
+   - GPU ≥ 16 GB VRAM, container disk ~15 GB
+   - Idle timeout ~120 s, **execution timeout ≥ 3600 s** (must exceed the longest keepalive the extension submits), FlashBoot recommended
+2. In SwarmUI: **User Settings → API Keys** → set your RunPod key.
+3. **Server → Backends** → *Show Advanced* → add **RunPod Serverless**, set `EndpointId`.
+4. Enable the backend — init validates your key and endpoint via RunPod's `/health` before going live.
+
+### Notes & limitations
+
+- The API key is read once when the backend initializes. After changing your key, disable/re-enable the backend.
+- `AutoRefresh: true` wakes a paid GPU worker on every SwarmUI start to list models — leave it off unless you want that.
+- `GenerationTimeoutSec` above 600 is capped by the shared HTTP client's 10-minute ceiling.
+- Keepalive is a blocking job occupying the worker's single job slot; the extension cancels the previous keepalive before extending or waking so jobs never queue behind it.
+
+## Development
+
+Build: `dotnet build src/Extensions/SwarmUI-CloudBackends/SwarmUI-CloudBackends.csproj -c Release` (from a SwarmUI checkout with `src/bin/live_release/SwarmUI.dll` present), or just launch SwarmUI — extensions build at startup. When iterating in Release mode, SwarmUI caches the built extension DLL keyed to this repo's git HEAD; use the dev launch script or delete `src/bin/extensions/SwarmExtensionSwarmUI-CloudBackends/` after edits.
+
+Deferred follow-ups:
+- Worker handler: revalidate its cached SwarmUI session instead of returning it blindly (the extension compensates by refreshing the remote session in place on `invalid_session_id`).
+- Worker repo docs (`WORKFLOW.md`/`CLIENT.md`) still describe the old blocking-wakeup contract.
+- RunPod Pods `AutoCreate` (pod provisioning) and the Vast.ai path end-to-end.
+
+## License
+
+MIT
