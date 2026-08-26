@@ -256,10 +256,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 Logs.Debug($"[{Provider.ProviderName}] Reusing worker {CurrentWorker.WorkerId} (expires in {remaining}s)");
                 if (remaining < keepaliveDuration / 2)
                 {
+                    // Extend by ADDING a keepalive, never by cancelling the running one: cancelling an
+                    // in-progress job makes the provider terminate the worker executing it, which would
+                    // kill the very worker we are trying to keep alive.
                     Logs.Debug($"[{Provider.ProviderName}] Extending keepalive by {keepaliveDuration}s");
-                    KeepaliveCts?.Cancel();
-                    KeepaliveCts?.Dispose();
-                    KeepaliveCts = new CancellationTokenSource();
+                    KeepaliveCts ??= new CancellationTokenSource();
                     _ = Provider.StartKeepaliveAsync(CurrentWorker, keepaliveDuration, KeepaliveCts.Token);
                     WorkerKeepaliveExpiry = DateTime.UtcNow.AddSeconds(keepaliveDuration);
                 }
@@ -306,6 +307,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 UpdateFeaturesFromWorker(data);
                 if (!anyLoading) return;
             }
+            // A dead/invalid worker must NOT be retried here - propagate so RunWithSession can
+            // refresh the remote session or wake a replacement worker.
+            catch (SessionInvalidException) { throw; }
             catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Backend poll error (attempt {i + 1}): {ex.Message}"); }
             await Task.Delay(pollMs);
         }
@@ -335,20 +339,28 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         }
         try
         {
-            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(Math.Max(180, BaseConfig.StartupTimeoutSec));
-            await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
-            string desired = model?.Name ?? GetModelFromInput(input);
-            if (string.IsNullOrWhiteSpace(desired)) return false;
-            foreach (string candidate in ModelCandidates(desired))
+            return await RunWithSession(async () =>
             {
-                if (await TrySelectModel(worker, candidate)) { CurrentModelName = candidate; return true; }
-            }
-            return false;
+                CloudWorkerInfo worker = await GetOrWakeWorkerAsync(Math.Max(180, BaseConfig.StartupTimeoutSec));
+                await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
+                string desired = model?.Name ?? GetModelFromInput(input);
+                if (string.IsNullOrWhiteSpace(desired)) return false;
+                foreach (string candidate in ModelCandidates(desired))
+                {
+                    if (await TrySelectModel(worker, candidate)) { CurrentModelName = candidate; return true; }
+                }
+                return false;
+            });
         }
         catch (Exception ex) { Logs.Debug($"[{Provider?.ProviderName}] LoadModel failed: {ex.Message}"); return false; }
     }
 
     public async Task RefreshModelsFromWorkerAsync()
+    {
+        await RunWithSession(() => RefreshModelsInner());
+    }
+
+    async Task<bool> RefreshModelsInner()
     {
         CloudWorkerInfo worker = await GetOrWakeWorkerAsync(180);
         int maxWaitSec = Math.Max(BaseConfig.StartupTimeoutSec, 120);
@@ -359,6 +371,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             {
                 ConcurrentDictionary<string, List<string>> tempModels = new();
                 ConcurrentDictionary<string, Dictionary<string, JObject>> tempRemote = new();
+                bool workerDied = false;
                 await Task.WhenAll(Program.T2IModelSets.Keys.Select(subtype => Task.Run(async () =>
                 {
                     try
@@ -382,8 +395,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                         tempModels[subtype] = [.. meta.Keys];
                         tempRemote[subtype] = meta;
                     }
+                    catch (SessionInvalidException) { workerDied = true; }
                     catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] ListModels failed for '{subtype}': {ex.Message}"); }
                 })));
+                // Every subtype failed because the worker is gone - recover rather than re-polling a corpse.
+                if (workerDied && tempModels.IsEmpty()) { throw new SessionInvalidException(); }
                 int totalCount = tempModels.Values.Sum(l => l.Count);
                 if (totalCount > 0)
                 {
@@ -393,7 +409,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                     foreach (var kv in tempRemote) RemoteModels[kv.Key] = kv.Value;
                     Logs.Info($"[{Provider?.ProviderName}] Model refresh complete: {tempModels.Values.Sum(l => l.Count)} models across {tempModels.Count} subtypes.");
                     Program.ModelRefreshEvent?.Invoke();
-                    return;
+                    return true;
                 }
                 if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec)
                     throw new TimeoutException($"No models discovered on the worker within {maxWaitSec}s.");
@@ -401,6 +417,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 await Task.Delay(10_000);
             }
             catch (TimeoutException) { throw; }
+            catch (SessionInvalidException) { throw; }
             catch (Exception ex)
             {
                 if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec) throw;
@@ -533,6 +550,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             JObject resp = await CallWorkerAPI(worker, "SelectModel", new JObject { ["model"] = modelName }, 120);
             return resp.TryGetValue("success", out JToken s) && s.Value<bool>();
         }
+        // A dead worker is not "this model name was wrong" - let the caller recover instead of
+        // silently trying every remaining name candidate against a worker that no longer exists.
+        catch (SessionInvalidException) { throw; }
         catch { return false; }
     }
 }

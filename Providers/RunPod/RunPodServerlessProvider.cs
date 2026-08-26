@@ -19,7 +19,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
 {
     static readonly HttpClient Http = NetworkBackendUtils.MakeHttpClient();
 
-    string _keepaliveJobId = null;
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _keepaliveJobIds = new();
 
     public string ProviderName => "RunPod Serverless";
     public string ApiKeyType => "runpod_api";
@@ -57,32 +57,36 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         };
     }
 
+    /// <summary>
+    /// Submits an additional keepalive job. Keepalive jobs are blocking and run one at a time, so a
+    /// newly submitted job queues behind the running one and seamlessly extends the worker's life.
+    ///
+    /// Deliberately does NOT cancel the currently running keepalive: RunPod terminates the worker that
+    /// is executing a cancelled job, so "cancel old, submit new" kills the worker mid-session (observed
+    /// live: worker died ~13s after such a cancel, and every later call to its proxy URL returned empty).
+    /// Outstanding jobs are cancelled only by <see cref="StopKeepaliveAsync"/>, where ending the worker
+    /// is the desired outcome.
+    /// </summary>
     public async Task StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
     {
         try
         {
-            // Cancel the previous keepalive FIRST: it's a blocking job occupying the worker's single
-            // job slot - leaving it running bills for the old duration AND queues the new job behind it.
-            string prev = Interlocked.Exchange(ref _keepaliveJobId, null);
-            if (prev is not null)
-            {
-                await CancelJobAsync(prev, cancel);
-            }
             string jobId = await SubmitJobAsync(new JObject { ["action"] = "keepalive", ["duration"] = durationSeconds, ["interval"] = 30 }, cancel);
-            Interlocked.Exchange(ref _keepaliveJobId, jobId);
-            cancel.Register(() => _ = CancelJobAsync(Interlocked.Exchange(ref _keepaliveJobId, null)));
-            Logs.Debug($"[RunPodServerless] Keepalive job submitted: {jobId} (duration: {durationSeconds}s)");
+            _keepaliveJobIds[jobId] = 0;
+            Logs.Debug($"[RunPodServerless] Keepalive job submitted: {jobId} (duration: {durationSeconds}s, outstanding: {_keepaliveJobIds.Count})");
         }
         catch (Exception ex) { Logs.Warning($"[RunPodServerless] Failed to submit keepalive job (worker may scale down early): {ex.Message}"); }
     }
 
     public async Task StopKeepaliveAsync()
     {
-        string jobId = Interlocked.Exchange(ref _keepaliveJobId, null);
-        if (!string.IsNullOrEmpty(jobId))
+        foreach (string jobId in _keepaliveJobIds.Keys.ToArray())
         {
-            Logs.Debug($"[RunPodServerless] Cancelling keepalive job {jobId}...");
-            await CancelJobAsync(jobId);
+            if (_keepaliveJobIds.TryRemove(jobId, out _))
+            {
+                Logs.Debug($"[RunPodServerless] Cancelling keepalive job {jobId}...");
+                await CancelJobAsync(jobId);
+            }
         }
     }
 
@@ -90,7 +94,10 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     {
         // Backend Shutdown() already awaited StopKeepaliveAsync; this is a best-effort backstop.
         // Fire-and-forget instead of sync-over-async to avoid deadlock risk.
-        _ = CancelJobAsync(Interlocked.Exchange(ref _keepaliveJobId, null));
+        foreach (string jobId in _keepaliveJobIds.Keys.ToArray())
+        {
+            if (_keepaliveJobIds.TryRemove(jobId, out _)) { _ = CancelJobAsync(jobId); }
+        }
     }
 
     public async Task ValidateAsync(CancellationToken cancel = default)
