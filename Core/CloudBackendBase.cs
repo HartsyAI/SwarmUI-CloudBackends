@@ -244,18 +244,31 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         Logs.Verbose($"[{Provider?.ProviderName}] POST {url}");
         JObject result;
         using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds)));
-        try
+        // A freshly woken worker's proxy serves empty bodies for a few seconds before routing is live,
+        // which is indistinguishable from a dead worker. Retry briefly so a cold start is not mistaken
+        // for death (which would abandon the worker we just paid to wake and start another).
+        for (int attempt = 0; ; attempt++)
         {
-            result = await HttpClient.PostJson(url, body, null, cancel.Token);
-        }
-        catch (OperationCanceledException) when (!Program.GlobalProgramCancel.IsCancellationRequested)
-        {
-            throw new SwarmReadableErrorException($"Worker API call '{apiPath}' timed out after {timeoutSeconds}s.");
-        }
-        catch (Exception ex) when (ex is System.Net.Http.HttpRequestException or Newtonsoft.Json.JsonException)
-        {
-            Logs.Verbose($"[{Provider?.ProviderName}] Worker at {worker.PublicUrl} unreachable or returned non-JSON ({ex.Message}) - treating worker as dead.");
-            throw new SessionInvalidException();
+            try
+            {
+                result = await HttpClient.PostJson(url, body, null, cancel.Token);
+                break;
+            }
+            catch (OperationCanceledException) when (!Program.GlobalProgramCancel.IsCancellationRequested)
+            {
+                throw new SwarmReadableErrorException($"Worker API call '{apiPath}' timed out after {timeoutSeconds}s.");
+            }
+            catch (Exception ex) when (ex is System.Net.Http.HttpRequestException or Newtonsoft.Json.JsonException)
+            {
+                if (attempt >= 2)
+                {
+                    Logs.Verbose($"[{Provider?.ProviderName}] Worker at {worker.PublicUrl} unreachable or returned non-JSON ({ex.Message}) - treating worker as dead.");
+                    throw new SessionInvalidException();
+                }
+                Logs.Verbose($"[{Provider?.ProviderName}] Worker at {worker.PublicUrl} not answering yet ({ex.Message}); retry {attempt + 1}/2...");
+                try { await Task.Delay(2000, cancel.Token); }
+                catch (OperationCanceledException) { throw new SwarmReadableErrorException($"Worker API call '{apiPath}' timed out after {timeoutSeconds}s."); }
+            }
         }
         AutoThrowException(result);
         return result;
@@ -352,30 +365,43 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         finally { WorkerLock.Release(); }
     }
 
+    /// <summary>
+    /// Waits until the worker's Swarm has finished loading its own backends. A worker that never becomes
+    /// reachable within the timeout throws <see cref="SessionInvalidException"/> so the caller recovers,
+    /// rather than proceeding to issue doomed calls against it.
+    /// </summary>
     public async Task WaitForWorkerBackendsLoadedAsync(CloudWorkerInfo worker, int timeoutSec)
     {
         int pollMs = Math.Clamp(BaseConfig.PollIntervalMs, 500, 5000);
         int attempts = Math.Max(1, (timeoutSec * 1000) / pollMs);
+        bool everReachable = false;
         for (int i = 0; i < attempts; i++)
         {
             try
             {
                 JObject data = await CallWorkerAPI(worker, "ListBackends", new JObject { ["nonreal"] = true, ["full_data"] = true });
+                everReachable = true;
                 bool anyLoading = data.Properties().Select(p => p.Value).OfType<JObject>()
                     .Any(b => string.Equals(b["status"]?.ToString(), "loading", StringComparison.OrdinalIgnoreCase));
                 UpdateFeaturesFromWorker(data);
                 if (!anyLoading) return;
             }
-            // A dead/invalid worker must NOT be retried here - propagate so RunWithSession can
-            // refresh the remote session or wake a replacement worker.
-            catch (SessionInvalidException) { throw; }
+            // This IS the readiness wait: a not-yet-reachable worker is the normal cold-start case, so keep
+            // polling instead of declaring it dead on the first empty response. If it never answers within
+            // the whole timeout, propagate so RunWithSession recovers rather than proceeding blindly.
+            catch (SessionInvalidException) { Logs.Verbose($"[{Provider?.ProviderName}] Worker not reachable yet (poll {i + 1}/{attempts})..."); }
             catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Backend poll error (attempt {i + 1}): {ex.Message}"); }
             // This wait can outlast the keepalive on a slow first boot - top it up rather than let the
             // worker be reaped out from under the request we are waiting to serve.
             await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
             await Task.Delay(pollMs);
         }
-        Logs.Verbose($"[{Provider?.ProviderName}] Timed out waiting for worker backends; proceeding.");
+        if (!everReachable)
+        {
+            Logs.Warning($"[{Provider?.ProviderName}] Worker {worker.WorkerId} never became reachable within {timeoutSec}s.");
+            throw new SessionInvalidException();
+        }
+        Logs.Verbose($"[{Provider?.ProviderName}] Timed out waiting for worker backends to finish loading; proceeding.");
     }
 
     public void UpdateFeaturesFromWorker(JObject backendData)
@@ -425,6 +451,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend
     async Task<bool> RefreshModelsInner()
     {
         CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
+        // Wait for the worker to actually answer before fanning out ListModels, otherwise a cold start
+        // makes every subtype fail at once and looks like a dead worker.
+        await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
         int maxWaitSec = Math.Max(BaseConfig.StartupTimeoutSec, 120);
         DateTime start = DateTime.UtcNow;
         while (true)
@@ -461,11 +490,12 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                     catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] ListModels failed for '{subtype}': {ex.Message}"); }
                 })));
                 // Every subtype failed because the worker is gone - recover rather than re-polling a corpse.
-                // Any subtype lost to a dead worker means this listing is incomplete - recovering beats
-                // silently committing a partial model list as if the refresh had succeeded.
-                if (workerDied) { throw new SessionInvalidException(); }
+                // Nothing came back at all: the worker is gone, so recover instead of re-polling a corpse.
+                if (workerDied && tempModels.IsEmpty()) { throw new SessionInvalidException(); }
                 int totalCount = tempModels.Values.Sum(l => l.Count);
-                if (totalCount > 0)
+                // A partial listing must not be committed as success - retry the loop instead, which is
+                // bounded by maxWaitSec below.
+                if (totalCount > 0 && !workerDied)
                 {
                     RemoteModels ??= new();
                     Models ??= new();
