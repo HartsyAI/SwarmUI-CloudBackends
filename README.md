@@ -44,10 +44,21 @@ Integration with SwarmUI built-ins:
 
 ### Notes & limitations
 
+- **Cloud models must be discovered before you can generate with them.** With `AutoRefresh` off, call `/API/CloudRefreshModels` (or enable `AutoRefresh`) once per server start; until then the model names are unknown to SwarmUI and generate requests are rejected with "are you sure that model name is correct?".
 - The API key is read once when the backend initializes. After changing your key, disable/re-enable the backend.
 - `AutoRefresh: true` wakes a paid GPU worker on every SwarmUI start to list models — leave it off unless you want that.
 - `GenerationTimeoutSec` above 600 is capped by the shared HTTP client's 10-minute ceiling.
-- Keepalive is a blocking job occupying the worker's single job slot; the extension cancels the previous keepalive before extending or waking so jobs never queue behind it.
+- **Never cancel a running keepalive job to "extend" it.** RunPod terminates the worker that is executing a cancelled job, so cancel-then-resubmit kills the live worker (observed: worker died ~13 s after such a cancel, and its proxy URL returned empty bodies from then on). Keepalives are blocking and run one at a time, so extending works by submitting an *additional* job that queues behind the current one. Outstanding jobs are cancelled only on shutdown, where ending the worker is the goal.
+
+### Measured behavior (live, RTX-class worker, SDXL 1024×1024 / 12 steps)
+
+| Operation | Time |
+|---|---|
+| Cold wake + model discovery (27 models) | ~15–40 s |
+| First generation after wake | ~64 s |
+| Warm generation (worker reused) | ~9 s |
+| Recovery from an invalidated remote session | ~9 s (session refreshed in place, no re-wake) |
+| Teardown to zero running workers / zero queued jobs | immediate on backend disable |
 
 ## Development
 
