@@ -356,7 +356,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                     ["id"] = v["id"]?.ToString(),
                     ["name"] = v["name"]?.ToString(),
                     ["size_gb"] = v["size"]?.Value<int>(),
-                    ["data_center"] = v["dataCenterId"]?.ToString()
+                    // v2 names this 'dataCenter'; v1 used 'dataCenterId'. Accept either.
+                    ["data_center"] = (v["dataCenter"] ?? v["dataCenterId"])?.ToString()
                 });
             }
         }
@@ -427,7 +428,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             {
                 if (t is JObject v && string.Equals(v["id"]?.ToString(), volumeId, StringComparison.OrdinalIgnoreCase))
                 {
-                    return v["dataCenterId"]?.ToString();
+                    // v2 names this 'dataCenter'; v1 used 'dataCenterId'. Accept either.
+                    return (v["dataCenter"] ?? v["dataCenterId"])?.ToString();
                 }
             }
             Logs.Warning($"[RunPodPods] Network volume '{volumeId}' was not found on this account.");

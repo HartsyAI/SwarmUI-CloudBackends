@@ -54,6 +54,8 @@ public class CloudBackendsExtension : Extension
     public override void OnPreInit()
     {
         Logs.Init("Initializing Hartsy's Cloud Backends Extension...");
+        // Fills the RunPod Pods settings form with live GPU, volume and pod choices from the user's account.
+        ScriptFiles.Add("Assets/cloudbackends.js");
     }
 
     public override void OnInit()

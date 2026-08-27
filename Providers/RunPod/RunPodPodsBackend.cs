@@ -1,4 +1,4 @@
-using FreneticUtilities.FreneticDataSyntax;
+﻿using FreneticUtilities.FreneticDataSyntax;
 using Hartsy.Extensions.CloudBackends;
 using Hartsy.Extensions.CloudBackends.Core;
 using SwarmUI.Accounts;
@@ -21,6 +21,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
     {
         [SuggestionPlaceholder(Text = "leave blank to create one")]
         [ConfigComment("Existing RunPod pod ID to use.\nLeave blank to have Swarm find a pod by name, or create one.")]
+        [ManualSettingsOptions(Vals = [""])]
         public string PodId = "";
 
         [ConfigComment("Port SwarmUI listens on inside the pod.\nThe pod must expose this as an http port so RunPod's proxy can reach it.")]
@@ -39,10 +40,12 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
 
         [SuggestionPlaceholder(Text = "RunPod template id")]
         [ConfigComment("RunPod template to create the pod from, instead of naming an image directly.")]
+        [ManualSettingsOptions(Vals = [""])]
         public string TemplateId = "";
 
         [SuggestionPlaceholder(Text = "pick a GPU, or leave blank for cheapest available")]
         [ConfigComment("GPU type for created pods.\nLeave blank to use whatever is available, cheapest first.\nRunPod places exactly one GPU type per request and does not fall back on its own, so naming a busy type simply fails.")]
+        [ManualSettingsOptions(Vals = [""])]
         public string GpuTypeId = "";
 
         [ConfigComment("Number of GPUs attached to a created pod.")]
@@ -53,6 +56,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
 
         [SuggestionPlaceholder(Text = "network volume id")]
         [ConfigComment("Network volume to attach, which is normally where SwarmUI and your models live.\nThe pod is automatically placed in that volume's data center.")]
+        [ManualSettingsOptions(Vals = [""])]
         public string NetworkVolumeId = "";
 
         [ConfigComment("Path the volume is mounted at inside the pod.")]
@@ -67,6 +71,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
 
         [SuggestionPlaceholder(Text = "leave blank to let RunPod choose")]
         [ConfigComment("Restrict created pods to one data center.\nIgnored when a network volume is attached, since the volume fixes the data center.")]
+        [ManualSettingsOptions(Vals = [""])]
         public string DataCenterId = "";
 
         [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
