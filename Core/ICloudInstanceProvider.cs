@@ -1,0 +1,43 @@
+namespace Hartsy.Extensions.CloudBackends.Core;
+
+/// <summary>Where a started cloud instance can be reached, and what to call it.</summary>
+public class CloudInstanceInfo
+{
+    /// <summary>Publicly reachable base URL of the SwarmUI running on the instance.</summary>
+    public string PublicUrl { get; set; }
+
+    /// <summary>Provider-side identifier, for example a RunPod pod ID.</summary>
+    public string InstanceId { get; set; }
+
+    /// <summary>Human-readable description of the hardware, used in the backend title.</summary>
+    public string Description { get; set; }
+}
+
+/// <summary>
+/// A cloud provider that rents a whole instance (a "pod", a VM) which stays up until stopped, as
+/// opposed to a serverless worker that is woken per request.
+///
+/// Implementations do one job: drive the provider's API to get a SwarmUI reachable at a URL, and to
+/// shut it down again. Everything after that (sessions, models, generation) is handled by SwarmUI's
+/// own <c>SwarmSwarmBackend</c>, which the backend attaches to that URL.
+/// </summary>
+public interface ICloudInstanceProvider : IDisposable
+{
+    /// <summary>Human-readable provider name shown in logs and titles.</summary>
+    string ProviderName { get; }
+
+    /// <summary>
+    /// Cheap check that credentials and configuration are usable, called before anything is started.
+    /// Throw <see cref="SwarmUI.Utils.SwarmReadableErrorException"/> with an actionable message on failure.
+    /// </summary>
+    Task ValidateAsync(CancellationToken cancel = default);
+
+    /// <summary>
+    /// Starts (or creates, or resumes) the instance and returns once its SwarmUI is reachable.
+    /// May block for minutes on a cold start.
+    /// </summary>
+    Task<CloudInstanceInfo> StartInstanceAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default);
+
+    /// <summary>Releases the instance, stopping or destroying it according to the provider's configuration.</summary>
+    Task ReleaseInstanceAsync(CancellationToken cancel = default);
+}

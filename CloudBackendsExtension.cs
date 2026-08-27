@@ -66,7 +66,7 @@ public class CloudBackendsExtension : Extension
 
         Program.Backends.RegisterBackendType<RunPodPodsBackend>(
             "runpod_pods", "RunPod GPU Pods",
-            "On-demand GPU pod via RunPod. Resume a stopped pod and connect to SwarmUI running inside it.",
+            "Rents a RunPod GPU pod running SwarmUI and attaches it as a Swarm backend. Can create the pod for you, and stops it again when disabled.",
             CanLoadFast: true);
 
         Program.Backends.RegisterBackendType<VastAIBackend>(
@@ -82,13 +82,15 @@ public class CloudBackendsExtension : Extension
             "Enter your Vast.ai API key. Get it from <a href='https://cloud.vast.ai/cli/' target='_blank'>Vast.ai Account Settings</a>.");
 
         // ── Remote model providers ────────────────────────────────────────────
+        // Pods are deliberately absent here. A pod attaches core's own SwarmSwarmBackend, whose models
+        // already reach the browser through the built-in "remote_swarm" provider, so registering our
+        // own would list them twice.
         RegisterModelProvider<RunPodServerlessBackend>("runpod_serverless");
-        RegisterModelProvider<RunPodPodsBackend>("runpod_pods");
         RegisterModelProvider<VastAIBackend>("vastai_serverless");
 
         // ── PreGenerate auto-routing ──────────────────────────────────────────
+        // Same reasoning: a pod's models belong to a real Swarm backend that core routes to normally.
         RegisterPreGenerateRouting<RunPodServerlessBackend>("runpod_serverless");
-        RegisterPreGenerateRouting<RunPodPodsBackend>("runpod_pods");
         RegisterPreGenerateRouting<VastAIBackend>("vastai_serverless");
 
         // ── Web API ───────────────────────────────────────────────────────────

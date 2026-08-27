@@ -56,7 +56,7 @@ public class RunPodPodPlan
 /// Pods bill continuously while running, so there is no keepalive to hold; shutdown stops (or
 /// terminates) the pod instead.
 /// </summary>
-public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudProvider
+public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInstanceProvider
 {
     static readonly HttpClient Http = NetworkBackendUtils.MakeHttpClient();
     const string ApiBase = "https://api.runpod.io/v2";
@@ -89,7 +89,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudProvi
         }
     }
 
-    public async Task<CloudWorkerInfo> WakeupWorkerAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
+    public async Task<CloudInstanceInfo> StartInstanceAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
     {
         DateTime deadline = DateTime.UtcNow.AddSeconds(maxWaitSeconds);
         string podId = await ResolvePodAsync(cancel);
@@ -144,9 +144,18 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudProvi
         }
         // The API never returns a proxy URL; it is constructed from the pod id and the internal port.
         string publicUrl = $"https://{podId}-{plan.SwarmUIPort}.proxy.runpod.net";
-        string sessionId = await CreateSwarmSessionAsync(publicUrl, deadline, cancel);
-        Logs.Info($"[RunPodPods] Connected to SwarmUI on pod '{podId}' at {publicUrl}");
-        return new CloudWorkerInfo { PublicUrl = publicUrl, SessionId = sessionId, WorkerId = podId, Version = null };
+        // Wait for SwarmUI itself, not just the pod: the proxy answers 502 while the container boots,
+        // and handing an unready URL to the Swarm backend would just make it fail its own connect.
+        await WaitForSwarmAsync(publicUrl, deadline, cancel);
+        string gpu = pod?["gpu"]?["id"]?.ToString();
+        int gpuCount = pod?["gpu"]?["count"]?.Value<int>() ?? plan.GpuCount;
+        Logs.Info($"[RunPodPods] SwarmUI is up on pod '{podId}' at {publicUrl}");
+        return new CloudInstanceInfo
+        {
+            PublicUrl = publicUrl,
+            InstanceId = podId,
+            Description = string.IsNullOrWhiteSpace(gpu) ? "RunPod pod" : $"{gpuCount}x {gpu}"
+        };
     }
 
     /// <summary>True if the pod's published action list permits the given action.</summary>
@@ -155,10 +164,12 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudProvi
         return pod["actions"] is JArray actions && actions.Any(a => string.Equals(a.ToString(), action, StringComparison.OrdinalIgnoreCase));
     }
 
-    /// <summary>Pods have no keepalive concept: they bill until stopped, so there is nothing to hold open.</summary>
-    public Task<bool> StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default) => Task.FromResult(true);
-
-    public Task StopKeepaliveAsync() => Task.CompletedTask;
+    /// <summary>Releases the pod, stopping or terminating it per the plan.</summary>
+    public async Task ReleaseInstanceAsync(CancellationToken cancel = default)
+    {
+        if (plan.TerminateOnShutdown) { await TerminatePodAsync(cancel); }
+        else { await StopPodAsync(cancel); }
+    }
 
     public void Dispose() { }
 
@@ -298,6 +309,114 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudProvi
         return ordered;
     }
 
+    /// <summary>
+    /// Gathers everything the settings form needs to offer real choices: GPU types that are actually
+    /// available for pods right now with their hourly price, the account's network volumes and
+    /// templates, and the data centers. Individual sections degrade to empty rather than failing the
+    /// whole call, so one unavailable catalog does not blank the entire form.
+    /// </summary>
+    public async Task<JObject> ListAccountOptionsAsync(string cloud, CancellationToken cancel = default)
+    {
+        JArray gpus = [];
+        try
+        {
+            JToken catalog = await ApiAsync(HttpMethod.Get, $"/catalog/gpus?include=AVAILABILITY&product=POD&cloud={cloud}", null, cancel);
+            List<JObject> found = [];
+            foreach (JToken t in catalog?["gpus"] as JArray ?? [])
+            {
+                if (t is not JObject gpu) { continue; }
+                string availability = gpu["availability"]?.ToString() ?? "UNKNOWN";
+                if (string.Equals(availability, "NONE", StringComparison.OrdinalIgnoreCase)) { continue; }
+                double? price = gpu["price"]?[cloud.ToLowerInvariant()]?.Value<double>();
+                int? maxCount = gpu["maxCount"]?[cloud.ToLowerInvariant()]?.Value<int>();
+                found.Add(new JObject
+                {
+                    ["id"] = gpu["id"]?.ToString(),
+                    ["name"] = gpu["name"]?.ToString(),
+                    ["memory_gb"] = gpu["memory"]?.Value<int>(),
+                    ["price_per_hr"] = price,
+                    ["max_count"] = maxCount,
+                    ["availability"] = availability,
+                    ["data_centers"] = new JArray((gpu["dataCenters"] as JArray ?? []).Select(d => d["id"]?.ToString()).Where(d => d is not null))
+                });
+            }
+            // Cheapest first is the order someone renting a GPU actually wants to scan.
+            gpus = new JArray(found.OrderBy(g => g["price_per_hr"]?.Value<double>() ?? double.MaxValue));
+        }
+        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list GPU types: {ex.Message}"); }
+        JArray volumes = [];
+        try
+        {
+            JToken vols = await ApiAsync(HttpMethod.Get, "/network-volumes", null, cancel);
+            foreach (JToken t in vols?["networkVolumes"] as JArray ?? vols as JArray ?? [])
+            {
+                if (t is not JObject v) { continue; }
+                volumes.Add(new JObject
+                {
+                    ["id"] = v["id"]?.ToString(),
+                    ["name"] = v["name"]?.ToString(),
+                    ["size_gb"] = v["size"]?.Value<int>(),
+                    ["data_center"] = v["dataCenterId"]?.ToString()
+                });
+            }
+        }
+        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list network volumes: {ex.Message}"); }
+        JArray templates = [];
+        try
+        {
+            JToken tpls = await ApiAsync(HttpMethod.Get, "/templates", null, cancel);
+            foreach (JToken t in tpls?["templates"] as JArray ?? tpls as JArray ?? [])
+            {
+                if (t is not JObject tpl) { continue; }
+                templates.Add(new JObject
+                {
+                    ["id"] = tpl["id"]?.ToString(),
+                    ["name"] = tpl["name"]?.ToString(),
+                    ["image"] = tpl["image"]?.ToString() ?? tpl["imageName"]?.ToString()
+                });
+            }
+        }
+        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list templates: {ex.Message}"); }
+        JArray dataCenters = [];
+        try
+        {
+            JToken dcs = await ApiAsync(HttpMethod.Get, "/catalog/datacenters", null, cancel);
+            foreach (JToken t in dcs?["dataCenters"] as JArray ?? dcs as JArray ?? [])
+            {
+                if (t is not JObject dc) { continue; }
+                dataCenters.Add(new JObject { ["id"] = dc["id"]?.ToString(), ["name"] = dc["name"]?.ToString() });
+            }
+        }
+        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list data centers: {ex.Message}"); }
+        JArray pods = [];
+        try
+        {
+            foreach (JToken t in await ListPodsAsync(cancel))
+            {
+                if (t is not JObject p) { continue; }
+                pods.Add(new JObject
+                {
+                    ["id"] = p["id"]?.ToString(),
+                    ["name"] = p["name"]?.ToString(),
+                    ["status"] = p["status"]?.ToString(),
+                    ["gpu"] = p["gpu"]?["id"]?.ToString(),
+                    ["cost_per_hr"] = p["cost"]?.Value<double>()
+                });
+            }
+        }
+        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list pods: {ex.Message}"); }
+        return new JObject
+        {
+            ["success"] = true,
+            ["cloud"] = cloud,
+            ["gpus"] = gpus,
+            ["network_volumes"] = volumes,
+            ["templates"] = templates,
+            ["data_centers"] = dataCenters,
+            ["pods"] = pods
+        };
+    }
+
     /// <summary>Finds the data center a network volume lives in, so the pod can be placed alongside it.</summary>
     public async Task<string> LookupVolumeDataCenterAsync(string volumeId, CancellationToken cancel = default)
     {
@@ -363,13 +482,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudProvi
         await ApiAsync(HttpMethod.Delete, $"/pods/{ActivePodId}", null, cancel, allowNotFound: true);
     }
 
-    /// <summary>Stops or terminates the pod per the plan. Called on backend shutdown.</summary>
-    public async Task ReleasePodAsync(CancellationToken cancel = default)
-    {
-        if (plan.TerminateOnShutdown) { await TerminatePodAsync(cancel); }
-        else { await StopPodAsync(cancel); }
-    }
-
     // ── HTTP plumbing ─────────────────────────────────────────────────────────
 
     /// <summary>A RunPod API failure, carrying the RFC 9457 problem details v2 returns.</summary>
@@ -412,8 +524,11 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudProvi
         };
     }
 
-    /// <summary>Opens a SwarmUI session on the pod, retrying while SwarmUI finishes booting.</summary>
-    public async Task<string> CreateSwarmSessionAsync(string publicUrl, DateTime deadline, CancellationToken cancel = default)
+    /// <summary>
+    /// Waits until SwarmUI on the pod answers its API. The RunPod proxy returns 502 while the container
+    /// is up but the service inside is not listening yet, which is the normal state during boot.
+    /// </summary>
+    public async Task WaitForSwarmAsync(string publicUrl, DateTime deadline, CancellationToken cancel = default)
     {
         Exception last = null;
         while (DateTime.UtcNow < deadline)
@@ -422,11 +537,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudProvi
             try
             {
                 JObject session = await Http.PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], null, cancel);
-                string id = session?["session_id"]?.ToString();
-                if (!string.IsNullOrWhiteSpace(id)) { return id; }
+                if (!string.IsNullOrWhiteSpace(session?["session_id"]?.ToString())) { return; }
             }
             catch (Exception ex) when (ex is not OperationCanceledException) { last = ex; }
-            // A 502 from the proxy is the normal answer while the container is still starting its service.
             Logs.Verbose($"[RunPodPods] Waiting for SwarmUI on {publicUrl} to answer...");
             await Task.Delay(5000, cancel);
         }

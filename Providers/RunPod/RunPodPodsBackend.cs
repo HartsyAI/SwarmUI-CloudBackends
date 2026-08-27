@@ -10,91 +10,84 @@ namespace Hartsy.Extensions.CloudBackends.Providers.RunPod;
 
 /// <summary>
 /// SwarmUI backend for RunPod on-demand GPU pods.
-/// Generation and worker lifecycle live in <see cref="CloudBackendBase"/>; this class supplies the
-/// provider factory, API key lookup, permission check, and the pod-specific settings.
+///
+/// This backend only drives RunPod's API to get a pod running with SwarmUI on it. Everything after
+/// that is core Swarm: <see cref="CloudInstanceBackendBase"/> attaches a SwarmSwarmBackend to the
+/// pod's URL, and that handles models, sessions and generation.
 /// </summary>
-public class RunPodPodsBackend : CloudBackendBase
+public class RunPodPodsBackend : CloudInstanceBackendBase
 {
-    public class Settings : BaseSettings
+    public class Settings : InstanceSettings
     {
-        [SuggestionPlaceholder(Text = "existing pod id")]
-        [ConfigComment("RunPod pod ID to use, for example 'abc123xyz'. Find it in the RunPod console.\nLeave blank and enable AutoCreate to have Swarm find or create a pod for you.")]
+        [SuggestionPlaceholder(Text = "leave blank to create one")]
+        [ConfigComment("Existing RunPod pod ID to use.\nLeave blank to have Swarm find a pod by name, or create one.")]
         public string PodId = "";
 
-        [ConfigComment("Port SwarmUI listens on inside the pod (default 7801).\nThe pod must expose this as an http port so RunPod's proxy can reach it.")]
+        [ConfigComment("Port SwarmUI listens on inside the pod.\nThe pod must expose this as an http port so RunPod's proxy can reach it.")]
         public int SwarmUIPort = 7801;
 
-        [ConfigComment("Stop the pod when this backend is disabled or Swarm shuts down.\nStrongly recommended: a running pod bills continuously, even when idle.")]
-        public bool StopPodOnShutdown = true;
-
-        [ConfigComment("Destroy the pod on shutdown instead of just stopping it.\nThis deletes the container disk. Only useful with AutoCreate plus a network volume holding your models.")]
+        [ConfigComment("Destroy the pod when this backend shuts down, instead of just stopping it.\nStopping keeps the container disk (and keeps billing for that storage) so the pod can resume quickly.\nTerminating deletes it, which is only sensible when a network volume holds everything worth keeping.")]
         public bool TerminateOnShutdown = false;
 
-        [ConfigComment("Create a pod when no pod ID is set and no previously created pod is found.\nRequires either ImageName or TemplateId, plus a GPU type.")]
-        public bool AutoCreate = false;
-
         [SuggestionPlaceholder(Text = "swarmui-cloudbackends")]
-        [ConfigComment("Name given to auto-created pods, and used to find one again on restart so a new pod is not created every time.")]
+        [ConfigComment("Name given to pods this backend creates, and used to find that pod again later so a restart reuses it rather than creating another.")]
         public string PodName = "swarmui-cloudbackends";
 
-        [SuggestionPlaceholder(Text = "docker image with SwarmUI installed")]
-        [ConfigComment("Docker image used when creating a pod, for example 'kalebbroo/swarmui-runpod:latest'.\nIgnored if TemplateId is set.")]
+        [SuggestionPlaceholder(Text = "docker image with SwarmUI")]
+        [ConfigComment("Docker image to create the pod from, for example 'kalebbroo/swarmui-runpod:latest'.\nIgnored when TemplateId is set.")]
         public string ImageName = "";
 
         [SuggestionPlaceholder(Text = "RunPod template id")]
-        [ConfigComment("RunPod template ID to create the pod from, instead of specifying an image directly.")]
+        [ConfigComment("RunPod template to create the pod from, instead of naming an image directly.")]
         public string TemplateId = "";
 
-        [SuggestionPlaceholder(Text = "NVIDIA RTX A4000")]
-        [ConfigComment("GPU type for created pods, exactly as RunPod names it, for example 'NVIDIA RTX A4000' or 'NVIDIA GeForce RTX 4090'.")]
+        [SuggestionPlaceholder(Text = "pick a GPU, or leave blank for cheapest available")]
+        [ConfigComment("GPU type for created pods.\nLeave blank to use whatever is available, cheapest first.\nRunPod places exactly one GPU type per request and does not fall back on its own, so naming a busy type simply fails.")]
         public string GpuTypeId = "";
 
         [ConfigComment("Number of GPUs attached to a created pod.")]
         public int GpuCount = 1;
 
-        [ConfigComment("Container disk size in GB for a created pod.")]
+        [ConfigComment("Container disk size in GB for a created pod. This is wiped when the pod is terminated.")]
         public int ContainerDiskGb = 50;
 
-        [ConfigComment("Pod volume size in GB for a created pod. Ignored when NetworkVolumeId is set.")]
-        public int VolumeGb = 0;
-
-        [ConfigComment("Path the volume is mounted at inside a created pod.")]
-        public string VolumeMountPath = "/workspace";
-
         [SuggestionPlaceholder(Text = "network volume id")]
-        [ConfigComment("Network volume to attach to a created pod, which is where models and the SwarmUI install normally live.\nThe pod is placed in that volume's data center.")]
+        [ConfigComment("Network volume to attach, which is normally where SwarmUI and your models live.\nThe pod is automatically placed in that volume's data center.")]
         public string NetworkVolumeId = "";
 
+        [ConfigComment("Path the volume is mounted at inside the pod.")]
+        public string VolumeMountPath = "/runpod-volume";
+
+        [ConfigComment("Pod volume size in GB, used only when no network volume is attached. Zero for none.")]
+        public int VolumeGb = 0;
+
         [ManualSettingsOptions(Vals = ["SECURE", "COMMUNITY"])]
-        [ConfigComment("Which RunPod cloud to create pods in. SECURE is more reliable, COMMUNITY is cheaper.")]
+        [ConfigComment("Which RunPod cloud to create pods in. Secure is more reliable, Community is cheaper.")]
         public string CloudType = "SECURE";
 
-        [SuggestionPlaceholder(Text = "eg US-KS-2")]
-        [ConfigComment("Restrict created pods to one data center. Leave blank to let RunPod choose.\nIgnored when NetworkVolumeId is set, since the volume fixes the data center.")]
+        [SuggestionPlaceholder(Text = "leave blank to let RunPod choose")]
+        [ConfigComment("Restrict created pods to one data center.\nIgnored when a network volume is attached, since the volume fixes the data center.")]
         public string DataCenterId = "";
 
         [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
         public string PodEnv = "";
     }
 
-    public override BaseSettings BaseConfig => (Settings)SettingsRaw;
+    public override InstanceSettings InstanceConfig => (Settings)SettingsRaw;
 
     Settings PodConfig => (Settings)SettingsRaw;
 
-    /// <summary>Typed access to the pod provider, for the WebAPI stop/terminate routes.</summary>
+    /// <summary>Typed access to the pod provider, for the WebAPI routes.</summary>
     public RunPodPodsProvider PodsProvider => Provider as RunPodPodsProvider;
 
-    protected override ICloudProvider CreateProvider(string apiKey)
+    protected override ICloudInstanceProvider CreateProvider(string apiKey)
     {
         Settings config = PodConfig;
-        // EndpointId is the shared base setting; accept it as a pod ID for backends configured before
-        // PodId existed, so those keep working instead of silently failing validation.
-        string podId = string.IsNullOrWhiteSpace(config.PodId) ? BaseConfig.EndpointId : config.PodId;
         return new RunPodPodsProvider(apiKey, new RunPodPodPlan
         {
-            PodId = podId?.Trim() ?? "",
+            PodId = config.PodId?.Trim() ?? "",
             SwarmUIPort = config.SwarmUIPort,
-            AutoCreate = config.AutoCreate,
+            AutoCreate = true,
             PodName = string.IsNullOrWhiteSpace(config.PodName) ? "swarmui-cloudbackends" : config.PodName.Trim(),
             ImageName = config.ImageName?.Trim() ?? "",
             TemplateId = config.TemplateId?.Trim() ?? "",
@@ -102,7 +95,7 @@ public class RunPodPodsBackend : CloudBackendBase
             GpuCount = config.GpuCount,
             ContainerDiskGb = config.ContainerDiskGb,
             VolumeGb = config.VolumeGb,
-            VolumeMountPath = config.VolumeMountPath?.Trim() ?? "/workspace",
+            VolumeMountPath = config.VolumeMountPath?.Trim() ?? "/runpod-volume",
             NetworkVolumeId = config.NetworkVolumeId?.Trim() ?? "",
             CloudType = config.CloudType,
             DataCenterId = config.DataCenterId?.Trim() ?? "",
@@ -134,37 +127,14 @@ public class RunPodPodsBackend : CloudBackendBase
         }
     }
 
-    /// <summary>Pods are identified by a pod ID (or created on demand), not by the shared EndpointId setting.</summary>
     protected override void CheckRequiredConfig()
     {
         Settings config = PodConfig;
-        bool hasPod = !string.IsNullOrWhiteSpace(config.PodId) || !string.IsNullOrWhiteSpace(BaseConfig.EndpointId);
-        if (!hasPod && !config.AutoCreate)
+        if (string.IsNullOrWhiteSpace(config.PodId)
+            && string.IsNullOrWhiteSpace(config.ImageName)
+            && string.IsNullOrWhiteSpace(config.TemplateId))
         {
-            throw new SwarmReadableErrorException("No pod is configured. Set 'PodId' to an existing RunPod pod, or enable 'AutoCreate' and set an image (or template) plus a GPU type.");
+            throw new SwarmReadableErrorException("Nothing to start. Set 'PodId' to use an existing pod, or set an 'ImageName' (or 'TemplateId') so a pod can be created.");
         }
-        if (config.AutoCreate && !hasPod && string.IsNullOrWhiteSpace(config.ImageName) && string.IsNullOrWhiteSpace(config.TemplateId))
-        {
-            throw new SwarmReadableErrorException("AutoCreate is on but neither 'ImageName' nor 'TemplateId' is set, so there is nothing to create a pod from.");
-        }
-    }
-
-    /// <summary>
-    /// Releases the pod before the shared shutdown runs. A pod bills for every minute it stays up, so
-    /// leaving one running after the backend is disabled is a silent, open-ended charge.
-    /// </summary>
-    public override async Task Shutdown()
-    {
-        RunPodPodsProvider pods = PodsProvider;
-        if (pods is not null && PodConfig.StopPodOnShutdown)
-        {
-            try { await pods.ReleasePodAsync(); }
-            catch (Exception ex) { Logs.Error($"[RunPodPods] Failed to release pod on shutdown, it may still be billing: {ex.ReadableString()}"); }
-        }
-        else if (pods is not null && !string.IsNullOrWhiteSpace(pods.ActivePodId))
-        {
-            Logs.Warning($"[RunPodPods] Leaving pod '{pods.ActivePodId}' running because StopPodOnShutdown is off. It continues to bill until stopped.");
-        }
-        await base.Shutdown();
     }
 }

@@ -18,7 +18,8 @@ public static class CloudBackendsWebAPI
         API.RegisterAPICall(CloudGetStatus, false, CloudBackendsExtension.PermCloudStatus);
         API.RegisterAPICall(CloudStopPod, true, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudDebugInvalidateSession, true, Permissions.EditBackends);
-        Logs.Verbose("[CloudBackendsWebAPI] Registered API routes: CloudRefreshModels, CloudGetStatus, CloudStopPod, CloudDebugInvalidateSession");
+        API.RegisterAPICall(CloudListRunPodOptions, false, Permissions.EditBackends);
+        Logs.Verbose("[CloudBackendsWebAPI] Registered API routes: CloudRefreshModels, CloudGetStatus, CloudStopPod, CloudDebugInvalidateSession, CloudListRunPodOptions");
     }
 
     /// <summary>True if the session's user may act on this backend (each provider defines its own permission).</summary>
@@ -110,8 +111,8 @@ public static class CloudBackendsWebAPI
     }
 
     /// <summary>
-    /// Stop a RunPod GPU pod by backend ID.
-    /// The pod remains stopped until the next generation request resumes it.
+    /// Stops the cloud instance behind a RunPod Pods backend, detaching its Swarm backend first.
+    /// The instance stays stopped until the backend is started again.
     /// </summary>
     public static async Task<JObject> CloudStopPod(Session session, string backend_id)
     {
@@ -123,15 +124,44 @@ public static class CloudBackendsWebAPI
                 .FirstOrDefault(b => b.BackendData?.ID == id);
             if (backend is null)
                 return new JObject { ["success"] = false, ["error"] = $"No RunPod Pods backend found with ID {id}." };
-            if (backend.Provider is not RunPodPodsProvider podsProvider)
-                return new JObject { ["success"] = false, ["error"] = "Backend provider is not a RunPodPodsProvider." };
-            await podsProvider.StopPodAsync();
-            await backend.ClearWorkerStateAsync();
-            return new JObject { ["success"] = true, ["message"] = $"Pod stop requested for backend #{id}." };
+            backend.CheckPermission(session);
+            await backend.StopInstanceAsync();
+            return new JObject { ["success"] = true, ["message"] = $"Pod stopped for backend #{id}." };
         }
         catch (Exception ex)
         {
             Logs.Error($"[CloudBackends] Error in CloudStopPod: {ex.ReadableString()}");
+            return new JObject { ["success"] = false, ["error"] = ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// Lists what the user's RunPod account can actually use right now: GPU types with live
+    /// availability and price, network volumes, data centers and templates.
+    ///
+    /// This exists so the backend settings form can offer real choices instead of asking someone to
+    /// type an exact GPU name and hope it is spelled right and in stock.
+    /// </summary>
+    public static async Task<JObject> CloudListRunPodOptions(Session session, string cloud_type = "SECURE")
+    {
+        try
+        {
+            if (session?.User is null)
+            {
+                return new JObject { ["success"] = false, ["error"] = "No user session." };
+            }
+            string key = session.User.GetGenericData("runpod_api", "key")?.Trim();
+            if (string.IsNullOrEmpty(key))
+            {
+                return new JObject { ["success"] = false, ["error"] = "No RunPod API key set. Add one in User Settings, API Keys, RunPod, then reopen this form." };
+            }
+            string cloud = string.Equals(cloud_type, "COMMUNITY", StringComparison.OrdinalIgnoreCase) ? "COMMUNITY" : "SECURE";
+            using RunPodPodsProvider provider = new(key, new RunPodPodPlan { CloudType = cloud });
+            return await provider.ListAccountOptionsAsync(cloud);
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Error in CloudListRunPodOptions: {ex.ReadableString()}");
             return new JObject { ["success"] = false, ["error"] = ex.Message };
         }
     }
