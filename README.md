@@ -117,7 +117,7 @@ One gotcha while iterating: SwarmUI caches the built extension DLL against this 
 ### Which APIs this targets
 
 * **RunPod Pods** uses REST API **v2** (`https://api.runpod.io/v2`). RunPod retires REST v1 on 2026-11-15 and GraphQL in early 2027, so neither is a safe target. v2 is not a rename of v1: status is a single observed value across six states rather than v1's three-state `desiredStatus`, state changes go through one `/action` endpoint, and several field names differ.
-* **RunPod Serverless** uses the job API (`/v2/{endpointId}/run`, `/status`, `/cancel`, `/health`), which is a separate surface and unaffected by the v1 retirement.
+* **RunPod Serverless** uses the job API at `https://api.runpod.ai/v2/{endpointId}/` (`run`, `status`, `cancel`, `health`), which is a separate surface and unaffected by the v1 retirement. Note the host: the serverless job API is on **runpod.ai** while the REST control plane is on **runpod.io**, and the two are easy to mix up because both use a `/v2/` prefix. Calling the control-plane host with an endpoint ID returns a confusing 404.
 * **Vast.ai** uses `POST https://run.vast.ai/route/` for routing plus the console REST API at `https://console.vast.ai` for endpoint lookup. The grant returned by `/route/` is forwarded to the worker verbatim as `auth_data`, because its signature covers those exact fields.
 
 Known follow ups:
