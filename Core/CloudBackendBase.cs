@@ -17,11 +17,11 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 /// Abstract T2I backend shared across all cloud GPU providers.
 ///
 /// Subclasses implement three methods:
-///   <see cref="CreateProvider"/> — return a fully-initialised <see cref="ICloudProvider"/>
-///   <see cref="GetApiKey"/>     — retrieve the provider-specific API key from the user session
-///   <see cref="CheckPermission"/> — throw if the user lacks permission
+///   <see cref="CreateProvider"/> - return a fully-initialised <see cref="ICloudProvider"/>
+///   <see cref="GetApiKey"/>     - retrieve the provider-specific API key from the user session
+///   <see cref="CheckPermission"/> - throw if the user lacks permission
 ///
-/// Everything else — worker caching, model refresh, Generate, GenerateLive, LoadModel — lives here.
+/// Everything else - worker caching, model refresh, Generate, GenerateLive, LoadModel - lives here.
 /// </summary>
 public abstract class CloudBackendBase : AbstractT2IBackend
 {
@@ -48,7 +48,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
     /// <summary>Settings every provider shares. Subclasses extend with provider-specific fields.</summary>
     public class BaseSettings : AutoConfiguration
     {
-        [ConfigComment("Cloud endpoint identifier (endpoint ID, name, pod ID — provider-specific).")]
+        [ConfigComment("Cloud endpoint identifier (endpoint ID, name, pod ID - provider-specific).")]
         public string EndpointId = "";
 
         [ConfigComment("Max parallel generation requests.")]
@@ -234,7 +234,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     /// <summary>
     /// POST to the worker's SwarmUI API. Injects <c>session_id</c> and validates the response.
-    /// All providers use direct HTTP after wakeup — no provider-specific auth envelope needed.
+    /// All providers use direct HTTP after wakeup - no provider-specific auth envelope needed.
     /// </summary>
     public async Task<JObject> CallWorkerAPI(CloudWorkerInfo worker, string apiPath, JObject body, int timeoutSeconds = 120)
     {

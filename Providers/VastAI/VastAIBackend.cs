@@ -26,7 +26,7 @@ public class VastAIBackend : CloudBackendBase
     protected override string GetApiKey(Session session)
     {
         if (session?.User is null)
-            throw new SwarmReadableErrorException("No user session — log in and configure a Vast.ai API key in User Settings → API Keys.");
+            throw new SwarmReadableErrorException("No user session - log in and configure a Vast.ai API key in User Settings → API Keys.");
         string key = session.User.GetGenericData("vastai_api", "key")?.Trim();
         if (string.IsNullOrEmpty(key))
             throw new SwarmReadableErrorException($"Vast.ai API key not configured for user '{session.User.UserID}'. Set it in User Settings → API Keys → Vast.ai.");

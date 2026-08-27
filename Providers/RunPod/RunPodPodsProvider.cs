@@ -21,7 +21,7 @@ namespace Hartsy.Extensions.CloudBackends.Providers.RunPod;
 /// Keepalive: background task that pings /API/GetNewSession every 5 minutes
 ///            (pods stay running on their own; this only refreshes the SwarmUI session).
 ///
-/// The pod is NOT stopped on shutdown — it keeps running so the user can reuse it.
+/// The pod is NOT stopped on shutdown - it keeps running so the user can reuse it.
 /// Use the StopPod WebAPI call or the RunPod dashboard to stop it manually.
 /// </summary>
 public class RunPodPodsProvider(string apiKey, string podId, int swarmPort) : ICloudProvider
