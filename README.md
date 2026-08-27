@@ -10,9 +10,9 @@ This supersedes the older single provider extensions `SwarmUI-Runpod-Serverless-
 
 | Provider | Backend type | Status |
 |---|---|---|
-| RunPod Serverless | `runpod_serverless` | Supported. Verified end to end against real hardware. |
-| RunPod Pods | `runpod_pods` | Experimental, untested. Resumes an existing pod only; `AutoCreate` is not implemented. |
-| Vast.ai Serverless | `vastai_serverless` | Experimental, untested. Needs a worker image built around `workers/vastai/vast_handler.py`. |
+| RunPod Serverless | `runpod_serverless` | Supported. Verified end to end against real hardware, including generation. |
+| RunPod Pods | `runpod_pods` | Built on REST API v2. Pod lifecycle verified live: create, start, status, stop, terminate. Generation end to end still needs a pod image that serves SwarmUI on the exposed http port (see below). |
+| Vast.ai Serverless | `vastai_serverless` | Built to the documented serverless contract. Config and credential handling verified against the live API; routing and generation are untested, since that needs a Vast account and a deployed worker. |
 
 ## How it works
 
@@ -46,6 +46,20 @@ The extension plugs into SwarmUI's own systems rather than reinventing them:
 2. In SwarmUI, open **User Settings > API Keys** and set your RunPod key.
 3. Open **Server > Backends**, enable *Show Advanced*, add a **RunPod Serverless** backend, and set `EndpointId`.
 4. Enable the backend. Initialization validates your key and endpoint against RunPod's health API before reporting as running, so a bad key or endpoint ID fails immediately with a clear message instead of at your first generation.
+
+## Setup for RunPod Pods
+
+A pod is a GPU you rent by the hour, so unlike serverless it bills continuously from the moment it starts until you stop it. The backend stops the pod when you disable it, which is on by default; leave it that way unless you have a reason not to.
+
+Point the backend at an existing pod by setting `PodId`, or turn on `AutoCreate` and give it an `ImageName` (or `TemplateId`). With AutoCreate the backend looks for a pod matching `PodName` before creating one, so restarting SwarmUI reuses your pod instead of leaving another one running.
+
+The pod's image must serve SwarmUI on `SwarmUIPort`, and that port is exposed as an http port so RunPod's proxy can reach it at `https://{podId}-{port}.proxy.runpod.net`. Note that RunPod's proxy applies no authentication of its own: anyone who knows the pod ID and port can reach that SwarmUI, so do not put anything sensitive on a pod you would not expose publicly.
+
+If you attach a `NetworkVolumeId`, the pod is automatically placed in that volume's data center, because a volume can only attach to a pod sitting next to it.
+
+Leaving `GpuTypeId` blank makes the backend ask RunPod's catalog which GPUs are actually available for pods and try them cheapest first. This matters because the v2 API places exactly one GPU type per request and will not fall back on its own: naming a single busy GPU type just fails with a capacity error.
+
+> A worker image built for RunPod **serverless** will not generally work as a pod. The serverless image's entrypoint runs the serverless job handler, which exits outside that environment, so nothing ends up listening on the http port and the proxy answers 404. A pod image needs to start SwarmUI and keep it running in the foreground.
 
 ## Concurrency and scaling
 
@@ -100,11 +114,19 @@ Build with `dotnet build src/Extensions/SwarmUI-CloudBackends/SwarmUI-CloudBacke
 
 One gotcha while iterating: SwarmUI caches the built extension DLL against this repository's git HEAD, so in Release mode it skips rebuilds until there is a new commit here. Either use the dev launch script or delete `src/bin/extensions/SwarmExtensionSwarmUI-CloudBackends/` after editing.
 
+### Which APIs this targets
+
+* **RunPod Pods** uses REST API **v2** (`https://api.runpod.io/v2`). RunPod retires REST v1 on 2026-11-15 and GraphQL in early 2027, so neither is a safe target. v2 is not a rename of v1: status is a single observed value across six states rather than v1's three-state `desiredStatus`, state changes go through one `/action` endpoint, and several field names differ.
+* **RunPod Serverless** uses the job API (`/v2/{endpointId}/run`, `/status`, `/cancel`, `/health`), which is a separate surface and unaffected by the v1 retirement.
+* **Vast.ai** uses `POST https://run.vast.ai/route/` for routing plus the console REST API at `https://console.vast.ai` for endpoint lookup. The grant returned by `/route/` is forwarded to the worker verbatim as `auth_data`, because its signature covers those exact fields.
+
 Known follow ups:
 
 * The worker handler returns its cached SwarmUI session without revalidating it. The extension compensates by refreshing the remote session in place when it sees `invalid_session_id`.
-* RunPod Pods provisioning (`AutoCreate`) and the Vast.ai path end to end.
+* A pod image that runs SwarmUI in the foreground, so the Pods path can be proven end to end rather than only through its lifecycle.
+* The Vast.ai path end to end, which needs an account, a workergroup and a deployed worker.
 * All requests through one backend share a single remote session, so an interrupt cancels every in flight generation on that worker. Per request remote sessions would fix it.
+* Vast.ai's `/route/` signature is verified inside Vast's own SDK and the algorithm is not published, so `workers/vastai/vast_handler.py` does not verify it. Treat that handler as trusted-network only until it does.
 
 ## License
 
