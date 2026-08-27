@@ -177,7 +177,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         return JObject.Parse(await res.Content.ReadAsStringAsync(cancel));
     }
 
-    /// <summary>Cancel a queued or running job. Best-effort — does not throw.</summary>
+    /// <summary>Cancel a queued or running job. Best-effort - does not throw.</summary>
     public async Task CancelJobAsync(string jobId, CancellationToken cancel = default)
     {
         if (string.IsNullOrEmpty(jobId)) return;

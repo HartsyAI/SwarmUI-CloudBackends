@@ -25,7 +25,7 @@ public class RunPodServerlessBackend : CloudBackendBase
     protected override string GetApiKey(Session session)
     {
         if (session?.User is null)
-            throw new SwarmReadableErrorException("No user session — log in and configure a RunPod API key in User Settings → API Keys.");
+            throw new SwarmReadableErrorException("No user session - log in and configure a RunPod API key in User Settings → API Keys.");
         string key = session.User.GetGenericData("runpod_api", "key")?.Trim();
         if (string.IsNullOrEmpty(key))
             throw new SwarmReadableErrorException($"RunPod API key not configured for user '{session.User.UserID}'. Set it in User Settings → API Keys → RunPod.");
