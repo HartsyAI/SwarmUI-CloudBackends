@@ -134,6 +134,21 @@ public class RunPodPodsBackend : CloudBackendBase
         }
     }
 
+    /// <summary>Pods are identified by a pod ID (or created on demand), not by the shared EndpointId setting.</summary>
+    protected override void CheckRequiredConfig()
+    {
+        Settings config = PodConfig;
+        bool hasPod = !string.IsNullOrWhiteSpace(config.PodId) || !string.IsNullOrWhiteSpace(BaseConfig.EndpointId);
+        if (!hasPod && !config.AutoCreate)
+        {
+            throw new SwarmReadableErrorException("No pod is configured. Set 'PodId' to an existing RunPod pod, or enable 'AutoCreate' and set an image (or template) plus a GPU type.");
+        }
+        if (config.AutoCreate && !hasPod && string.IsNullOrWhiteSpace(config.ImageName) && string.IsNullOrWhiteSpace(config.TemplateId))
+        {
+            throw new SwarmReadableErrorException("AutoCreate is on but neither 'ImageName' nor 'TemplateId' is set, so there is nothing to create a pod from.");
+        }
+    }
+
     /// <summary>
     /// Releases the pod before the shared shutdown runs. A pod bills for every minute it stays up, so
     /// leaving one running after the backend is disabled is a silent, open-ended charge.

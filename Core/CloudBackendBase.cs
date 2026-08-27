@@ -91,6 +91,19 @@ public abstract class CloudBackendBase : AbstractT2IBackend
     /// <summary>Throw <see cref="SwarmReadableErrorException"/> if the session user lacks permission.</summary>
     public abstract void CheckPermission(Session session);
 
+    /// <summary>
+    /// Throws if this backend's settings are not usable. Runs before the provider is built, so it can
+    /// only see settings. Providers that identify their target by something other than an endpoint ID
+    /// (a pod ID, for instance) override this.
+    /// </summary>
+    protected virtual void CheckRequiredConfig()
+    {
+        if (string.IsNullOrWhiteSpace(BaseConfig.EndpointId))
+        {
+            throw new SwarmReadableErrorException("Endpoint ID is not configured. Set it in the backend settings.");
+        }
+    }
+
     // ── Session-invalid exception ─────────────────────────────────────────────
 
     public class SessionInvalidException : Exception { }
@@ -159,10 +172,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend
     public override async Task Init()
     {
         AddLoadStatus($"Starting {GetType().Name} backend...");
-        if (string.IsNullOrWhiteSpace(BaseConfig.EndpointId))
+        try { CheckRequiredConfig(); }
+        catch (Exception ex)
         {
             Status = BackendStatus.ERRORED;
-            AddLoadStatus("ERROR: Endpoint ID is not configured. Set it in the backend settings.");
+            AddLoadStatus($"ERROR: {ex.Message}");
             return;
         }
         Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);

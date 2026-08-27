@@ -103,6 +103,10 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
 
     public async Task ValidateAsync(CancellationToken cancel = default)
     {
+        if (string.IsNullOrWhiteSpace(endpointId))
+        {
+            throw new SwarmReadableErrorException("No RunPod serverless endpoint ID is set. Set 'EndpointId' in the backend settings.");
+        }
         JObject health = await GetHealthAsync(cancel);
         Logs.Debug($"[RunPodServerless] Endpoint {endpointId} health: workers={health["workers"]?.ToString(Newtonsoft.Json.Formatting.None)}, jobs={health["jobs"]?.ToString(Newtonsoft.Json.Formatting.None)}");
     }
