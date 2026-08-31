@@ -149,7 +149,13 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
         SwarmSwarmBackend.SwarmSwarmBackendSettings settings = new()
         {
             Address = CurrentInstance.PublicUrl,
-            AllowIdle = false,
+            // AllowIdle does two things we need: SwarmSwarmBackend only re-polls the remote's backend
+            // list (ReviseRemoteDataList) via its idle monitor, so without this a backend added on the
+            // instance after attach (or removed and re-added) is never picked up without a manual
+            // restart. It also lets a transient connectivity blip recover on its own by going IDLE
+            // instead of ERRORED, which matters more here than for a same-machine remote since a cloud
+            // proxy URL is more prone to brief hiccups.
+            AllowIdle = true,
             AllowForwarding = false,
             AllowWebsocket = true,
             ConnectionAttemptTimeoutSeconds = Math.Max(30, InstanceConfig.StartupTimeoutSec / 4)
