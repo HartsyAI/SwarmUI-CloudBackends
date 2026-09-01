@@ -70,6 +70,36 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     public string ProviderName => "RunPod GPU Pods";
     public string ApiKeyType => "runpod_api";
 
+    // ── Status cache ──────────────────────────────────────────────────────────
+    // Same instance-scoped cache-with-expiry idiom CloudBackendBase uses for its worker (CurrentWorker /
+    // WorkerKeepaliveExpiry): short-lived so a UI status poll doesn't hammer RunPod's rate limit, but
+    // never so long that a Start/Stop button feels unresponsive.
+    static readonly TimeSpan StatusCacheTtl = TimeSpan.FromSeconds(5);
+    readonly SemaphoreSlim StatusLock = new(1, 1);
+    RunPodPodStatus CachedStatus;
+    DateTime StatusCacheExpiry = DateTime.MinValue;
+
+    /// <summary>
+    /// Gets the pod's live status (state, GPU, cost/hr, uptime, allowed actions). Returns null if no pod
+    /// has been resolved yet (nothing created or bound via PodId). Cached briefly unless <paramref
+    /// name="forceRefresh"/> is set, e.g. right after a Start/Stop action.
+    /// </summary>
+    public async Task<RunPodPodStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default)
+    {
+        if (string.IsNullOrWhiteSpace(ActivePodId)) { return null; }
+        if (!forceRefresh && CachedStatus is not null && DateTime.UtcNow < StatusCacheExpiry) { return CachedStatus; }
+        await StatusLock.WaitAsync(cancel);
+        try
+        {
+            if (!forceRefresh && CachedStatus is not null && DateTime.UtcNow < StatusCacheExpiry) { return CachedStatus; }
+            JObject pod = await GetPodAsync(ActivePodId, cancel);
+            CachedStatus = RunPodPodStatus.FromPod(ActivePodId, pod, plan.SwarmUIPort);
+            StatusCacheExpiry = DateTime.UtcNow.Add(StatusCacheTtl);
+            return CachedStatus;
+        }
+        finally { StatusLock.Release(); }
+    }
+
     // ── ICloudProvider ────────────────────────────────────────────────────────
 
     public async Task ValidateAsync(CancellationToken cancel = default)
@@ -169,6 +199,13 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     {
         if (plan.TerminateOnShutdown) { await TerminatePodAsync(cancel); }
         else { await StopPodAsync(cancel); }
+    }
+
+    /// <inheritdoc/>
+    public async Task<double?> GetCostPerHourAsync(CancellationToken cancel = default)
+    {
+        RunPodPodStatus status = await GetStatusAsync(forceRefresh: false, cancel);
+        return status?.CostPerHour;
     }
 
     public void Dispose() { }

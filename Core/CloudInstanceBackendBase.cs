@@ -33,6 +33,12 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
 
         [ConfigComment("Start the cloud instance as soon as this backend is enabled.\nIf off, the backend stays idle and the instance is only started when you press Start on it.")]
         public bool StartOnEnable = true;
+
+        [ConfigComment("Failsafe: auto-stop the instance after it has been running this many minutes, in case you forgot to turn it off. Zero disables this check.")]
+        public int MaxRuntimeMinutes = 0;
+
+        [ConfigComment("Failsafe: auto-stop the instance once its estimated spend reaches this many US dollars.\nEstimated as (the provider's own reported hourly rate) x (time running) - not exact billing, and only checked for providers that report a rate (see GetCostPerHourAsync). Zero disables this check.")]
+        public double MaxSpendUsd = 0;
     }
 
     /// <summary>Returns the subclass's settings cast to <see cref="InstanceSettings"/>.</summary>
@@ -65,8 +71,69 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
     /// <summary>Control instances never load models or generate; the child backend does.</summary>
     public override IEnumerable<string> SupportedFeatures => [];
 
+    // ── Runtime/spend failsafe ───────────────────────────────────────────────
+    // Same Program.TickEvent subscribe-in-Init/unsubscribe-in-Shutdown idiom AutoScalingBackend uses for
+    // its own periodic housekeeping; throttled internally since the tick fires roughly once a second.
+
+    /// <summary>When the current instance was confirmed up. Null while no instance is running.</summary>
+    public DateTime? InstanceStartedAt { get; private set; }
+
+    /// <summary>Guards against the failsafe re-triggering while an async stop from a prior trip is still in flight.</summary>
+    volatile bool FailsafeTripped = false;
+
+    /// <summary><see cref="Environment.TickCount64"/> value before which <see cref="FailsafeTick"/> does nothing further.</summary>
+    long NextFailsafeCheckTicks = 0;
+
+    void FailsafeTick()
+    {
+        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped) { return; }
+        if (InstanceConfig.MaxRuntimeMinutes <= 0 && InstanceConfig.MaxSpendUsd <= 0) { return; }
+        long now = Environment.TickCount64;
+        if (now < NextFailsafeCheckTicks) { return; }
+        NextFailsafeCheckTicks = now + 30_000; // no need to check more than roughly twice a minute
+        _ = Utilities.RunCheckedTask(CheckFailsafeAsync, $"{GetType().Name} #{BackendData?.ID} failsafe check");
+    }
+
+    async Task CheckFailsafeAsync()
+    {
+        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped) { return; }
+        TimeSpan runtime = DateTime.UtcNow - InstanceStartedAt.Value;
+        string reason = null;
+        if (InstanceConfig.MaxRuntimeMinutes > 0 && runtime.TotalMinutes >= InstanceConfig.MaxRuntimeMinutes)
+        {
+            reason = $"max runtime of {InstanceConfig.MaxRuntimeMinutes}m reached (running {runtime.TotalMinutes:0.#}m)";
+        }
+        else if (InstanceConfig.MaxSpendUsd > 0)
+        {
+            try
+            {
+                double? costPerHour = await Provider.GetCostPerHourAsync(Program.GlobalProgramCancel);
+                if (costPerHour is > 0)
+                {
+                    double estimatedSpend = costPerHour.Value * runtime.TotalHours;
+                    if (estimatedSpend >= InstanceConfig.MaxSpendUsd)
+                    {
+                        reason = $"estimated spend ${estimatedSpend:0.00} reached cap of ${InstanceConfig.MaxSpendUsd:0.00} (at ${costPerHour:0.00}/hr)";
+                    }
+                }
+            }
+            // A failed rate lookup must not block the run - only the runtime cap is guaranteed regardless.
+            catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Failsafe spend check failed: {ex.Message}"); }
+        }
+        if (reason is null) { return; }
+        FailsafeTripped = true;
+        try
+        {
+            Logs.Warning($"[{Provider?.ProviderName}] Backend #{BackendData?.ID} auto-stopping instance: {reason}.");
+            AddLoadStatus($"Auto-stopped: {reason}.");
+            await StopInstanceAsync();
+        }
+        finally { FailsafeTripped = false; }
+    }
+
     public override async Task Init()
     {
+        Program.TickEvent += FailsafeTick;
         AddLoadStatus($"Starting {GetType().Name} backend...");
         Session session;
         string apiKey;
@@ -134,6 +201,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
             CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, InstanceConfig.PollIntervalMs, Program.GlobalProgramCancel);
             AddLoadStatus($"Instance '{CurrentInstance.InstanceId}' is up at {CurrentInstance.PublicUrl}, attaching Swarm backend...");
             AttachChildBackend();
+            InstanceStartedAt = DateTime.UtcNow;
             AddLoadStatus($"{Provider.ProviderName} instance ready.");
         }
         finally { InstanceLock.Release(); }
@@ -191,12 +259,14 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
                 catch (Exception ex) { Logs.Error($"[{Provider.ProviderName}] Failed to release instance '{CurrentInstance.InstanceId}', it may still be billing: {ex.ReadableString()}"); }
             }
             CurrentInstance = null;
+            InstanceStartedAt = null;
         }
         finally { InstanceLock.Release(); }
     }
 
     public override async Task Shutdown()
     {
+        Program.TickEvent -= FailsafeTick;
         string name = Provider?.ProviderName ?? GetType().Name;
         Logs.Info($"[{name}] Backend {BackendData?.ID} shutting down...");
         await StopInstanceAsync();
