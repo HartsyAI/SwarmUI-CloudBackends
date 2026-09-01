@@ -15,12 +15,16 @@ namespace Hartsy.Extensions.CloudBackends;
 
 /// <summary>
 /// Entry point for the SwarmUI Cloud Backends extension.
-/// Registers three backend types: RunPod Serverless, RunPod GPU Pods, and Vast.ai.
+/// Registers one user-facing backend type, "Cloud Backends" (<see cref="CloudBackendsBackend"/>), which
+/// internally spins up hidden children for whichever of RunPod Serverless, RunPod GPU Pods, and Vast.ai
+/// its settings have enabled. See <see cref="CloudBackendTypes"/> for how those providers stay fully
+/// functional without being independently addable.
 ///
 /// To add a future provider (e.g. Massed Compute):
 ///   1. Create Providers/MassedCompute/MassedComputeProvider.cs implementing ICloudProvider.
 ///   2. Create Providers/MassedCompute/MassedComputeBackend.cs extending CloudBackendBase.
-///   3. Add the four registration lines in OnInit() below.
+///   3. Register it in CloudBackendTypes.Init(), add its enabled/settings fields to
+///      CloudBackendsBackend.Settings, and add the branch in CloudBackendsBackend.Init().
 /// </summary>
 public class CloudBackendsExtension : Extension
 {
@@ -54,26 +58,23 @@ public class CloudBackendsExtension : Extension
     public override void OnPreInit()
     {
         Logs.Init("Initializing Hartsy's Cloud Backends Extension...");
-        // Fills the RunPod Pods settings form with live GPU, volume and pod choices from the user's account.
+        // Fills the RunPod Pods section with live GPU/volume/pod choices, and regroups the single
+        // "Cloud Backends" settings card into one collapsible section per provider.
         ScriptFiles.Add("Assets/cloudbackends.js");
+        StyleSheetFiles.Add("Assets/cloudbackends.css");
     }
 
     public override void OnInit()
     {
         // ── Backend types ─────────────────────────────────────────────────────
-        Program.Backends.RegisterBackendType<RunPodServerlessBackend>(
-            "runpod_serverless", "RunPod Serverless",
-            "Serverless GPU inference via RunPod with direct SwarmUI API access. Requires a custom serverless handler.",
-            CanLoadFast: true);
+        // The three providers are no longer independently addable - CloudBackendTypes builds their
+        // BackendType records for internal use only (nonreal children of CloudBackendsBackend below).
+        // Their classes are otherwise unchanged and fully reused.
+        CloudBackendTypes.Init();
 
-        Program.Backends.RegisterBackendType<RunPodPodsBackend>(
-            "runpod_pods", "RunPod GPU Pods",
-            "Rents a RunPod GPU pod running SwarmUI and attaches it as a Swarm backend. Can create the pod for you, and stops it again when disabled.",
-            CanLoadFast: true);
-
-        Program.Backends.RegisterBackendType<VastAIBackend>(
-            "vastai_serverless", "Vast.ai Serverless",
-            "Serverless GPU inference via Vast.ai with direct SwarmUI API access. Supports on-demand scaling.",
+        Program.Backends.RegisterBackendType<CloudBackendsBackend>(
+            "cloud_backends", "Cloud Backends",
+            "Rents GPU capacity from RunPod or Vast.ai. Enable one or more providers in the settings below.",
             CanLoadFast: true);
 
         // ── API keys ──────────────────────────────────────────────────────────
@@ -92,13 +93,16 @@ public class CloudBackendsExtension : Extension
 
         // ── PreGenerate auto-routing ──────────────────────────────────────────
         // Same reasoning: a pod's models belong to a real Swarm backend that core routes to normally.
-        RegisterPreGenerateRouting<RunPodServerlessBackend>("runpod_serverless");
-        RegisterPreGenerateRouting<VastAIBackend>("vastai_serverless");
+        // The IDs here must match CloudBackendTypes' hidden BackendType records (T2IEngine matches
+        // T2IParamTypes.BackendType against each live backend's own HandlerTypeData.ID directly - it
+        // never looks the ID up in the public registry, so the hidden IDs work fine here).
+        RegisterPreGenerateRouting<RunPodServerlessBackend>(CloudBackendTypes.RunPodServerless.ID);
+        RegisterPreGenerateRouting<VastAIBackend>(CloudBackendTypes.VastAI.ID);
 
         // ── Web API ───────────────────────────────────────────────────────────
         CloudBackendsWebAPI.Register();
 
-        Logs.Info("Cloud Backends extension loaded (RunPod Serverless, RunPod GPU Pods, Vast.ai).");
+        Logs.Info("Cloud Backends extension loaded (one 'Cloud Backends' entry, providers: RunPod Serverless, RunPod GPU Pods, Vast.ai).");
     }
 
     // ── Registration helpers ──────────────────────────────────────────────────

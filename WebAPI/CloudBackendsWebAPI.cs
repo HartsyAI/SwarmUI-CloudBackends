@@ -3,6 +3,7 @@ using Hartsy.Extensions.CloudBackends.Core;
 using Hartsy.Extensions.CloudBackends.Providers.RunPod;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
+using SwarmUI.Backends;
 using SwarmUI.Core;
 using SwarmUI.Utils;
 using SwarmUI.WebAPI;
@@ -16,10 +17,12 @@ public static class CloudBackendsWebAPI
     {
         API.RegisterAPICall(CloudRefreshModels, true, CloudBackendsExtension.PermCloudStatus);
         API.RegisterAPICall(CloudGetStatus, false, CloudBackendsExtension.PermCloudStatus);
+        API.RegisterAPICall(CloudStartPod, true, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudStopPod, true, CloudBackendsExtension.PermUseRunPodPods);
+        API.RegisterAPICall(CloudGetPodStatus, false, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudDebugInvalidateSession, true, Permissions.EditBackends);
         API.RegisterAPICall(CloudListRunPodOptions, false, Permissions.EditBackends);
-        Logs.Verbose("[CloudBackendsWebAPI] Registered API routes: CloudRefreshModels, CloudGetStatus, CloudStopPod, CloudDebugInvalidateSession, CloudListRunPodOptions");
+        Logs.Verbose("[CloudBackendsWebAPI] Registered API routes: CloudRefreshModels, CloudGetStatus, CloudStartPod, CloudStopPod, CloudGetPodStatus, CloudDebugInvalidateSession, CloudListRunPodOptions");
     }
 
     /// <summary>True if the session's user may act on this backend (each provider defines its own permission).</summary>
@@ -29,6 +32,36 @@ public static class CloudBackendsWebAPI
         // silently reported to the user as "no cloud backends are running".
         try { backend.CheckPermission(session); return true; }
         catch (SwarmReadableErrorException) { return false; }
+    }
+
+    /// <summary>
+    /// Finds the RunPod GPU Pods backend for a given ID. The frontend only ever sees the parent "Cloud
+    /// Backends" backend's ID, never the hidden child's own (negative, nonreal) ID, so this matches
+    /// either: the child's own ID directly (in case a caller ever has it), or - the normal case - a
+    /// running RunPodPodsBackend whose <see cref="BackendHandler.BackendData.AbstractParent"/> is the
+    /// given parent ID (set in <see cref="CloudBackendsBackend.AddChild"/>).
+    /// </summary>
+    static RunPodPodsBackend FindRunPodPodsChild(int id) =>
+        Program.Backends.RunningBackendsOfType<RunPodPodsBackend>()
+            .FirstOrDefault(b => b.BackendData?.ID == id || b.BackendData?.AbstractParent?.ID == id);
+
+    /// <summary>
+    /// A "not found" message for RunPod Pods actions. If the child exists but isn't RUNNING (most likely
+    /// ERRORED, e.g. a missing API key or bad config), that is a much more useful thing to report than a
+    /// bare "not found" - so look past the RUNNING filter for one last diagnostic attempt.
+    /// </summary>
+    static string RunPodPodsNotFoundMessage(int id)
+    {
+        AbstractBackend match = Program.Backends.AllBackends.Values
+            .Select(d => d.AbstractBackend)
+            .FirstOrDefault(b => b is RunPodPodsBackend && (b.AbstractBackendData?.ID == id || b.AbstractBackendData?.AbstractParent?.ID == id));
+        if (match is not null)
+        {
+            string lastStatus = match.LoadStatusReport?.LastOrDefault()?.Message;
+            return $"RunPod GPU Pods backend for #{id} is {match.Status} (not usable right now)."
+                + (string.IsNullOrWhiteSpace(lastStatus) ? "" : $" Last status: {lastStatus}");
+        }
+        return $"No RunPod GPU Pods backend found for #{id}. Is the RunPod GPU Pods section enabled and saved?";
     }
 
     /// <summary>Manually trigger a model refresh from workers for all running cloud backends the user may access.</summary>
@@ -111,8 +144,33 @@ public static class CloudBackendsWebAPI
     }
 
     /// <summary>
+    /// Starts (or creates, per settings) the cloud instance behind a RunPod Pods backend and attaches
+    /// its Swarm backend. <paramref name="backend_id"/> is the "Cloud Backends" parent's ID.
+    /// </summary>
+    public static async Task<JObject> CloudStartPod(Session session, string backend_id)
+    {
+        try
+        {
+            if (!int.TryParse(backend_id, out int id))
+                return new JObject { ["success"] = false, ["error"] = "Invalid backend_id." };
+            RunPodPodsBackend backend = FindRunPodPodsChild(id);
+            if (backend is null)
+                return new JObject { ["success"] = false, ["error"] = RunPodPodsNotFoundMessage(id) };
+            backend.CheckPermission(session);
+            await backend.StartInstanceAsync();
+            return new JObject { ["success"] = true, ["message"] = $"Pod started for backend #{id}." };
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Error in CloudStartPod: {ex.ReadableString()}");
+            return new JObject { ["success"] = false, ["error"] = ex.Message };
+        }
+    }
+
+    /// <summary>
     /// Stops the cloud instance behind a RunPod Pods backend, detaching its Swarm backend first.
-    /// The instance stays stopped until the backend is started again.
+    /// The instance stays stopped until the backend is started again. <paramref name="backend_id"/> is
+    /// the "Cloud Backends" parent's ID.
     /// </summary>
     public static async Task<JObject> CloudStopPod(Session session, string backend_id)
     {
@@ -120,10 +178,9 @@ public static class CloudBackendsWebAPI
         {
             if (!int.TryParse(backend_id, out int id))
                 return new JObject { ["success"] = false, ["error"] = "Invalid backend_id." };
-            RunPodPodsBackend backend = Program.Backends.RunningBackendsOfType<RunPodPodsBackend>()
-                .FirstOrDefault(b => b.BackendData?.ID == id);
+            RunPodPodsBackend backend = FindRunPodPodsChild(id);
             if (backend is null)
-                return new JObject { ["success"] = false, ["error"] = $"No RunPod Pods backend found with ID {id}." };
+                return new JObject { ["success"] = false, ["error"] = RunPodPodsNotFoundMessage(id) };
             backend.CheckPermission(session);
             await backend.StopInstanceAsync();
             return new JObject { ["success"] = true, ["message"] = $"Pod stopped for backend #{id}." };
@@ -131,6 +188,48 @@ public static class CloudBackendsWebAPI
         catch (Exception ex)
         {
             Logs.Error($"[CloudBackends] Error in CloudStopPod: {ex.ReadableString()}");
+            return new JObject { ["success"] = false, ["error"] = ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// Live status of the pod behind a RunPod Pods backend - state, GPU, cost/hr, uptime, and which
+    /// actions RunPod currently allows on it. Cached briefly server-side (see
+    /// <see cref="RunPodPodsProvider.GetStatusAsync"/>) so a UI poll does not hammer RunPod's API.
+    /// <paramref name="backend_id"/> is the "Cloud Backends" parent's ID.
+    /// </summary>
+    public static async Task<JObject> CloudGetPodStatus(Session session, string backend_id, bool force_refresh = false)
+    {
+        try
+        {
+            if (!int.TryParse(backend_id, out int id))
+                return new JObject { ["success"] = false, ["error"] = "Invalid backend_id." };
+            RunPodPodsBackend backend = FindRunPodPodsChild(id);
+            if (backend is null)
+                return new JObject { ["success"] = false, ["error"] = RunPodPodsNotFoundMessage(id) };
+            backend.CheckPermission(session);
+            if (backend.PodsProvider is null)
+                return new JObject { ["success"] = false, ["error"] = "Backend has no active provider (not yet initialized)." };
+            RunPodPodStatus status = await backend.PodsProvider.GetStatusAsync(force_refresh);
+            if (status is null)
+                return new JObject { ["success"] = true, ["has_pod"] = false, ["message"] = "No pod resolved yet - it is created on first Start." };
+            return new JObject
+            {
+                ["success"] = true,
+                ["has_pod"] = true,
+                ["pod_id"] = status.PodId,
+                ["status"] = status.Status,
+                ["gpu_id"] = status.GpuId,
+                ["gpu_count"] = status.GpuCount,
+                ["cost_per_hour"] = status.CostPerHour,
+                ["uptime_seconds"] = status.UptimeSeconds,
+                ["allowed_actions"] = JArray.FromObject(status.AllowedActions),
+                ["public_url"] = status.PublicUrl
+            };
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Error in CloudGetPodStatus: {ex.ReadableString()}");
             return new JObject { ["success"] = false, ["error"] = ex.Message };
         }
     }

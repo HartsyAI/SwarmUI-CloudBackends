@@ -40,4 +40,12 @@ public interface ICloudInstanceProvider : IDisposable
 
     /// <summary>Releases the instance, stopping or destroying it according to the provider's configuration.</summary>
     Task ReleaseInstanceAsync(CancellationToken cancel = default);
+
+    /// <summary>
+    /// Current hourly billing rate for the running instance, if the provider can report one. Used only
+    /// for the optional spend-cap failsafe in <see cref="CloudInstanceBackendBase"/> - return null if
+    /// unknown, not yet available, or the provider doesn't bill this way (the failsafe simply skips the
+    /// spend check in that case; the runtime-based cap still works regardless).
+    /// </summary>
+    Task<double?> GetCostPerHourAsync(CancellationToken cancel = default);
 }

@@ -1,0 +1,61 @@
+/* Collapsible per-provider sections inside the single "Cloud Backends" settings card. */
+
+.cloudbackends-provider-section {
+    border: 1px solid var(--bs-border-color, #444);
+    border-radius: 6px;
+    margin: 6px 0;
+    overflow: hidden;
+}
+
+.cloudbackends-provider-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    cursor: pointer;
+    background: rgba(128, 128, 128, 0.12);
+    user-select: none;
+}
+
+.cloudbackends-provider-header:hover {
+    background: rgba(128, 128, 128, 0.2);
+}
+
+.cloudbackends-provider-caret {
+    display: inline-block;
+    width: 1em;
+}
+
+.cloudbackends-provider-title {
+    font-weight: 600;
+    flex: 1;
+}
+
+.cloudbackends-provider-header .auto-checkbox-box {
+    margin: 0;
+    padding: 0;
+}
+
+.cloudbackends-provider-body {
+    padding: 6px 10px 10px 10px;
+}
+
+.cloudbackends-provider-actions:empty {
+    display: none;
+}
+
+.cloudbackends-provider-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(128, 128, 128, 0.25);
+}
+
+.cloudbackends-pod-status {
+    flex-basis: 100%;
+    opacity: 0.85;
+    font-size: 0.9em;
+}
