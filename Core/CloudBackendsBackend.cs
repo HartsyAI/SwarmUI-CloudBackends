@@ -2,6 +2,7 @@ using FreneticUtilities.FreneticDataSyntax;
 using Hartsy.Extensions.CloudBackends.Providers.RunPod;
 using Hartsy.Extensions.CloudBackends.Providers.VastAI;
 using SwarmUI.Backends;
+using SwarmUI.DataHolders;
 using SwarmUI.Media;
 using SwarmUI.Text2Image;
 using SwarmUI.Utils;
@@ -11,9 +12,9 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 /// <summary>
 /// The single user-facing "Cloud Backends" entry. Never generates anything itself - on Init it spins up
 /// a hidden (nonreal) child backend for each provider section the user has enabled, reusing the existing
-/// <see cref="RunPodServerlessBackend"/>/<see cref="RunPodPodsBackend"/>/<see cref="VastAIBackend"/>
-/// classes unchanged. On Shutdown (including a settings-edit re-Init) it tears all of them down again, so
-/// the child set always matches the current toggle state.
+/// <see cref="RunPodServerlessBackend"/>/<see cref="RunPodPodsBackend"/>/<see cref="VastAIBackend"/>/
+/// <see cref="VastAIInstanceBackend"/> classes unchanged. On Shutdown (including a settings-edit re-Init)
+/// it tears all of them down again, so the child set always matches the current toggle state.
 /// </summary>
 public class CloudBackendsBackend : AbstractT2IBackend
 {
@@ -40,24 +41,30 @@ public class CloudBackendsBackend : AbstractT2IBackend
         // ── RunPod GPU Pods ──────────────────────────────────────────────────
         [ConfigComment("Enable a RunPod GPU Pod.")]
         public bool RunPodPods_Enabled = false;
+        [SuggestionPlaceholder(Text = "leave blank to create one")]
         [ConfigComment("Existing RunPod pod ID to use.\nLeave blank to have Swarm find a pod by name, or create one.")]
         public string RunPodPods_PodId = "";
         [ConfigComment("Port SwarmUI listens on inside the pod.")]
         public int RunPodPods_SwarmUIPort = 7801;
         [ConfigComment("Destroy the pod when this backend shuts down, instead of just stopping it.")]
         public bool RunPodPods_TerminateOnShutdown = false;
-        [ConfigComment("Name given to pods this backend creates, and used to find that pod again later.")]
-        public string RunPodPods_PodName = "swarmui-cloudbackends";
+        [SuggestionPlaceholder(Text = "blank = a name unique to this backend")]
+        [ConfigComment("Name given to pods this backend creates, and used to find that pod again later.\nLeave blank to use a name unique to this backend (recommended) - a shared literal name here across two or more Cloud Backends instances would make each backend's 'find an existing pod by name' step liable to attach to the other's pod instead of creating its own.")]
+        public string RunPodPods_PodName = "";
+        [SuggestionPlaceholder(Text = "docker image with SwarmUI")]
         [ConfigComment("Docker image to create the pod from. Ignored when TemplateId is set.")]
         public string RunPodPods_ImageName = "";
+        [SuggestionPlaceholder(Text = "RunPod template id")]
         [ConfigComment("RunPod template to create the pod from, instead of naming an image directly.")]
         public string RunPodPods_TemplateId = "";
+        [SuggestionPlaceholder(Text = "pick a GPU, or leave blank for cheapest available")]
         [ConfigComment("GPU type for created pods. Leave blank to use whatever is available, cheapest first.")]
         public string RunPodPods_GpuTypeId = "";
         [ConfigComment("Number of GPUs attached to a created pod.")]
         public int RunPodPods_GpuCount = 1;
         [ConfigComment("Container disk size in GB for a created pod.")]
         public int RunPodPods_ContainerDiskGb = 50;
+        [SuggestionPlaceholder(Text = "network volume id")]
         [ConfigComment("Network volume to attach, which is normally where SwarmUI and your models live.")]
         public string RunPodPods_NetworkVolumeId = "";
         [ConfigComment("Path the volume is mounted at inside the pod.")]
@@ -66,6 +73,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public int RunPodPods_VolumeGb = 0;
         [ConfigComment("Which RunPod cloud to create pods in. Secure is more reliable, Community is cheaper.")]
         public string RunPodPods_CloudType = "SECURE";
+        [SuggestionPlaceholder(Text = "leave blank to let RunPod choose")]
         [ConfigComment("Restrict created pods to one data center. Ignored when a network volume is attached.")]
         public string RunPodPods_DataCenterId = "";
         [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
@@ -86,6 +94,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public bool VastAI_Enabled = false;
         [ConfigComment("Vast.ai serverless endpoint NAME (matches on /route/).")]
         public string VastAI_EndpointId = "";
+        [SuggestionPlaceholder(Text = "handler")]
         [ConfigComment("Route on the worker that serves the SwarmUI wakeup handler.")]
         public string VastAI_WorkerRoute = "handler";
         [ConfigComment("Max parallel generation requests.")]
@@ -100,6 +109,49 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public int VastAI_KeepaliveSeconds = 420;
         [ConfigComment("Refresh available models from the worker on backend init (background).")]
         public bool VastAI_AutoRefresh = false;
+
+        // ── Vast.ai Instances ────────────────────────────────────────────────
+        // Prefixed VastAIInstance_ (not VastAI_, which the Serverless section above already owns).
+        [ConfigComment("Enable a Vast.ai rented instance.")]
+        public bool VastAIInstance_Enabled = false;
+        [SuggestionPlaceholder(Text = "leave blank to create one")]
+        [ConfigComment("Existing Vast.ai instance ID to use.\nLeave blank to have Swarm find an instance by label, or create one.")]
+        public string VastAIInstance_InstanceId = "";
+        [ConfigComment("Port SwarmUI listens on inside the instance.\nDeclared to Vast as a Docker '-p' flag, so the instance's own SwarmUI must actually bind this port.")]
+        public int VastAIInstance_SwarmUIPort = 7801;
+        [ConfigComment("Destroy the instance when this backend shuts down, instead of just stopping it.")]
+        public bool VastAIInstance_TerminateOnShutdown = false;
+        [SuggestionPlaceholder(Text = "blank = a label unique to this backend")]
+        [ConfigComment("Label given to instances this backend creates, and used to find that instance again later.\nLeave blank to use a label unique to this backend (recommended) - a shared literal label across two or more Cloud Backends instances would make each backend's find-by-label step liable to attach to the other's instance instead of creating its own.")]
+        public string VastAIInstance_Label = "";
+        [SuggestionPlaceholder(Text = "docker image with SwarmUI")]
+        [ConfigComment("Docker image to create the instance from. Ignored when TemplateHashId is set.")]
+        public string VastAIInstance_Image = "";
+        [SuggestionPlaceholder(Text = "Vast.ai template hash")]
+        [ConfigComment("Vast.ai template to create the instance from, instead of naming an image directly.")]
+        public string VastAIInstance_TemplateHashId = "";
+        [SuggestionPlaceholder(Text = "pick an offer, or leave blank for cheapest available")]
+        [ConfigComment("Specific rentable offer to create the instance from.\nLeave blank to search on-demand offers and take the cheapest match. Unlike RunPod's GPU-type retry, an offer is a specific host slot - if it's gone by the time Swarm tries to use it, pick another rather than expecting an automatic fallback.")]
+        public string VastAIInstance_OfferId = "";
+        [ConfigComment("Container disk size in GB for a created instance. This is wiped when the instance is destroyed.")]
+        public int VastAIInstance_DiskGb = 20;
+        [SuggestionPlaceholder(Text = "network volume id")]
+        [ConfigComment("Existing network volume to attach, which is normally where SwarmUI and your models live.\nCreating a brand new named volume isn't supported here yet - attach one you already created on Vast.ai.")]
+        public string VastAIInstance_NetworkVolumeId = "";
+        [ConfigComment("Path the volume is mounted at inside the instance.")]
+        public string VastAIInstance_VolumeMountPath = "/workspace";
+        [ConfigComment("Extra environment variables for a created instance, as KEY=VALUE, one per line.\nThe SwarmUI port mapping is added automatically - no need to include it here.")]
+        public string VastAIInstance_Env = "";
+        [ConfigComment("How long to wait for the instance to boot and for SwarmUI on it to answer, in seconds.")]
+        public int VastAIInstance_StartupTimeoutSec = 900;
+        [ConfigComment("How often to poll Vast.ai while waiting for the instance to start, in milliseconds.")]
+        public int VastAIInstance_PollIntervalMs = 5000;
+        [ConfigComment("Start (creating it if needed) the instance as soon as this section is enabled and saved.\nOff by default, same reasoning as RunPod GPU Pods: use the Start button, or turn this on if you want it automatic.")]
+        public bool VastAIInstance_StartOnEnable = false;
+        [ConfigComment("Failsafe: auto-stop the instance after it has been running this many minutes, in case you forgot to turn it off. Zero disables this check.")]
+        public int VastAIInstance_MaxRuntimeMinutes = 0;
+        [ConfigComment("Failsafe: auto-stop the instance once its estimated spend (hourly rate x time running) reaches this many US dollars. Zero disables this check.")]
+        public double VastAIInstance_MaxSpendUsd = 0;
     }
 
     Settings Config => (Settings)SettingsRaw;
@@ -140,7 +192,9 @@ public class CloudBackendsBackend : AbstractT2IBackend
                 PodId = config.RunPodPods_PodId,
                 SwarmUIPort = config.RunPodPods_SwarmUIPort,
                 TerminateOnShutdown = config.RunPodPods_TerminateOnShutdown,
-                PodName = config.RunPodPods_PodName,
+                // Falls back to a name unique to this backend rather than a shared literal - see the
+                // ConfigComment on RunPodPods_PodName for why a shared default is a collision risk.
+                PodName = string.IsNullOrWhiteSpace(config.RunPodPods_PodName) ? $"swarmui-cloudbackends-{BackendData.ID}" : config.RunPodPods_PodName,
                 ImageName = config.RunPodPods_ImageName,
                 TemplateId = config.RunPodPods_TemplateId,
                 GpuTypeId = config.RunPodPods_GpuTypeId,
@@ -175,6 +229,32 @@ public class CloudBackendsBackend : AbstractT2IBackend
                 AutoRefresh = config.VastAI_AutoRefresh
             };
             AddChild(CloudBackendTypes.VastAI, settings, "Vast.ai Serverless");
+            enabledCount++;
+        }
+        if (config.VastAIInstance_Enabled)
+        {
+            VastAIInstanceBackend.Settings settings = new()
+            {
+                InstanceId = config.VastAIInstance_InstanceId,
+                SwarmUIPort = config.VastAIInstance_SwarmUIPort,
+                TerminateOnShutdown = config.VastAIInstance_TerminateOnShutdown,
+                // Falls back to a label unique to this backend rather than a shared literal - see the
+                // ConfigComment on VastAIInstance_Label for why a shared default is a collision risk.
+                Label = string.IsNullOrWhiteSpace(config.VastAIInstance_Label) ? $"swarmui-cloudbackends-{BackendData.ID}" : config.VastAIInstance_Label,
+                Image = config.VastAIInstance_Image,
+                TemplateHashId = config.VastAIInstance_TemplateHashId,
+                OfferId = config.VastAIInstance_OfferId,
+                DiskGb = config.VastAIInstance_DiskGb,
+                NetworkVolumeId = config.VastAIInstance_NetworkVolumeId,
+                VolumeMountPath = config.VastAIInstance_VolumeMountPath,
+                Env = config.VastAIInstance_Env,
+                StartupTimeoutSec = config.VastAIInstance_StartupTimeoutSec,
+                PollIntervalMs = config.VastAIInstance_PollIntervalMs,
+                StartOnEnable = config.VastAIInstance_StartOnEnable,
+                MaxRuntimeMinutes = config.VastAIInstance_MaxRuntimeMinutes,
+                MaxSpendUsd = config.VastAIInstance_MaxSpendUsd
+            };
+            AddChild(CloudBackendTypes.VastAIInstance, settings, "Vast.ai Instances");
             enabledCount++;
         }
         Status = BackendStatus.RUNNING;

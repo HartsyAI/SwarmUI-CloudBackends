@@ -1,6 +1,7 @@
 using Hartsy.Extensions.CloudBackends;
 using Hartsy.Extensions.CloudBackends.Core;
 using Hartsy.Extensions.CloudBackends.Providers.RunPod;
+using Hartsy.Extensions.CloudBackends.Providers.VastAI;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
 using SwarmUI.Backends;
@@ -20,9 +21,13 @@ public static class CloudBackendsWebAPI
         API.RegisterAPICall(CloudStartPod, true, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudStopPod, true, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudGetPodStatus, false, CloudBackendsExtension.PermUseRunPodPods);
+        API.RegisterAPICall(VastAIStartInstance, true, CloudBackendsExtension.PermUseVastAIInstances);
+        API.RegisterAPICall(VastAIStopInstance, true, CloudBackendsExtension.PermUseVastAIInstances);
+        API.RegisterAPICall(VastAIGetInstanceStatus, false, CloudBackendsExtension.PermUseVastAIInstances);
         API.RegisterAPICall(CloudDebugInvalidateSession, true, Permissions.EditBackends);
         API.RegisterAPICall(CloudListRunPodOptions, false, Permissions.EditBackends);
-        Logs.Verbose("[CloudBackendsWebAPI] Registered API routes: CloudRefreshModels, CloudGetStatus, CloudStartPod, CloudStopPod, CloudGetPodStatus, CloudDebugInvalidateSession, CloudListRunPodOptions");
+        API.RegisterAPICall(VastAIListInstanceOptions, false, Permissions.EditBackends);
+        Logs.Verbose("[CloudBackendsWebAPI] Registered API routes: CloudRefreshModels, CloudGetStatus, CloudStartPod, CloudStopPod, CloudGetPodStatus, VastAIStartInstance, VastAIStopInstance, VastAIGetInstanceStatus, CloudDebugInvalidateSession, CloudListRunPodOptions, VastAIListInstanceOptions");
     }
 
     /// <summary>True if the session's user may act on this backend (each provider defines its own permission).</summary>
@@ -62,6 +67,26 @@ public static class CloudBackendsWebAPI
                 + (string.IsNullOrWhiteSpace(lastStatus) ? "" : $" Last status: {lastStatus}");
         }
         return $"No RunPod GPU Pods backend found for #{id}. Is the RunPod GPU Pods section enabled and saved?";
+    }
+
+    /// <summary>Same by-parent-ID lookup as <see cref="FindRunPodPodsChild"/>, for the Vast.ai Instances child.</summary>
+    static VastAIInstanceBackend FindVastAIInstanceChild(int id) =>
+        Program.Backends.RunningBackendsOfType<VastAIInstanceBackend>()
+            .FirstOrDefault(b => b.BackendData?.ID == id || b.BackendData?.AbstractParent?.ID == id);
+
+    /// <summary>Same "surface the real reason" fallback as <see cref="RunPodPodsNotFoundMessage"/>, for Vast.ai Instances.</summary>
+    static string VastAIInstanceNotFoundMessage(int id)
+    {
+        AbstractBackend match = Program.Backends.AllBackends.Values
+            .Select(d => d.AbstractBackend)
+            .FirstOrDefault(b => b is VastAIInstanceBackend && (b.AbstractBackendData?.ID == id || b.AbstractBackendData?.AbstractParent?.ID == id));
+        if (match is not null)
+        {
+            string lastStatus = match.LoadStatusReport?.LastOrDefault()?.Message;
+            return $"Vast.ai Instances backend for #{id} is {match.Status} (not usable right now)."
+                + (string.IsNullOrWhiteSpace(lastStatus) ? "" : $" Last status: {lastStatus}");
+        }
+        return $"No Vast.ai Instances backend found for #{id}. Is the Vast.ai Instances section enabled and saved?";
     }
 
     /// <summary>Manually trigger a model refresh from workers for all running cloud backends the user may access.</summary>
@@ -235,6 +260,94 @@ public static class CloudBackendsWebAPI
     }
 
     /// <summary>
+    /// Starts (or creates, per settings) the Vast.ai instance behind a Vast.ai Instances backend and
+    /// attaches its Swarm backend. <paramref name="backend_id"/> is the "Cloud Backends" parent's ID.
+    /// </summary>
+    public static async Task<JObject> VastAIStartInstance(Session session, string backend_id)
+    {
+        try
+        {
+            if (!int.TryParse(backend_id, out int id))
+                return new JObject { ["success"] = false, ["error"] = "Invalid backend_id." };
+            VastAIInstanceBackend backend = FindVastAIInstanceChild(id);
+            if (backend is null)
+                return new JObject { ["success"] = false, ["error"] = VastAIInstanceNotFoundMessage(id) };
+            backend.CheckPermission(session);
+            await backend.StartInstanceAsync();
+            return new JObject { ["success"] = true, ["message"] = $"Instance started for backend #{id}." };
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Error in VastAIStartInstance: {ex.ReadableString()}");
+            return new JObject { ["success"] = false, ["error"] = ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// Stops the Vast.ai instance behind a Vast.ai Instances backend, detaching its Swarm backend first.
+    /// <paramref name="backend_id"/> is the "Cloud Backends" parent's ID.
+    /// </summary>
+    public static async Task<JObject> VastAIStopInstance(Session session, string backend_id)
+    {
+        try
+        {
+            if (!int.TryParse(backend_id, out int id))
+                return new JObject { ["success"] = false, ["error"] = "Invalid backend_id." };
+            VastAIInstanceBackend backend = FindVastAIInstanceChild(id);
+            if (backend is null)
+                return new JObject { ["success"] = false, ["error"] = VastAIInstanceNotFoundMessage(id) };
+            backend.CheckPermission(session);
+            await backend.StopInstanceAsync();
+            return new JObject { ["success"] = true, ["message"] = $"Instance stopped for backend #{id}." };
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Error in VastAIStopInstance: {ex.ReadableString()}");
+            return new JObject { ["success"] = false, ["error"] = ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// Live status of the instance behind a Vast.ai Instances backend - state, GPU, cost/hr, uptime.
+    /// Cached briefly server-side (see <see cref="VastAIInstanceProvider.GetStatusAsync"/>) so a UI poll
+    /// does not hammer Vast's API. <paramref name="backend_id"/> is the "Cloud Backends" parent's ID.
+    /// </summary>
+    public static async Task<JObject> VastAIGetInstanceStatus(Session session, string backend_id, bool force_refresh = false)
+    {
+        try
+        {
+            if (!int.TryParse(backend_id, out int id))
+                return new JObject { ["success"] = false, ["error"] = "Invalid backend_id." };
+            VastAIInstanceBackend backend = FindVastAIInstanceChild(id);
+            if (backend is null)
+                return new JObject { ["success"] = false, ["error"] = VastAIInstanceNotFoundMessage(id) };
+            backend.CheckPermission(session);
+            if (backend.VastProvider is null)
+                return new JObject { ["success"] = false, ["error"] = "Backend has no active provider (not yet initialized)." };
+            VastAIInstanceStatus status = await backend.VastProvider.GetStatusAsync(force_refresh);
+            if (status is null)
+                return new JObject { ["success"] = true, ["has_instance"] = false, ["message"] = "No instance resolved yet - it is created on first Start." };
+            return new JObject
+            {
+                ["success"] = true,
+                ["has_instance"] = true,
+                ["instance_id"] = status.InstanceId,
+                ["status"] = status.Status,
+                ["gpu_name"] = status.GpuName,
+                ["gpu_count"] = status.GpuCount,
+                ["cost_per_hour"] = status.CostPerHour,
+                ["uptime_minutes"] = status.UptimeMinutes,
+                ["public_url"] = status.PublicUrl
+            };
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Error in VastAIGetInstanceStatus: {ex.ReadableString()}");
+            return new JObject { ["success"] = false, ["error"] = ex.Message };
+        }
+    }
+
+    /// <summary>
     /// Lists what the user's RunPod account can actually use right now: GPU types with live
     /// availability and price, network volumes, data centers and templates.
     ///
@@ -261,6 +374,33 @@ public static class CloudBackendsWebAPI
         catch (Exception ex)
         {
             Logs.Error($"[CloudBackends] Error in CloudListRunPodOptions: {ex.ReadableString()}");
+            return new JObject { ["success"] = false, ["error"] = ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// Lists what the user's Vast.ai account can actually rent right now: on-demand offers (GPU, price,
+    /// location) and the account's own network volumes. Same purpose as <see cref="CloudListRunPodOptions"/>.
+    /// </summary>
+    public static async Task<JObject> VastAIListInstanceOptions(Session session)
+    {
+        try
+        {
+            if (session?.User is null)
+            {
+                return new JObject { ["success"] = false, ["error"] = "No user session." };
+            }
+            string key = session.User.GetGenericData("vastai_api", "key")?.Trim();
+            if (string.IsNullOrEmpty(key))
+            {
+                return new JObject { ["success"] = false, ["error"] = "No Vast.ai API key set. Add one in User Settings, API Keys, Vast.ai, then reopen this form." };
+            }
+            using VastAIInstanceProvider provider = new(key, new VastAIInstancePlan());
+            return await provider.ListAccountOptionsAsync();
+        }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Error in VastAIListInstanceOptions: {ex.ReadableString()}");
             return new JObject { ["success"] = false, ["error"] = ex.Message };
         }
     }
