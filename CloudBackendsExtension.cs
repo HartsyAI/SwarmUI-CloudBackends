@@ -16,9 +16,9 @@ namespace Hartsy.Extensions.CloudBackends;
 /// <summary>
 /// Entry point for the SwarmUI Cloud Backends extension.
 /// Registers one user-facing backend type, "Cloud Backends" (<see cref="CloudBackendsBackend"/>), which
-/// internally spins up hidden children for whichever of RunPod Serverless, RunPod GPU Pods, and Vast.ai
-/// its settings have enabled. See <see cref="CloudBackendTypes"/> for how those providers stay fully
-/// functional without being independently addable.
+/// internally spins up hidden children for whichever of RunPod Serverless, RunPod GPU Pods, Vast.ai
+/// Serverless, and Vast.ai Instances its settings have enabled. See <see cref="CloudBackendTypes"/> for
+/// how those providers stay fully functional without being independently addable.
 ///
 /// To add a future provider (e.g. Massed Compute):
 ///   1. Create Providers/MassedCompute/MassedComputeProvider.cs implementing ICloudProvider.
@@ -46,6 +46,11 @@ public class CloudBackendsExtension : Extension
     public static readonly PermInfo PermUseVastAI = Permissions.Register(new PermInfo(
         "use_vastai", "Use Vast.ai",
         "Allows using Vast.ai's serverless GPU endpoints for image generation.",
+        PermissionDefault.POWERUSERS, CloudPermGroup));
+
+    public static readonly PermInfo PermUseVastAIInstances = Permissions.Register(new PermInfo(
+        "use_vastai_instances", "Use Vast.ai Instances",
+        "Allows using Vast.ai on-demand rented instances for image generation.",
         PermissionDefault.POWERUSERS, CloudPermGroup));
 
     public static readonly PermInfo PermCloudStatus = Permissions.Register(new PermInfo(
@@ -102,7 +107,7 @@ public class CloudBackendsExtension : Extension
         // ── Web API ───────────────────────────────────────────────────────────
         CloudBackendsWebAPI.Register();
 
-        Logs.Info("Cloud Backends extension loaded (one 'Cloud Backends' entry, providers: RunPod Serverless, RunPod GPU Pods, Vast.ai).");
+        Logs.Info("Cloud Backends extension loaded (one 'Cloud Backends' entry, providers: RunPod Serverless, RunPod GPU Pods, Vast.ai Serverless, Vast.ai Instances).");
     }
 
     // ── Registration helpers ──────────────────────────────────────────────────
