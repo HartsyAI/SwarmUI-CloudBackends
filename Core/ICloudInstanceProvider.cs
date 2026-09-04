@@ -27,6 +27,13 @@ public interface ICloudInstanceProvider : IDisposable
     string ProviderName { get; }
 
     /// <summary>
+    /// Provider-side ID of the instance this provider is bound to, or empty until one is resolved.
+    /// Set as soon as an instance is created or found - even if the start later fails - so the backend
+    /// can remember it for reattachment (a created instance bills whether or not the start finished).
+    /// </summary>
+    string ActiveInstanceId { get; }
+
+    /// <summary>
     /// Cheap check that credentials and configuration are usable, called before anything is started.
     /// Throw <see cref="SwarmUI.Utils.SwarmReadableErrorException"/> with an actionable message on failure.
     /// </summary>
@@ -40,6 +47,13 @@ public interface ICloudInstanceProvider : IDisposable
 
     /// <summary>Releases the instance, stopping or destroying it according to the provider's configuration.</summary>
     Task ReleaseInstanceAsync(CancellationToken cancel = default);
+
+    /// <summary>
+    /// Live status of the instance (state, GPU, cost/hr, uptime), or null if no instance has been
+    /// resolved yet. Cached briefly unless <paramref name="forceRefresh"/> is set, so UI polls do not
+    /// hammer the provider's rate-limited API.
+    /// </summary>
+    Task<CloudInstanceStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default);
 
     /// <summary>
     /// Current hourly billing rate for the running instance, if the provider can report one. Used only

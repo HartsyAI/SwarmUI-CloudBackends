@@ -1,4 +1,5 @@
 using FreneticUtilities.FreneticDataSyntax;
+using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
 using SwarmUI.Backends;
 using SwarmUI.Core;
@@ -20,8 +21,39 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 /// model listing, websockets, previews, interrupts and parameter forwarding are all core Swarm code
 /// that already works, rather than a reimplementation that has to be kept in step with it.
 /// </summary>
-public abstract class CloudInstanceBackendBase : AbstractT2IBackend
+public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBackend
 {
+    /// <inheritdoc/>
+    public string CloudProviderName => Provider?.ProviderName;
+
+    /// <inheritdoc/>
+    public string OwnerUserId { get; set; }
+
+    /// <summary>The owning user, resolved fresh from the user DB, or null if the user no longer exists.</summary>
+    public User Owner => string.IsNullOrWhiteSpace(OwnerUserId) ? null : Program.Sessions.GetUser(OwnerUserId, makeNew: false);
+
+    /// <summary>The API key the current <see cref="Provider"/> was built with, for rotation detection.</summary>
+    protected string ProviderApiKey;
+
+    /// <inheritdoc/>
+    public bool IsUsingApiKey(string apiKey) => apiKey == ProviderApiKey;
+
+    /// <inheritdoc/>
+    public JObject GetStatusNet()
+    {
+        return new JObject
+        {
+            ["id"] = BackendData?.ID,
+            ["title"] = Title,
+            ["provider"] = CloudProviderName ?? "Unknown",
+            ["kind"] = "instance",
+            ["status"] = Status.ToString(),
+            ["instance_id"] = CurrentInstance?.InstanceId,
+            ["instance_url"] = CurrentInstance?.PublicUrl,
+            ["child_backend_id"] = ChildBackend?.ID
+        };
+    }
+
     /// <summary>Settings every instance-renting provider shares.</summary>
     public class InstanceSettings : AutoConfiguration
     {
@@ -47,8 +79,8 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
     /// <summary>Factory: build a provider using the given API key.</summary>
     protected abstract ICloudInstanceProvider CreateProvider(string apiKey);
 
-    /// <summary>Retrieve the provider API key for <paramref name="session"/>. Throw a readable error if missing.</summary>
-    protected abstract string GetApiKey(Session session);
+    /// <summary>Retrieve the provider API key for <paramref name="user"/>. Throw a readable error if missing.</summary>
+    protected abstract string GetApiKey(User user);
 
     /// <summary>Throw <see cref="SwarmReadableErrorException"/> if the session user lacks permission.</summary>
     public abstract void CheckPermission(Session session);
@@ -131,24 +163,58 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
         finally { FailsafeTripped = false; }
     }
 
+    // ── Per-user instance persistence ─────────────────────────────────────────
+
+    /// <summary>
+    /// Per-user KV name this backend's created instance ID is remembered under (SaveGenericData
+    /// lowercases it). Keyed by class plus the user-visible parent backend ID, so each provider section
+    /// of each "Cloud Backends" entry remembers its own instance per user. Note this key follows the
+    /// parent's ID: renumbering the backend via EditBackend's new_id orphans the remembered instance
+    /// (same pre-existing property as the default pod naming scheme).
+    /// </summary>
+    string PersistName => $"{GetType().Name}_{BackendData?.AbstractParent?.ID ?? BackendData?.ID}";
+
+    /// <summary>
+    /// Instance ID remembered from a previous run for this owner, loaded at Init. Subclasses feed this
+    /// to their provider as a reattach hint (used only after live verification, never trusted blindly),
+    /// so a restart reattaches the owner's existing billed instance instead of creating a second one.
+    /// </summary>
+    protected string PersistedInstanceId { get; private set; }
+
+    /// <summary>Remembers the provider's active instance ID in the owner's user data (no-op if unchanged or unknown).</summary>
+    void PersistActiveInstanceId()
+    {
+        string id = Provider?.ActiveInstanceId;
+        if (string.IsNullOrWhiteSpace(id) || id == PersistedInstanceId)
+        {
+            return;
+        }
+        PersistedInstanceId = id;
+        Owner?.SaveGenericData("cloudbackends", PersistName, id);
+        Logs.Debug($"[{Provider?.ProviderName}] Remembered instance '{id}' for user '{OwnerUserId}' under '{PersistName.ToLowerInvariant()}'.");
+    }
+
     public override async Task Init()
     {
         Program.TickEvent += FailsafeTick;
         AddLoadStatus($"Starting {GetType().Name} backend...");
-        Session session;
         string apiKey;
         try
         {
             CheckRequiredConfig();
-            session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
-            apiKey = GetApiKey(session);
+            // Every cloud backend runs on its owner's own key - there is deliberately no fallback to
+            // any other user's key, so a misconfigured owner is a hard error rather than a mis-bill.
+            User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend has no valid owner user ('{OwnerUserId}').");
+            apiKey = GetApiKey(owner);
+            PersistedInstanceId = owner.GetGenericData("cloudbackends", PersistName)?.Trim();
         }
         catch (Exception ex)
         {
-            Status = BackendStatus.ERRORED;
             AddLoadStatus($"ERROR: {ex.Message}");
+            Status = BackendStatus.ERRORED;
             return;
         }
+        ProviderApiKey = apiKey;
         Provider = CreateProvider(apiKey);
         try
         {
@@ -158,8 +224,8 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
         }
         catch (Exception ex)
         {
-            Status = BackendStatus.ERRORED;
             AddLoadStatus($"ERROR: {Provider.ProviderName} validation failed: {ex.Message}");
+            Status = BackendStatus.ERRORED;
             return;
         }
         // A control instance must not be offered for generation itself.
@@ -178,15 +244,36 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
         }
         catch (Exception ex)
         {
-            Status = BackendStatus.ERRORED;
             AddLoadStatus($"ERROR: {ex.Message}");
+            Status = BackendStatus.ERRORED;
             Logs.Error($"[{Provider?.ProviderName}] Failed to start cloud instance: {ex.ReadableString()}");
         }
     }
 
     /// <summary>
-    /// Starts the cloud instance if it is not already running, and attaches a SwarmSwarmBackend child
-    /// to it. Safe to call repeatedly.
+    /// Re-resolves the owner's API key and rebuilds the provider if it changed, so a key rotation takes
+    /// effect on the next start instead of requiring a disable/re-enable cycle. Must be called under
+    /// <see cref="InstanceLock"/>. Safe while no instance is attached; the persisted instance ID (not
+    /// in-memory provider state) is what carries reattachment across the rebuild.
+    /// </summary>
+    void RefreshProviderIfKeyChanged()
+    {
+        User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend's owner user ('{OwnerUserId}') no longer exists.");
+        string currentKey = GetApiKey(owner);
+        if (currentKey == ProviderApiKey)
+        {
+            return;
+        }
+        Logs.Info($"[{Provider?.ProviderName}] API key changed for user '{OwnerUserId}', rebuilding provider for backend #{BackendData?.ID}.");
+        ICloudInstanceProvider oldProvider = Provider;
+        Provider = CreateProvider(currentKey);
+        ProviderApiKey = currentKey;
+        oldProvider?.Dispose();
+    }
+
+    /// <summary>
+    /// Starts the cloud instance if it is not already running, and attaches the owner-bound swarm
+    /// child to it. Safe to call repeatedly.
     /// </summary>
     public async Task StartInstanceAsync()
     {
@@ -197,8 +284,19 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
             {
                 return;
             }
+            RefreshProviderIfKeyChanged();
             AddLoadStatus($"Starting {Provider.ProviderName} instance (up to {InstanceConfig.StartupTimeoutSec}s)...");
-            CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, InstanceConfig.PollIntervalMs, Program.GlobalProgramCancel);
+            try
+            {
+                CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, InstanceConfig.PollIntervalMs, Program.GlobalProgramCancel);
+            }
+            finally
+            {
+                // Remember the instance even when the start times out partway: it may already have been
+                // created (and be billing), and the remembered ID is what lets the next attempt reattach
+                // it rather than create a second one.
+                PersistActiveInstanceId();
+            }
             AddLoadStatus($"Instance '{CurrentInstance.InstanceId}' is up at {CurrentInstance.PublicUrl}, attaching Swarm backend...");
             AttachChildBackend();
             InstanceStartedAt = DateTime.UtcNow;
@@ -208,11 +306,12 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
     }
 
     /// <summary>
-    /// Hands the instance URL to core's SwarmSwarmBackend as a non-real child. That child is a control
-    /// instance in its own right: it mirrors the remote's backends, models and features, and spawns its
-    /// own children which perform generation.
+    /// Hands the instance URL to a swarm backend as a non-real child. That child is a control instance
+    /// in its own right: it mirrors the remote's backends, models and features, and spawns its own
+    /// children which perform generation. The child is an <see cref="OwnerBoundSwarmBackend"/> (not
+    /// core's plain SwarmSwarmBackend) so the whole tree refuses generations from anyone but the owner.
     /// </summary>
-    void AttachChildBackend()
+    internal void AttachChildBackend()
     {
         SwarmSwarmBackend.SwarmSwarmBackendSettings settings = new()
         {
@@ -228,12 +327,15 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend
             AllowWebsocket = true,
             ConnectionAttemptTimeoutSeconds = Math.Max(30, InstanceConfig.StartupTimeoutSec / 4)
         };
-        ChildBackend = Handler.AddNewNonrealBackend(Handler.SwarmBackendType, BackendData, settings, newData =>
+        ChildBackend = Handler.AddNewNonrealBackend(CloudBackendTypes.OwnerBoundSwarm, BackendData, settings, newData =>
         {
             SwarmSwarmBackend swarm = newData.AbstractBackend as SwarmSwarmBackend;
             swarm.IsSpecialControlled = true;
             swarm.CanLoadModels = false;
             swarm.Title = $"[{Provider.ProviderName} {CurrentInstance.InstanceId}] {(string.IsNullOrWhiteSpace(CurrentInstance.Description) ? "Cloud Instance" : CurrentInstance.Description)}";
+            // Core's AddNewNonrealBackend takes a parent argument but never assigns it - set it
+            // ourselves, since OwnerBoundSwarmBackend's ownership walk relies on this exact link.
+            newData.AbstractParent = BackendData;
             newData.UpdateLastReleaseTime();
         });
         Logs.Info($"[{Provider.ProviderName}] Attached Swarm backend #{ChildBackend.ID} to instance '{CurrentInstance.InstanceId}'.");
