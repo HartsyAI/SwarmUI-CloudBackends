@@ -38,8 +38,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public int RunPodServerless_GenerationTimeoutSec = 300;
         [ConfigComment("How long to keep a woken worker alive after each request (seconds).")]
         public int RunPodServerless_KeepaliveSeconds = 420;
-        [ConfigComment("Refresh available models from the worker on backend init (background).")]
-        public bool RunPodServerless_AutoRefresh = false;
 
         // ── RunPod GPU Pods ──────────────────────────────────────────────────
         [ConfigComment("Enable a RunPod GPU Pod.")]
@@ -87,8 +85,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public int RunPodPods_StartupTimeoutSec = 900;
         [ConfigComment("How often to poll RunPod while waiting for the pod to start, in milliseconds.")]
         public int RunPodPods_PollIntervalMs = 5000;
-        [ConfigComment("Start (creating it if needed) the pod as soon as this section is enabled and saved.\nOff by default: with the Start Pod button available, enabling this section should not silently create/bill a pod - use the button, or turn this on if you want it automatic.")]
-        public bool RunPodPods_StartOnEnable = false;
         [ConfigComment("Failsafe: auto-stop the pod after it has been running this many minutes, in case you forgot to turn it off. Zero disables this check.")]
         public int RunPodPods_MaxRuntimeMinutes = 0;
         [ConfigComment("Failsafe: auto-stop the pod once its estimated spend (hourly rate x time running) reaches this many US dollars. Zero disables this check.")]
@@ -112,8 +108,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public int VastAI_GenerationTimeoutSec = 300;
         [ConfigComment("How long to keep a woken worker alive after each request (seconds).")]
         public int VastAI_KeepaliveSeconds = 420;
-        [ConfigComment("Refresh available models from the worker on backend init (background).")]
-        public bool VastAI_AutoRefresh = false;
 
         // ── Vast.ai Instances ────────────────────────────────────────────────
         // Prefixed VastAIInstance_ (not VastAI_, which the Serverless section above already owns).
@@ -151,8 +145,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public int VastAIInstance_StartupTimeoutSec = 900;
         [ConfigComment("How often to poll Vast.ai while waiting for the instance to start, in milliseconds.")]
         public int VastAIInstance_PollIntervalMs = 5000;
-        [ConfigComment("Start (creating it if needed) the instance as soon as this section is enabled and saved.\nOff by default, same reasoning as RunPod GPU Pods: use the Start button, or turn this on if you want it automatic.")]
-        public bool VastAIInstance_StartOnEnable = false;
         [ConfigComment("Failsafe: auto-stop the instance after it has been running this many minutes, in case you forgot to turn it off. Zero disables this check.")]
         public int VastAIInstance_MaxRuntimeMinutes = 0;
         [ConfigComment("Failsafe: auto-stop the instance once its estimated spend (hourly rate x time running) reaches this many US dollars. Zero disables this check.")]
@@ -300,14 +292,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
                 }
             }
             AutoConfiguration settings = BuildChildSettings(def);
-            if (settings is CloudBackendBase.BaseSettings serverless)
-            {
-                serverless.AutoRefresh = false;
-            }
-            if (settings is CloudInstanceBackendBase.InstanceSettings instance)
-            {
-                instance.StartOnEnable = false;
-            }
             if (settings is RunPodPodsBackend.Settings pods && string.IsNullOrWhiteSpace(pods.PodName))
             {
                 // A name unique to this backend AND user, so each user's find-by-name reattaches their

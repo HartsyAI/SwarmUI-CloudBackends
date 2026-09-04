@@ -66,8 +66,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             ["model_count"] = Models?.Values.Sum(l => l.Count) ?? 0,
             ["worker_id"] = CurrentWorker?.WorkerId,
             ["worker_url"] = CurrentWorker?.PublicUrl,
-            ["max_concurrent"] = BaseConfig.MaxConcurrent,
-            ["auto_refresh"] = BaseConfig.AutoRefresh
+            ["max_concurrent"] = BaseConfig.MaxConcurrent
         };
     }
 
@@ -119,9 +118,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 
         [ConfigComment("How long to keep a woken worker alive after each request (seconds).\nThis is what you pay for while idle, so lower is cheaper - but it MUST exceed your longest single generation, or the worker can be torn down mid-generation.\nAutomatically raised to at least the generation timeout plus two minutes.")]
         public int KeepaliveSeconds = 420;
-
-        [ConfigComment("Refresh available models from the worker on backend init (background).")]
-        public bool AutoRefresh = false;
     }
 
     /// <summary>Returns the subclass's settings cast to <see cref="BaseSettings"/>.</summary>
@@ -273,20 +269,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         MaxUsages = Math.Max(1, BaseConfig.MaxConcurrent);
         Status = BackendStatus.RUNNING;
         CanLoadModels = true;
+        // Models are deliberately NOT refreshed here: listing them wakes a billed worker, and a backend
+        // that comes into being because its owner generated something must never spend money on its own.
+        // The CloudRefreshModels route is the explicit, user-initiated way to do it.
         AddLoadStatus($"{Provider.ProviderName} backend ready (endpoint: {BaseConfig.EndpointId}, max concurrent: {MaxUsages}).");
-        if (BaseConfig.AutoRefresh)
-        {
-            _ = Utilities.RunCheckedTask(async () =>
-            {
-                try
-                {
-                    AddLoadStatus("Refreshing models from worker (background)...");
-                    await RefreshModelsFromWorkerAsync();
-                    AddLoadStatus("Model refresh complete.");
-                }
-                catch (Exception ex) { AddLoadStatus($"Model refresh failed: {ex.Message}"); }
-            });
-        }
     }
 
     public override async Task Shutdown()
