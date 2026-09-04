@@ -63,9 +63,6 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         [ConfigComment("How often to poll the provider while waiting for the instance to start, in milliseconds.")]
         public int PollIntervalMs = 5000;
 
-        [ConfigComment("Start the cloud instance as soon as this backend is enabled.\nIf off, the backend stays idle and the instance is only started when you press Start on it.")]
-        public bool StartOnEnable = true;
-
         [ConfigComment("Failsafe: auto-stop the instance after it has been running this many minutes, in case you forgot to turn it off. Zero disables this check.")]
         public int MaxRuntimeMinutes = 0;
 
@@ -231,23 +228,11 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         // A control instance must not be offered for generation itself.
         CanLoadModels = false;
         MaxUsages = 1;
-        if (!InstanceConfig.StartOnEnable)
-        {
-            Status = BackendStatus.RUNNING;
-            AddLoadStatus($"{Provider.ProviderName} backend ready. The instance is not started; it will start on demand.");
-            return;
-        }
-        try
-        {
-            await StartInstanceAsync();
-            Status = BackendStatus.RUNNING;
-        }
-        catch (Exception ex)
-        {
-            AddLoadStatus($"ERROR: {ex.Message}");
-            Status = BackendStatus.ERRORED;
-            Logs.Error($"[{Provider?.ProviderName}] Failed to start cloud instance: {ex.ReadableString()}");
-        }
+        // The instance is deliberately NOT started here: renting one bills continuously, and a backend
+        // that comes into being on its owner's first use must never do that on its own. Start is always
+        // an explicit action (the Start button, or the start API route).
+        Status = BackendStatus.RUNNING;
+        AddLoadStatus($"{Provider.ProviderName} backend ready. The instance is not started yet; press Start to rent one.");
     }
 
     /// <summary>
