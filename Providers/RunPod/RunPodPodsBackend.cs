@@ -82,15 +82,13 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
 
     Settings PodConfig => (Settings)SettingsRaw;
 
-    /// <summary>Typed access to the pod provider, for the WebAPI routes.</summary>
-    public RunPodPodsProvider PodsProvider => Provider as RunPodPodsProvider;
-
     protected override ICloudInstanceProvider CreateProvider(string apiKey)
     {
         Settings config = PodConfig;
         return new RunPodPodsProvider(apiKey, new RunPodPodPlan
         {
             PodId = config.PodId?.Trim() ?? "",
+            PersistedId = PersistedInstanceId ?? "",
             SwarmUIPort = config.SwarmUIPort,
             AutoCreate = true,
             PodName = string.IsNullOrWhiteSpace(config.PodName) ? "swarmui-cloudbackends" : config.PodName.Trim(),
@@ -109,16 +107,12 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
         });
     }
 
-    protected override string GetApiKey(Session session)
+    protected override string GetApiKey(User user)
     {
-        if (session?.User is null)
-        {
-            throw new SwarmReadableErrorException("No user session. Log in and configure a RunPod API key in User Settings, API Keys.");
-        }
-        string key = session.User.GetGenericData("runpod_api", "key")?.Trim();
+        string key = user?.GetGenericData("runpod_api", "key")?.Trim();
         if (string.IsNullOrEmpty(key))
         {
-            throw new SwarmReadableErrorException($"RunPod API key not configured for user '{session.User.UserID}'. Set it in User Settings, API Keys, RunPod.");
+            throw new SwarmReadableErrorException($"RunPod API key not configured for user '{user?.UserID}'. Set it in User Settings, API Keys, RunPod.");
         }
         return key;
     }

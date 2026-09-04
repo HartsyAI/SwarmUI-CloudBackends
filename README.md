@@ -12,7 +12,17 @@ This supersedes the older single provider extensions `SwarmUI-Runpod-Serverless-
 
 ![Add new backend - only one Cloud Backends button among the advanced types](Assets/screenshots/add-backend-button.png)
 
-Adding it gives you one settings card with a collapsible section per provider (RunPod Serverless / RunPod GPU Pods / Vast.ai Serverless / Vast.ai Instances), each with its own enable toggle and fields, no API key fields in this card (those stay in **User Settings > API Keys** as always). Enabling a section spins that provider up as a hidden backend behind the scenes, using the exact same code paths described below; the internal `runpod_serverless`/`runpod_pods`/`vastai_serverless`/`vastai_instance` backend types still exist, they just aren't independently addable or listed in the per-generation backend-type dropdown any more.
+Adding it gives you one settings card with a collapsible section per provider (RunPod Serverless / RunPod GPU Pods / Vast.ai Serverless / Vast.ai Instances), each with its own enable toggle and fields, no API key fields in this card (those stay in **User Settings > API Keys** as always). The card is a pool manager: enabling a section makes that provider available, and an actual hidden backend is created **per user, on that user's own API key**, the first time the user generates (serverless) or presses Start (instances). The internal `runpod_serverless_hidden`/`runpod_pods_hidden`/`vastai_serverless_hidden`/`vastai_instance_hidden` backend types still exist, they just aren't independently addable or listed in the per-generation backend-type dropdown.
+
+### Per-user backends
+
+Every cloud backend belongs to exactly one user and runs on that user's own key:
+
+* A user with no key on file gets a clean refusal ("No ... API key on file for user '...'"), never another user's worker or bill.
+* A user's generations only route to (and are only accepted by) their own cloud backends - this holds for serverless workers and for the whole backend tree attached to a rented instance.
+* Changing your API key takes effect on the next use automatically; no disable/re-enable cycle needed.
+* A created pod/instance is remembered per user (in the user database) and reattached after a SwarmUI restart instead of creating a second billed one; find-by-name/label (unique per backend and user by default) covers the same case as a fallback. Under `--no_persist` (or if the backend is later renumbered via an ID edit) the remembered ID is not written/found, and find-by-name/label alone carries reattachment.
+* Cost safety rule: an implicitly-created backend never spends money by itself. Serverless children never auto-refresh models (that wakes a billed worker - use the refresh button/route), and instance children never auto-start their instance (use Start).
 
 ![Cloud Backends card with all four provider sections collapsed](Assets/screenshots/accordion-collapsed.png)
 
@@ -66,7 +76,8 @@ The extension plugs into SwarmUI's own systems rather than reinventing them:
 * `CloudBackendsBackend` is the one publicly registered backend type; the three providers' own `BackendType` records are built without calling the public registry, so they're usable internally (as hidden children) without being independently addable. See `CloudBackendTypes`.
 * API keys live in the per user key store under **User Settings > API Keys** (`runpod_api`, `vastai_api`).
 * Serverless remote models are merged into the model browser through `ExtraModelProviders`, and generating with a cloud only model auto routes to the cloud backend. A pod's models reach the browser through core's own `remote_swarm` provider instead, since the attached `SwarmSwarmBackend` is a real backend as far as core is concerned.
-* Permissions: `use_runpod_serverless`, `use_runpod_pods`, `use_vastai`, and `cloudbackends_status`.
+* Permissions: `use_runpod_serverless`, `use_runpod_pods`, `use_vastai`, `use_vastai_instances`, and `cloudbackends_status`.
+* Every action is reachable over the plain API (`CloudGetStatus`, `CloudRefreshModels`, `CloudStartPod`/`CloudStopPod`/`CloudGetPodStatus`, `VastAIStartInstance`/`VastAIStopInstance`/`VastAIGetInstanceStatus`, `CloudListProviders`), and the start/stop calls have websocket variants (`...WS`) that stream progress lines while a cold instance boots.
 
 ## Setup for RunPod Serverless
 
@@ -120,9 +131,10 @@ Generation traffic goes straight to the worker's URL and never enters RunPod's j
 
 ## Notes and limitations
 
-* **Cloud models must be discovered before you can generate with them.** With `AutoRefresh` off, call `/API/CloudRefreshModels` once per server start, or turn `AutoRefresh` on. Until then SwarmUI does not know those model names and will reject the request.
-* `AutoRefresh: true` wakes a paid GPU worker on every SwarmUI start in order to list models. Leave it off unless you want that.
-* The API key is read once when the backend initializes. After changing your key, disable and re-enable the backend.
+* **Cloud models must be discovered before you can generate with them.** Call `/API/CloudRefreshModels` once per server start (it is a deliberate action because it wakes a billed worker). Until then SwarmUI does not know those model names and will reject the request. The `AutoRefresh` setting is deliberately not honored on per-user backends - waking a paid worker must never be a side effect.
+* The model *list* is merged across users' serverless backends (core's model-list hook carries no user context); generation itself stays strictly per-user - routing a request at another user's model gets a clean refusal. Per-user listing needs a core PR.
+* Editing the Cloud Backends card's settings restarts it, which drops every user's hidden children (including stopping started instances); users get fresh ones on next use. Core restarts any backend you edit - this is the same behavior, just fanned out.
+* API keys are stored cleartext in `Data/Users.ldb` (and its periodic backups) by core's per-user key store. Protect that directory accordingly; masking there is core's to fix, not this extension's.
 * `GenerationTimeoutSec` above 600 is capped by the shared HTTP client's 10 minute ceiling.
 * `KeepaliveSeconds` (default 420) is what you pay for while idle, so lower is cheaper. It is automatically raised to at least `GenerationTimeoutSec` plus two minutes so a worker is never torn down mid generation.
 

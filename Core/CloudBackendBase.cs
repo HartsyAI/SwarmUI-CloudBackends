@@ -23,24 +23,78 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 ///
 /// Everything else - worker caching, model refresh, Generate, GenerateLive, LoadModel - lives here.
 /// </summary>
-public abstract class CloudBackendBase : AbstractT2IBackend
+public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 {
-    // ── Shared HTTP client ────────────────────────────────────────────────────
+    /// <inheritdoc/>
+    public string CloudProviderName => Provider?.ProviderName;
 
+    /// <inheritdoc/>
+    public string OwnerUserId { get; set; }
+
+    /// <summary>The owning user, resolved fresh from the user DB, or null if the user no longer exists.</summary>
+    public User Owner => string.IsNullOrWhiteSpace(OwnerUserId) ? null : Program.Sessions.GetUser(OwnerUserId, makeNew: false);
+
+    /// <summary>The API key the current <see cref="Provider"/> was built with, for rotation detection.</summary>
+    protected string ProviderApiKey;
+
+    /// <inheritdoc/>
+    public bool IsUsingApiKey(string apiKey) => apiKey == ProviderApiKey;
+
+    /// <inheritdoc/>
+    public override bool IsValidForThisBackend(T2IParamInput input)
+    {
+        string requester = input.SourceSession?.User?.UserID;
+        if (requester is not null && requester != OwnerUserId)
+        {
+            input.RefusalReasons.Add($"{CloudProviderName ?? "Cloud"} backend #{BackendData?.ID} belongs to another user. Your own is created automatically once your API key is set in User Settings.");
+            return false;
+        }
+        return true;
+    }
+
+    /// <inheritdoc/>
+    public JObject GetStatusNet()
+    {
+        return new JObject
+        {
+            ["id"] = BackendData?.ID,
+            ["title"] = Title,
+            ["provider"] = CloudProviderName ?? "Unknown",
+            ["kind"] = "serverless",
+            ["status"] = Status.ToString(),
+            ["endpoint"] = BaseConfig.EndpointId,
+            ["model_count"] = Models?.Values.Sum(l => l.Count) ?? 0,
+            ["worker_id"] = CurrentWorker?.WorkerId,
+            ["worker_url"] = CurrentWorker?.PublicUrl,
+            ["max_concurrent"] = BaseConfig.MaxConcurrent,
+            ["auto_refresh"] = BaseConfig.AutoRefresh
+        };
+    }
+
+    /// <summary>Shared HTTP client for direct worker API calls.</summary>
     public static System.Net.Http.HttpClient HttpClient = NetworkBackendUtils.MakeHttpClient();
 
-    // ── Active provider (created in Init) ────────────────────────────────────
-
+    /// <summary>The active provider, created in Init (and rebuilt on API key rotation).</summary>
     public ICloudProvider Provider { get; private set; }
 
     // ── Runtime state ─────────────────────────────────────────────────────────
 
+    /// <summary>Model metadata mirrored from the worker, per subtype, or null before the first refresh.</summary>
     public ConcurrentDictionary<string, Dictionary<string, JObject>> RemoteModels = null;
+
+    /// <summary>Feature IDs the worker's own backends currently advertise.</summary>
     public ConcurrentDictionary<string, string> RemoteFeatureCombo = new();
-    public Session Session = null;
+
+    /// <summary>The currently woken worker, or null when none is trusted alive.</summary>
     public CloudWorkerInfo CurrentWorker = null;
+
+    /// <summary>When the current worker's keepalive runs out and it can no longer be trusted.</summary>
     public DateTime WorkerKeepaliveExpiry = DateTime.MinValue;
+
+    /// <summary>Guards all worker wake/extend/clear state transitions.</summary>
     public SemaphoreSlim WorkerLock = new(1, 1);
+
+    /// <summary>Cancels outstanding keepalive jobs, swapped under <see cref="WorkerLock"/>.</summary>
     public CancellationTokenSource KeepaliveCts = null;
 
     // ── Config ────────────────────────────────────────────────────────────────
@@ -85,8 +139,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend
     /// <summary>Factory: create a provider initialised with the caller's API key.</summary>
     protected abstract ICloudProvider CreateProvider(string apiKey);
 
-    /// <summary>Retrieve the provider API key for <paramref name="session"/>. Throw a readable error if missing.</summary>
-    protected abstract string GetApiKey(Session session);
+    /// <summary>Retrieve the provider API key for <paramref name="user"/>. Throw a readable error if missing.</summary>
+    protected abstract string GetApiKey(User user);
 
     /// <summary>Throw <see cref="SwarmReadableErrorException"/> if the session user lacks permission.</summary>
     public abstract void CheckPermission(Session session);
@@ -106,21 +160,29 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     // ── Session-invalid exception ─────────────────────────────────────────────
 
+    /// <summary>Thrown when the remote worker is unreachable or refused our session, signaling the recovery path.</summary>
     public class SessionInvalidException : Exception { }
 
+    /// <summary>Throws the matching exception if a worker API response carries an error.</summary>
     public static void AutoThrowException(JObject data)
     {
         if (data.TryGetValue("error_id", out JToken errorId) && errorId.ToString() == "invalid_session_id")
+        {
             throw new SessionInvalidException();
+        }
         if (data.TryGetValue("error", out JToken error))
+        {
             throw new SwarmReadableErrorException($"Remote worker gave error: {error}");
+        }
     }
 
+    /// <summary>Runs an action against the worker, recovering the remote session and retrying on <see cref="SessionInvalidException"/>.</summary>
     public async Task RunWithSession(Func<Task> run)
     {
         await RunWithSession(async () => { await run(); return true; });
     }
 
+    /// <summary>Same as <see cref="RunWithSession(Func{Task})"/>, returning the action's result.</summary>
     public async Task<T> RunWithSession<T>(Func<Task<T>> run)
     {
         for (int attempt = 0; ; attempt++)
@@ -175,19 +237,25 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         try { CheckRequiredConfig(); }
         catch (Exception ex)
         {
-            Status = BackendStatus.ERRORED;
             AddLoadStatus($"ERROR: {ex.Message}");
+            Status = BackendStatus.ERRORED;
             return;
         }
-        Session = Program.Sessions.CreateSession("internal", SessionHandler.LocalUserID);
         string apiKey;
-        try { apiKey = GetApiKey(Session); }
+        try
+        {
+            // Every cloud backend runs on its owner's own key - there is deliberately no fallback to
+            // any other user's key, so a misconfigured owner is a hard error rather than a mis-bill.
+            User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend has no valid owner user ('{OwnerUserId}').");
+            apiKey = GetApiKey(owner);
+        }
         catch (Exception ex)
         {
-            Status = BackendStatus.ERRORED;
             AddLoadStatus($"ERROR: {ex.Message}");
+            Status = BackendStatus.ERRORED;
             return;
         }
+        ProviderApiKey = apiKey;
         Provider = CreateProvider(apiKey);
         Logs.Verbose($"[{Provider.ProviderName}] Backend #{BackendData?.ID} provider created. Endpoint: {BaseConfig.EndpointId}");
         try
@@ -198,8 +266,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         }
         catch (Exception ex)
         {
-            Status = BackendStatus.ERRORED;
             AddLoadStatus($"ERROR: {Provider.ProviderName} validation failed: {ex.Message}");
+            Status = BackendStatus.ERRORED;
             return;
         }
         MaxUsages = Math.Max(1, BaseConfig.MaxConcurrent);
@@ -290,11 +358,36 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     // ── Worker lifecycle ──────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Re-resolves the owner's API key and rebuilds the provider if it changed, so a key rotation takes
+    /// effect on the next acquisition instead of requiring a disable/re-enable cycle. Must be called
+    /// under <see cref="WorkerLock"/>. Clears cached worker state on change - the old worker was woken
+    /// under the old key and its keepalive would no longer be authorized.
+    /// </summary>
+    void RefreshProviderIfKeyChanged()
+    {
+        User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend's owner user ('{OwnerUserId}') no longer exists.");
+        string currentKey = GetApiKey(owner);
+        if (currentKey == ProviderApiKey)
+        {
+            return;
+        }
+        Logs.Info($"[{Provider?.ProviderName}] API key changed for user '{OwnerUserId}', rebuilding provider for backend #{BackendData?.ID}.");
+        ICloudProvider oldProvider = Provider;
+        Provider = CreateProvider(currentKey);
+        ProviderApiKey = currentKey;
+        oldProvider?.Dispose();
+        CurrentWorker = null;
+        WorkerKeepaliveExpiry = DateTime.MinValue;
+    }
+
+    /// <summary>Returns the cached live worker, extending its keepalive when close to expiry, or wakes a fresh one.</summary>
     public async Task<CloudWorkerInfo> GetOrWakeWorkerAsync(int keepaliveDuration)
     {
         await WorkerLock.WaitAsync(Program.GlobalProgramCancel);
         try
         {
+            RefreshProviderIfKeyChanged();
             if (CurrentWorker is not null && DateTime.UtcNow < WorkerKeepaliveExpiry)
             {
                 int remaining = (int)(WorkerKeepaliveExpiry - DateTime.UtcNow).TotalSeconds;
@@ -431,16 +524,19 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         throw new SwarmReadableErrorException($"Cloud worker '{worker.WorkerId}' did not bring up a usable backend within {timeoutSec}s. Check the worker's SwarmUI at {worker.PublicUrl} under Server -> Backends.");
     }
 
+    /// <summary>Syncs <see cref="RemoteFeatureCombo"/> from a worker's ListBackends response.</summary>
     public void UpdateFeaturesFromWorker(JObject backendData)
     {
         HashSet<string> features = ["text2image"];
         foreach (JToken backend in backendData.Values())
         {
             if (backend["status"]?.ToString() is "running" && backend["features"] is JArray arr)
+            {
                 features.UnionWith(arr.Select(f => f.ToString()));
+            }
         }
-        foreach (string f in features.Where(f => !RemoteFeatureCombo.ContainsKey(f))) RemoteFeatureCombo.TryAdd(f, f);
-        foreach (string f in RemoteFeatureCombo.Keys.Where(f => !features.Contains(f))) RemoteFeatureCombo.TryRemove(f, out _);
+        foreach (string f in features.Where(f => !RemoteFeatureCombo.ContainsKey(f))) { RemoteFeatureCombo.TryAdd(f, f); }
+        foreach (string f in RemoteFeatureCombo.Keys.Where(f => !features.Contains(f))) { RemoteFeatureCombo.TryRemove(f, out _); }
     }
 
     // ── Model management ──────────────────────────────────────────────────────
@@ -459,7 +555,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
                 await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
                 string desired = model?.Name ?? GetModelFromInput(input);
-                if (string.IsNullOrWhiteSpace(desired)) return false;
+                if (string.IsNullOrWhiteSpace(desired)) { return false; }
                 foreach (string candidate in ModelCandidates(desired))
                 {
                     if (await TrySelectModel(worker, candidate)) { CurrentModelName = candidate; return true; }
@@ -474,6 +570,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         catch (Exception ex) { Logs.Debug($"[{Provider?.ProviderName}] LoadModel failed: {ex.Message}"); return false; }
     }
 
+    /// <summary>Wakes the worker (if needed) and re-mirrors its model lists into <see cref="RemoteModels"/>.</summary>
     public async Task RefreshModelsFromWorkerAsync()
     {
         await RunWithSession(() => RefreshModelsInner());
@@ -512,7 +609,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                             d["preview_image"] ??= "imgs/model_placeholder.jpg";
                             d["is_supported_model_format"] ??= true;
                             string name = d["name"]?.ToString();
-                            if (!string.IsNullOrWhiteSpace(name)) meta[name] = d;
+                            if (!string.IsNullOrWhiteSpace(name)) { meta[name] = d; }
                         }
                         tempModels[subtype] = [.. meta.Keys];
                         tempRemote[subtype] = meta;
@@ -530,14 +627,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                 {
                     RemoteModels ??= new();
                     Models ??= new();
-                    foreach (var kv in tempModels) Models[kv.Key] = kv.Value;
-                    foreach (var kv in tempRemote) RemoteModels[kv.Key] = kv.Value;
+                    foreach (KeyValuePair<string, List<string>> kv in tempModels) { Models[kv.Key] = kv.Value; }
+                    foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in tempRemote) { RemoteModels[kv.Key] = kv.Value; }
                     Logs.Info($"[{Provider?.ProviderName}] Model refresh complete: {tempModels.Values.Sum(l => l.Count)} models across {tempModels.Count} subtypes.");
                     Program.ModelRefreshEvent?.Invoke();
                     return true;
                 }
                 if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec)
+                {
                     throw new TimeoutException($"No models discovered on the worker within {maxWaitSec}s.");
+                }
                 AddLoadStatus("Waiting for Swarm to finish loading models on worker...");
                 await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
                 await Task.Delay(10_000);
@@ -546,7 +645,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             catch (SessionInvalidException) { throw; }
             catch (Exception ex)
             {
-                if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec) throw;
+                if ((DateTime.UtcNow - start).TotalSeconds >= maxWaitSec) { throw; }
                 Logs.Verbose($"[{Provider?.ProviderName}] Model refresh attempt failed: {ex.Message}. Retrying...");
                 await Task.Delay(10_000);
             }
@@ -557,7 +656,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
-        if (user_input.SourceSession is not null) CheckPermission(user_input.SourceSession);
+        if (user_input.SourceSession is not null) { CheckPermission(user_input.SourceSession); }
         return await RunWithSession(async () =>
         {
             // Worker acquisition must live INSIDE the retried lambda: on session recovery the
@@ -566,14 +665,14 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
             JObject resp = await CallWorkerAPI(worker, "GenerateText2Image", BuildRequest(user_input, worker.SessionId), BaseConfig.GenerationTimeoutSec);
             Image[] images = ExtractImages(resp);
-            if (images.Length is 0) throw new SwarmReadableErrorException("No images returned from remote worker.");
+            if (images.Length is 0) { throw new SwarmReadableErrorException("No images returned from remote worker."); }
             return images;
         });
     }
 
     public override async Task GenerateLive(T2IParamInput user_input, string batchId, Action<object> takeOutput)
     {
-        if (user_input.SourceSession is not null) CheckPermission(user_input.SourceSession);
+        if (user_input.SourceSession is not null) { CheckPermission(user_input.SourceSession); }
         await RunWithSession(async () =>
         {
             CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
@@ -597,7 +696,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
                     AutoThrowException(response);
                     HandleLiveResponse(response, batchId, user_input, takeOutput);
                 }
-                if (ws.CloseStatus.HasValue) break;
+                if (ws.CloseStatus.HasValue) { break; }
             }
             await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, Program.GlobalProgramCancel);
         });
@@ -605,6 +704,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
 
     // ── Shared helpers ────────────────────────────────────────────────────────
 
+    /// <summary>Builds the remote GenerateText2Image request body from local generation input.</summary>
     public JObject BuildRequest(T2IParamInput input, string sessionId)
     {
         input.ProcessPromptEmbeds(x => $"<embedding:{x}>");
@@ -614,11 +714,12 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         req[T2IParamTypes.DoNotSave.Type.ID] = true;
         req.Remove(T2IParamTypes.ExactBackendID.Type.ID);
         req.Remove(T2IParamTypes.BackendType.Type.ID);
-        if (input.ReceiveRawBackendData is not null) req[T2IParamTypes.ForwardRawBackendData.Type.ID] = true;
+        if (input.ReceiveRawBackendData is not null) { req[T2IParamTypes.ForwardRawBackendData.Type.ID] = true; }
         req[T2IParamTypes.ForwardSwarmData.Type.ID] = true;
         return req;
     }
 
+    /// <summary>Decodes the images array of a remote generation response.</summary>
     public static Image[] ExtractImages(JObject response)
     {
         List<Image> images = [];
@@ -630,6 +731,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend
         return [.. images];
     }
 
+    /// <summary>Translates one remote websocket message (progress, image, raw data) into local generation output.</summary>
     public static void HandleLiveResponse(JObject response, string batchId, T2IParamInput input, Action<object> takeOutput)
     {
         if (response.TryGetValue("gen_progress", out JToken val) && val is JObject objVal)
@@ -637,7 +739,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             string actualId = batchId;
             if (objVal.TryGetValue("batch_index", out JToken batchInd) && int.TryParse($"{batchInd}", out int remoteIdx)
                 && remoteIdx > 0 && int.TryParse(batchId, out int localIdx))
+            {
                 actualId = $"{localIdx + remoteIdx}";
+            }
             objVal["batch_index"] = actualId;
             objVal["request_id"] = $"{input.UserRequestId}";
             takeOutput(objVal);
@@ -648,19 +752,23 @@ public abstract class CloudBackendBase : AbstractT2IBackend
             string type = rawData["type"]?.ToString();
             string datab64 = rawData["data"]?.ToString();
             if (type is not null && datab64 is not null)
+            {
                 input.ReceiveRawBackendData?.Invoke(type, Convert.FromBase64String(datab64));
+            }
         }
         else if (response.TryGetValue("raw_swarm_data", out JToken rawSwarmTok) && rawSwarmTok is JObject rawSwarm)
         {
             if (rawSwarm.TryGetValue("params_used", out JToken paramsUsed))
-                foreach (JToken p in paramsUsed) input.ParamsQueried.Add($"{p}");
-            if (input.Get(T2IParamTypes.ForwardSwarmData, false)) takeOutput(response);
+            {
+                foreach (JToken p in paramsUsed) { input.ParamsQueried.Add($"{p}"); }
+            }
+            if (input.Get(T2IParamTypes.ForwardSwarmData, false)) { takeOutput(response); }
         }
     }
 
     static string GetModelFromInput(T2IParamInput input)
     {
-        if (input is null) return null;
+        if (input is null) { return null; }
         object m = input.Get(T2IParamTypes.Model);
         return m is T2IModel tm ? tm.Name : m as string;
     }

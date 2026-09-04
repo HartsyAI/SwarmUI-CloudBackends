@@ -1,11 +1,7 @@
 using Hartsy.Extensions.CloudBackends.Core;
 using Newtonsoft.Json.Linq;
-using SwarmUI.Backends;
 using SwarmUI.Utils;
-using System.Net;
 using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Text;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.RunPod;
 
@@ -20,6 +16,9 @@ public class RunPodPodPlan
 
     /// <summary>Whether the provider may create a pod when no existing one is found.</summary>
     public bool AutoCreate = false;
+
+    /// <summary>Pod ID remembered from a previous run, used as a reattach hint after live verification. Never blocks a fresh create when stale.</summary>
+    public string PersistedId = "";
 
     /// <summary>Name given to created pods, and used to find one again so restarts do not pile up pods.</summary>
     public string PodName = "swarmui-cloudbackends";
@@ -58,53 +57,61 @@ public class RunPodPodPlan
 /// </summary>
 public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInstanceProvider
 {
-    static readonly HttpClient Http = NetworkBackendUtils.MakeHttpClient();
-    const string ApiBase = "https://api.runpod.io/v2";
-
     /// <summary>Statuses a pod never leaves on its own.</summary>
     static readonly string[] TerminalStatuses = ["ERROR", "TERMINATED"];
 
     /// <summary>Pod this provider is bound to. Resolved on first wake.</summary>
-    public string ActivePodId { get; private set; } = plan.PodId?.Trim() ?? "";
+    public string ActiveInstanceId { get; private set; } = plan.PodId?.Trim() ?? "";
 
     public string ProviderName => "RunPod GPU Pods";
     public string ApiKeyType => "runpod_api";
 
-    // ── Status cache ──────────────────────────────────────────────────────────
-    // Same instance-scoped cache-with-expiry idiom CloudBackendBase uses for its worker (CurrentWorker /
-    // WorkerKeepaliveExpiry): short-lived so a UI status poll doesn't hammer RunPod's rate limit, but
-    // never so long that a Start/Stop button feels unresponsive.
-    static readonly TimeSpan StatusCacheTtl = TimeSpan.FromSeconds(5);
-    readonly SemaphoreSlim StatusLock = new(1, 1);
-    RunPodPodStatus CachedStatus;
-    DateTime StatusCacheExpiry = DateTime.MinValue;
+    /// <summary>Shared HTTP plumbing, with RunPod's well-known failure statuses mapped to actionable messages.</summary>
+    readonly CloudApiClient Api = new("RunPodPods", "https://api.runpod.io/v2", apiKey, (status, detail) => status switch
+    {
+        401 => new SwarmReadableErrorException("RunPod API key was rejected (401). Check your key in User Settings -> API Keys."),
+        402 => new SwarmReadableErrorException("RunPod reports an insufficient account balance (402). Add credit before starting pods."),
+        422 => new SwarmReadableErrorException($"RunPod rejected the request as invalid (422): {detail}. This is a bug in the request rather than a capacity problem."),
+        429 => new SwarmReadableErrorException("RunPod rate limited this request (429). Wait a moment and retry."),
+        _ => null
+    });
+
+    readonly CloudStatusCache StatusCache = new();
 
     /// <summary>
     /// Gets the pod's live status (state, GPU, cost/hr, uptime, allowed actions). Returns null if no pod
     /// has been resolved yet (nothing created or bound via PodId). Cached briefly unless <paramref
     /// name="forceRefresh"/> is set, e.g. right after a Start/Stop action.
     /// </summary>
-    public async Task<RunPodPodStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default)
+    public async Task<CloudInstanceStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActivePodId)) { return null; }
-        if (!forceRefresh && CachedStatus is not null && DateTime.UtcNow < StatusCacheExpiry) { return CachedStatus; }
-        await StatusLock.WaitAsync(cancel);
-        try
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return null; }
+        return await StatusCache.GetAsync(forceRefresh, async () => StatusFromPod(await GetPodAsync(ActiveInstanceId, cancel)), cancel);
+    }
+
+    /// <summary>Projects RunPod's <c>GET /pods/{id}</c> response (see https://docs.runpod.io/api-reference-v2/pods/get-a-pod) into the provider-neutral status shape.</summary>
+    CloudInstanceStatus StatusFromPod(JObject pod)
+    {
+        if (pod is null) { return null; }
+        return new CloudInstanceStatus
         {
-            if (!forceRefresh && CachedStatus is not null && DateTime.UtcNow < StatusCacheExpiry) { return CachedStatus; }
-            JObject pod = await GetPodAsync(ActivePodId, cancel);
-            CachedStatus = RunPodPodStatus.FromPod(ActivePodId, pod, plan.SwarmUIPort);
-            StatusCacheExpiry = DateTime.UtcNow.Add(StatusCacheTtl);
-            return CachedStatus;
-        }
-        finally { StatusLock.Release(); }
+            InstanceId = ActiveInstanceId,
+            Status = pod["status"]?.ToString() ?? "UNKNOWN",
+            GpuName = pod["gpu"]?["id"]?.ToString(),
+            GpuCount = pod["gpu"]?["count"]?.Value<int>() ?? 0,
+            CostPerHour = pod["cost"]?.Value<double>() ?? 0,
+            UptimeSeconds = pod["runtime"]?["uptime"]?.Value<int>() ?? 0,
+            AllowedActions = [.. (pod["actions"] as JArray ?? []).Select(a => a.ToString())],
+            // The API never returns a proxy URL; it is constructed from the pod id and the internal port.
+            PublicUrl = $"https://{ActiveInstanceId}-{plan.SwarmUIPort}.proxy.runpod.net"
+        };
     }
 
     // ── ICloudProvider ────────────────────────────────────────────────────────
 
     public async Task ValidateAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActivePodId) && !plan.AutoCreate)
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId) && !plan.AutoCreate)
         {
             throw new SwarmReadableErrorException("No RunPod pod ID is set and AutoCreate is off. Set 'PodId', or enable 'AutoCreate' with an image (or template) and a GPU type.");
         }
@@ -113,9 +120,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             throw new SwarmReadableErrorException("AutoCreate is on but neither 'ImageName' nor 'TemplateId' is set, so there is nothing to create a pod from.");
         }
         await ApiAsync(HttpMethod.Get, "/pods", null, cancel);
-        if (!string.IsNullOrWhiteSpace(ActivePodId) && await GetPodAsync(ActivePodId, cancel) is null)
+        if (!string.IsNullOrWhiteSpace(ActiveInstanceId) && await GetPodAsync(ActiveInstanceId, cancel) is null)
         {
-            throw new SwarmReadableErrorException($"RunPod pod '{ActivePodId}' was not found on this account. Check the PodId backend setting.");
+            throw new SwarmReadableErrorException($"RunPod pod '{ActiveInstanceId}' was not found on this account. Check the PodId backend setting.");
         }
     }
 
@@ -176,7 +183,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         string publicUrl = $"https://{podId}-{plan.SwarmUIPort}.proxy.runpod.net";
         // Wait for SwarmUI itself, not just the pod: the proxy answers 502 while the container boots,
         // and handing an unready URL to the Swarm backend would just make it fail its own connect.
-        await WaitForSwarmAsync(publicUrl, deadline, cancel);
+        await Api.WaitForSwarmAsync(publicUrl, deadline, $"Check that SwarmUI is installed in the pod and listening on port {plan.SwarmUIPort}, and that the port is exposed as http.", cancel);
         string gpu = pod?["gpu"]?["id"]?.ToString();
         int gpuCount = pod?["gpu"]?["count"]?.Value<int>() ?? plan.GpuCount;
         Logs.Info($"[RunPodPods] SwarmUI is up on pod '{podId}' at {publicUrl}");
@@ -204,7 +211,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <inheritdoc/>
     public async Task<double?> GetCostPerHourAsync(CancellationToken cancel = default)
     {
-        RunPodPodStatus status = await GetStatusAsync(forceRefresh: false, cancel);
+        CloudInstanceStatus status = await GetStatusAsync(forceRefresh: false, cancel);
         return status?.CostPerHour;
     }
 
@@ -215,10 +222,23 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Finds the pod to use: an explicit ID, else a previously created pod by name, else creates one.</summary>
     async Task<string> ResolvePodAsync(CancellationToken cancel)
     {
-        if (!string.IsNullOrWhiteSpace(ActivePodId)) { return ActivePodId; }
+        if (!string.IsNullOrWhiteSpace(ActiveInstanceId)) { return ActiveInstanceId; }
         if (!plan.AutoCreate)
         {
             throw new SwarmReadableErrorException("No RunPod pod ID is set and AutoCreate is off.");
+        }
+        // A pod remembered from a previous run is only a hint - verify it still exists and is not
+        // terminal before trusting it, so a stale memory can never block or misdirect a fresh create.
+        if (!string.IsNullOrWhiteSpace(plan.PersistedId))
+        {
+            JObject remembered = await GetPodAsync(plan.PersistedId, cancel);
+            if (remembered is not null && !TerminalStatuses.Contains(remembered["status"]?.ToString() ?? "", StringComparer.OrdinalIgnoreCase))
+            {
+                ActiveInstanceId = plan.PersistedId;
+                Logs.Info($"[RunPodPods] Reattaching remembered pod '{ActiveInstanceId}'.");
+                return ActiveInstanceId;
+            }
+            Logs.Debug($"[RunPodPods] Remembered pod '{plan.PersistedId}' is gone or terminal, ignoring it.");
         }
         // Reuse before creating: otherwise every restart would leave another pod behind, billing.
         foreach (JToken t in await ListPodsAsync(cancel))
@@ -226,13 +246,13 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             if (t is JObject p && string.Equals(p["name"]?.ToString(), plan.PodName, StringComparison.OrdinalIgnoreCase)
                 && !TerminalStatuses.Contains(p["status"]?.ToString() ?? "", StringComparer.OrdinalIgnoreCase))
             {
-                ActivePodId = p["id"]?.ToString();
-                Logs.Info($"[RunPodPods] Reusing existing pod '{ActivePodId}' named '{plan.PodName}'.");
-                return ActivePodId;
+                ActiveInstanceId = p["id"]?.ToString();
+                Logs.Info($"[RunPodPods] Reusing existing pod '{ActiveInstanceId}' named '{plan.PodName}'.");
+                return ActiveInstanceId;
             }
         }
-        ActivePodId = await CreatePodAsync(cancel);
-        return ActivePodId;
+        ActiveInstanceId = await CreatePodAsync(cancel);
+        return ActiveInstanceId;
     }
 
     /// <summary>
@@ -273,7 +293,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 Logs.Info($"[RunPodPods] Created pod '{id}' on '{gpuId}'. It bills until stopped or terminated.");
                 return id;
             }
-            catch (RunPodApiException ex) when (ex.Status == 400 || ex.Status == 403)
+            catch (CloudApiException ex) when (ex.Status == 400 || ex.Status == 403)
             {
                 // 400 covers both a bad request and no capacity, so move to the next candidate; if every
                 // candidate fails the same way, the last detail is reported as the likely real cause.
@@ -313,7 +333,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 ["persistent"] = new JObject { ["size"] = Math.Max(10, plan.VolumeGb), ["path"] = plan.VolumeMountPath }
             };
         }
-        JObject env = ParseEnv(plan.Env);
+        JObject env = CloudApiClient.ParseEnv(plan.Env);
         if (env.HasValues) { body["env"] = env; }
         return body;
     }
@@ -445,7 +465,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list pods: {ex.Message}"); }
         return new JObject
         {
-            ["success"] = true,
             ["cloud"] = cloud,
             ["gpus"] = gpus,
             ["network_volumes"] = volumes,
@@ -475,19 +494,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return null;
     }
 
-    /// <summary>Parses newline or comma separated KEY=VALUE pairs into a JSON object.</summary>
-    public static JObject ParseEnv(string raw)
-    {
-        JObject result = [];
-        if (string.IsNullOrWhiteSpace(raw)) { return result; }
-        foreach (string line in raw.Split(['\n', '\r', ','], StringSplitOptions.RemoveEmptyEntries))
-        {
-            int eq = line.IndexOf('=');
-            if (eq > 0) { result[line[..eq].Trim()] = line[(eq + 1)..].Trim(); }
-        }
-        return result;
-    }
-
     /// <summary>Gets a pod by ID, or null if it does not exist.</summary>
     public async Task<JObject> GetPodAsync(string podId, CancellationToken cancel = default)
     {
@@ -504,84 +510,26 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Stops the pod, releasing compute but keeping its disk so it can be started again.</summary>
     public async Task StopPodAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActivePodId)) { return; }
-        Logs.Info($"[RunPodPods] Stopping pod '{ActivePodId}'...");
-        try { await ApiAsync(HttpMethod.Post, $"/pods/{ActivePodId}/action", new JObject { ["action"] = "stop" }, cancel, allowNotFound: true); }
-        catch (RunPodApiException ex) when (ex.Status == 409)
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return; }
+        Logs.Info($"[RunPodPods] Stopping pod '{ActiveInstanceId}'...");
+        try { await ApiAsync(HttpMethod.Post, $"/pods/{ActiveInstanceId}/action", new JObject { ["action"] = "stop" }, cancel, allowNotFound: true); }
+        catch (CloudApiException ex) when (ex.Status == 409)
         {
-            Logs.Verbose($"[RunPodPods] Pod '{ActivePodId}' cannot be stopped from its current state: {ex.Detail}");
+            Logs.Verbose($"[RunPodPods] Pod '{ActiveInstanceId}' cannot be stopped from its current state: {ex.Detail}");
         }
     }
 
     /// <summary>Permanently destroys the pod and its container disk. A network volume is only detached.</summary>
     public async Task TerminatePodAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActivePodId)) { return; }
-        Logs.Info($"[RunPodPods] Terminating pod '{ActivePodId}'...");
-        await ApiAsync(HttpMethod.Delete, $"/pods/{ActivePodId}", null, cancel, allowNotFound: true);
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return; }
+        Logs.Info($"[RunPodPods] Terminating pod '{ActiveInstanceId}'...");
+        await ApiAsync(HttpMethod.Delete, $"/pods/{ActiveInstanceId}", null, cancel, allowNotFound: true);
     }
 
-    // ── HTTP plumbing ─────────────────────────────────────────────────────────
-
-    /// <summary>A RunPod API failure, carrying the RFC 9457 problem details v2 returns.</summary>
-    public class RunPodApiException(int status, string detail) : SwarmReadableErrorException($"RunPod API error {status}: {detail}")
+    /// <summary>Calls the RunPod v2 REST API via the shared client (see <see cref="CloudApiClient.ApiAsync"/>).</summary>
+    public Task<JToken> ApiAsync(HttpMethod method, string path, JObject body, CancellationToken cancel = default, bool allowNotFound = false)
     {
-        public int Status = status;
-        public string Detail = detail;
-    }
-
-    /// <summary>Calls the RunPod v2 REST API, translating failures into readable errors.</summary>
-    public async Task<JToken> ApiAsync(HttpMethod method, string path, JObject body, CancellationToken cancel = default, bool allowNotFound = false)
-    {
-        using HttpRequestMessage request = new(method, $"{ApiBase}{path}");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        if (body is not null)
-        {
-            request.Content = new StringContent(body.ToString(), Encoding.UTF8, "application/json");
-        }
-        Logs.Debug($"[RunPodPods] {method} {path}");
-        using HttpResponseMessage response = await Http.SendAsync(request, cancel);
-        string text = await response.Content.ReadAsStringAsync(cancel);
-        if (response.StatusCode == HttpStatusCode.NotFound && allowNotFound) { return null; }
-        if (response.IsSuccessStatusCode)
-        {
-            if (string.IsNullOrWhiteSpace(text)) { return null; }
-            try { return JToken.Parse(text); }
-            catch (Exception) { return null; }
-        }
-        int status = (int)response.StatusCode;
-        string detail = text;
-        try { detail = JObject.Parse(text)["detail"]?.ToString() ?? text; }
-        catch (Exception) { }
-        throw status switch
-        {
-            401 => new SwarmReadableErrorException("RunPod API key was rejected (401). Check your key in User Settings -> API Keys."),
-            402 => new SwarmReadableErrorException("RunPod reports an insufficient account balance (402). Add credit before starting pods."),
-            422 => new SwarmReadableErrorException($"RunPod rejected the request as invalid (422): {detail}. This is a bug in the request rather than a capacity problem."),
-            429 => new SwarmReadableErrorException($"RunPod rate limited this request (429). Retry after {response.Headers.RetryAfter?.Delta?.TotalSeconds ?? 0}s."),
-            _ => new RunPodApiException(status, detail)
-        };
-    }
-
-    /// <summary>
-    /// Waits until SwarmUI on the pod answers its API. The RunPod proxy returns 502 while the container
-    /// is up but the service inside is not listening yet, which is the normal state during boot.
-    /// </summary>
-    public async Task WaitForSwarmAsync(string publicUrl, DateTime deadline, CancellationToken cancel = default)
-    {
-        Exception last = null;
-        while (DateTime.UtcNow < deadline)
-        {
-            cancel.ThrowIfCancellationRequested();
-            try
-            {
-                JObject session = await Http.PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], null, cancel);
-                if (!string.IsNullOrWhiteSpace(session?["session_id"]?.ToString())) { return; }
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException) { last = ex; }
-            Logs.Verbose($"[RunPodPods] Waiting for SwarmUI on {publicUrl} to answer...");
-            await Task.Delay(5000, cancel);
-        }
-        throw new SwarmReadableErrorException($"Pod is running but SwarmUI at {publicUrl} did not answer before the startup timeout. Check that SwarmUI is installed in the pod and listening on port {plan.SwarmUIPort}, and that the port is exposed as http.{(last is null ? "" : $" Last error: {last.Message}")}");
+        return Api.ApiAsync(method, path, body, cancel, allowNotFound);
     }
 }

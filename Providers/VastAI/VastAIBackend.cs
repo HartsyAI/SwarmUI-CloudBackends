@@ -33,16 +33,12 @@ public class VastAIBackend : CloudBackendBase
         return new VastAIProvider(apiKey, BaseConfig.EndpointId?.Trim() ?? "", route);
     }
 
-    protected override string GetApiKey(Session session)
+    protected override string GetApiKey(User user)
     {
-        if (session?.User is null)
-        {
-            throw new SwarmReadableErrorException("No user session. Log in and configure a Vast.ai API key in User Settings, API Keys.");
-        }
-        string key = session.User.GetGenericData("vastai_api", "key")?.Trim();
+        string key = user?.GetGenericData("vastai_api", "key")?.Trim();
         if (string.IsNullOrEmpty(key))
         {
-            throw new SwarmReadableErrorException($"Vast.ai API key not configured for user '{session.User.UserID}'. Set it in User Settings, API Keys, Vast.ai.");
+            throw new SwarmReadableErrorException($"Vast.ai API key not configured for user '{user?.UserID}'. Set it in User Settings, API Keys, Vast.ai.");
         }
         return key;
     }

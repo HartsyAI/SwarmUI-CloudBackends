@@ -42,11 +42,15 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             throw;
         }
         if (output["success"]?.Value<bool>() is false)
+        {
             throw new SwarmReadableErrorException($"Worker wakeup failed: {output["error"]}");
+        }
         string publicUrl = output["public_url"]?.ToString();
         string sessionId = output["session_id"]?.ToString();
         if (string.IsNullOrEmpty(publicUrl) || string.IsNullOrEmpty(sessionId))
+        {
             throw new SwarmReadableErrorException($"Wakeup job completed but did not return public_url/session_id. Output: {output}");
+        }
         Logs.Info($"[RunPodServerless] Worker ready: {output["worker_id"]} at {publicUrl}");
         return new CloudWorkerInfo
         {
@@ -132,7 +136,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         }
         JObject result = JObject.Parse(await response.Content.ReadAsStringAsync(cancel));
         string jobId = result["id"]?.ToString();
-        if (string.IsNullOrEmpty(jobId)) throw new Exception($"RunPod /run did not return a job ID. Response: {result}");
+        if (string.IsNullOrEmpty(jobId)) { throw new Exception($"RunPod /run did not return a job ID. Response: {result}"); }
         Logs.Debug($"[RunPodServerless] Job submitted: {jobId}");
         return jobId;
     }
@@ -157,9 +161,9 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
                 Logs.Info($"[RunPodServerless] Job {jobId}: {status} (after {elapsed}s)");
                 lastStatus = status;
             }
-            if (status is "COMPLETED") return result["output"] as JObject ?? new JObject();
-            if (status is "FAILED") throw new SwarmReadableErrorException($"RunPod job {jobId} failed: {result["error"]}");
-            if (status is "CANCELLED" or "TIMED_OUT") throw new SwarmReadableErrorException($"RunPod job {jobId} ended without completing: {status}");
+            if (status is "COMPLETED") { return result["output"] as JObject ?? new JObject(); }
+            if (status is "FAILED") { throw new SwarmReadableErrorException($"RunPod job {jobId} failed: {result["error"]}"); }
+            if (status is "CANCELLED" or "TIMED_OUT") { throw new SwarmReadableErrorException($"RunPod job {jobId} ended without completing: {status}"); }
             await Task.Delay(pollIntervalMs, cancel);
         }
         throw new TimeoutException($"RunPod job {jobId} did not complete within {timeoutSec}s");
@@ -173,18 +177,24 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
         using HttpResponseMessage res = await Http.SendAsync(req, cancel);
         if (res.StatusCode is System.Net.HttpStatusCode.Unauthorized)
+        {
             throw new SwarmReadableErrorException("RunPod API key was rejected (401). Check your key in User Settings -> API Keys.");
+        }
         if (res.StatusCode is System.Net.HttpStatusCode.NotFound)
+        {
             throw new SwarmReadableErrorException($"RunPod endpoint '{endpointId}' not found (404). Check the EndpointId backend setting.");
+        }
         if (!res.IsSuccessStatusCode)
+        {
             throw new SwarmReadableErrorException($"RunPod /health for endpoint '{endpointId}' failed: {res.StatusCode}");
+        }
         return JObject.Parse(await res.Content.ReadAsStringAsync(cancel));
     }
 
     /// <summary>Cancel a queued or running job. Best-effort - does not throw.</summary>
     public async Task CancelJobAsync(string jobId, CancellationToken cancel = default)
     {
-        if (string.IsNullOrEmpty(jobId)) return;
+        if (string.IsNullOrEmpty(jobId)) { return; }
         try
         {
             string url = $"https://api.runpod.ai/v2/{endpointId}/cancel/{jobId}";

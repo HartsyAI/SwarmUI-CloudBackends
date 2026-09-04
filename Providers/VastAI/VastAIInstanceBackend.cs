@@ -63,15 +63,13 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
 
     Settings InstConfig => (Settings)SettingsRaw;
 
-    /// <summary>Typed access to the instance provider, for the WebAPI routes.</summary>
-    public VastAIInstanceProvider VastProvider => Provider as VastAIInstanceProvider;
-
     protected override ICloudInstanceProvider CreateProvider(string apiKey)
     {
         Settings config = InstConfig;
         return new VastAIInstanceProvider(apiKey, new VastAIInstancePlan
         {
             InstanceId = config.InstanceId?.Trim() ?? "",
+            PersistedId = PersistedInstanceId ?? "",
             SwarmUIPort = config.SwarmUIPort,
             AutoCreate = true,
             Label = string.IsNullOrWhiteSpace(config.Label) ? "swarmui-cloudbackends" : config.Label.Trim(),
@@ -86,16 +84,12 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         });
     }
 
-    protected override string GetApiKey(Session session)
+    protected override string GetApiKey(User user)
     {
-        if (session?.User is null)
-        {
-            throw new SwarmReadableErrorException("No user session. Log in and configure a Vast.ai API key in User Settings, API Keys.");
-        }
-        string key = session.User.GetGenericData("vastai_api", "key")?.Trim();
+        string key = user?.GetGenericData("vastai_api", "key")?.Trim();
         if (string.IsNullOrEmpty(key))
         {
-            throw new SwarmReadableErrorException($"Vast.ai API key not configured for user '{session.User.UserID}'. Set it in User Settings, API Keys, Vast.ai.");
+            throw new SwarmReadableErrorException($"Vast.ai API key not configured for user '{user?.UserID}'. Set it in User Settings, API Keys, Vast.ai.");
         }
         return key;
     }

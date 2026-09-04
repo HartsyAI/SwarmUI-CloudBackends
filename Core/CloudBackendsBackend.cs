@@ -1,7 +1,10 @@
+using System.Collections.Concurrent;
 using FreneticUtilities.FreneticDataSyntax;
 using Hartsy.Extensions.CloudBackends.Providers.RunPod;
 using Hartsy.Extensions.CloudBackends.Providers.VastAI;
+using SwarmUI.Accounts;
 using SwarmUI.Backends;
+using SwarmUI.Core;
 using SwarmUI.DataHolders;
 using SwarmUI.Media;
 using SwarmUI.Text2Image;
@@ -60,6 +63,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [SuggestionPlaceholder(Text = "pick a GPU, or leave blank for cheapest available")]
         [ConfigComment("GPU type for created pods. Leave blank to use whatever is available, cheapest first.")]
         public string RunPodPods_GpuTypeId = "";
+        [ManualSettingsOptions(Vals = ["1", "2", "4", "8"])]
         [ConfigComment("Number of GPUs attached to a created pod.")]
         public int RunPodPods_GpuCount = 1;
         [ConfigComment("Container disk size in GB for a created pod.")]
@@ -71,6 +75,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public string RunPodPods_VolumeMountPath = "/runpod-volume";
         [ConfigComment("Pod volume size in GB, used only when no network volume is attached. Zero for none.")]
         public int RunPodPods_VolumeGb = 0;
+        [ManualSettingsOptions(Vals = ["SECURE", "COMMUNITY"], ManualNames = ["Secure Cloud", "Community Cloud"])]
         [ConfigComment("Which RunPod cloud to create pods in. Secure is more reliable, Community is cheaper.")]
         public string RunPodPods_CloudType = "SECURE";
         [SuggestionPlaceholder(Text = "leave blank to let RunPod choose")]
@@ -156,135 +161,227 @@ public class CloudBackendsBackend : AbstractT2IBackend
 
     Settings Config => (Settings)SettingsRaw;
 
-    /// <summary>IDs of the nonreal children this instance currently owns, so re-Init/Shutdown can clean them up.</summary>
-    readonly List<int> ChildIds = [];
+    /// <summary>One provider section of the parent settings: its field prefix, display label, which API key it bills, whether it rents whole instances, and its hidden backend type.</summary>
+    public record ProviderDef(string Prefix, string Label, string KeyType, bool IsInstance, Func<BackendHandler.BackendType> Type);
+
+    /// <summary>Every provider section this backend can manage, in settings-declaration order.</summary>
+    public static readonly ProviderDef[] Providers =
+    [
+        new("RunPodServerless_", "RunPod Serverless", "runpod_api", IsInstance: false, () => CloudBackendTypes.RunPodServerless),
+        new("RunPodPods_", "RunPod GPU Pods", "runpod_api", IsInstance: true, () => CloudBackendTypes.RunPodPods),
+        new("VastAI_", "Vast.ai Serverless", "vastai_api", IsInstance: false, () => CloudBackendTypes.VastAI),
+        new("VastAIInstance_", "Vast.ai Instances", "vastai_api", IsInstance: true, () => CloudBackendTypes.VastAIInstance)
+    ];
+
+    /// <summary>Looks up a provider definition by its settings prefix (e.g. "RunPodPods_").</summary>
+    public static ProviderDef ProviderByPrefix(string prefix) => Providers.First(d => d.Prefix == prefix);
+
+    /// <summary>True if the given provider section is enabled in this backend's settings.</summary>
+    public bool IsProviderEnabled(ProviderDef def) => def.Prefix switch
+    {
+        "RunPodServerless_" => Config.RunPodServerless_Enabled,
+        "RunPodPods_" => Config.RunPodPods_Enabled,
+        "VastAI_" => Config.VastAI_Enabled,
+        "VastAIInstance_" => Config.VastAIInstance_Enabled,
+        _ => false
+    };
+
+    /// <summary>Child backend IDs per "{userId}/{prefix}", so each user gets exactly one child per enabled provider.</summary>
+    readonly ConcurrentDictionary<string, int> ChildMap = new();
+
+    /// <summary>Per-(user, provider) spawn locks, so concurrent first requests cannot double-spawn a child.</summary>
+    readonly ConcurrentDictionary<string, SemaphoreSlim> SpawnLocks = new();
 
     /// <summary>Control backend only - never loads models or generates directly.</summary>
     public override IEnumerable<string> SupportedFeatures => [];
+
+    /// <summary>
+    /// Copies this backend's <c>{prefix}X</c> settings values into a child settings object's matching
+    /// <c>X</c> fields, via FDS save/load, so a provider's fields only have to be declared (with the
+    /// prefix) in <see cref="Settings"/> and never hand-copied per field. The <c>{prefix}Enabled</c>
+    /// toggle is skipped - it belongs to this parent, not the child.
+    /// </summary>
+    AutoConfiguration BuildChildSettings(ProviderDef def)
+    {
+        FDSSection all = SettingsRaw.Save(true);
+        FDSSection stripped = new();
+        foreach (string key in all.GetRootKeys().Where(k => k.StartsWith(def.Prefix) && k != $"{def.Prefix}Enabled"))
+        {
+            stripped.Set(key[def.Prefix.Length..], all.GetObject(key));
+        }
+        AutoConfiguration child = Activator.CreateInstance(def.Type().SettingsClass) as AutoConfiguration;
+        child.Load(stripped);
+        return child;
+    }
 
     public override async Task Init()
     {
         CanLoadModels = false;
         MaxUsages = 1;
-        // Settings edits re-run Init without a guaranteed prior Shutdown - always start from a clean slate.
+        // Children are per-user and spawn on demand (each runs on its owner's own API key), so a
+        // settings re-Init only needs to drop the old set; users get fresh children on next use.
+        // Note this stops any user's running instance children - core backend edits always restart
+        // the backend tree they configure.
         await TearDownChildren();
-        Settings config = Config;
-        int enabledCount = 0;
-        if (config.RunPodServerless_Enabled)
-        {
-            RunPodServerlessBackend.Settings settings = new()
-            {
-                EndpointId = config.RunPodServerless_EndpointId,
-                MaxConcurrent = config.RunPodServerless_MaxConcurrent,
-                PollIntervalMs = config.RunPodServerless_PollIntervalMs,
-                StartupTimeoutSec = config.RunPodServerless_StartupTimeoutSec,
-                GenerationTimeoutSec = config.RunPodServerless_GenerationTimeoutSec,
-                KeepaliveSeconds = config.RunPodServerless_KeepaliveSeconds,
-                AutoRefresh = config.RunPodServerless_AutoRefresh
-            };
-            AddChild(CloudBackendTypes.RunPodServerless, settings, "RunPod Serverless");
-            enabledCount++;
-        }
-        if (config.RunPodPods_Enabled)
-        {
-            RunPodPodsBackend.Settings settings = new()
-            {
-                PodId = config.RunPodPods_PodId,
-                SwarmUIPort = config.RunPodPods_SwarmUIPort,
-                TerminateOnShutdown = config.RunPodPods_TerminateOnShutdown,
-                // Falls back to a name unique to this backend rather than a shared literal - see the
-                // ConfigComment on RunPodPods_PodName for why a shared default is a collision risk.
-                PodName = string.IsNullOrWhiteSpace(config.RunPodPods_PodName) ? $"swarmui-cloudbackends-{BackendData.ID}" : config.RunPodPods_PodName,
-                ImageName = config.RunPodPods_ImageName,
-                TemplateId = config.RunPodPods_TemplateId,
-                GpuTypeId = config.RunPodPods_GpuTypeId,
-                GpuCount = config.RunPodPods_GpuCount,
-                ContainerDiskGb = config.RunPodPods_ContainerDiskGb,
-                NetworkVolumeId = config.RunPodPods_NetworkVolumeId,
-                VolumeMountPath = config.RunPodPods_VolumeMountPath,
-                VolumeGb = config.RunPodPods_VolumeGb,
-                CloudType = config.RunPodPods_CloudType,
-                DataCenterId = config.RunPodPods_DataCenterId,
-                PodEnv = config.RunPodPods_PodEnv,
-                StartupTimeoutSec = config.RunPodPods_StartupTimeoutSec,
-                PollIntervalMs = config.RunPodPods_PollIntervalMs,
-                StartOnEnable = config.RunPodPods_StartOnEnable,
-                MaxRuntimeMinutes = config.RunPodPods_MaxRuntimeMinutes,
-                MaxSpendUsd = config.RunPodPods_MaxSpendUsd
-            };
-            AddChild(CloudBackendTypes.RunPodPods, settings, "RunPod GPU Pods");
-            enabledCount++;
-        }
-        if (config.VastAI_Enabled)
-        {
-            VastAIBackend.Settings settings = new()
-            {
-                EndpointId = config.VastAI_EndpointId,
-                WorkerRoute = config.VastAI_WorkerRoute,
-                MaxConcurrent = config.VastAI_MaxConcurrent,
-                PollIntervalMs = config.VastAI_PollIntervalMs,
-                StartupTimeoutSec = config.VastAI_StartupTimeoutSec,
-                GenerationTimeoutSec = config.VastAI_GenerationTimeoutSec,
-                KeepaliveSeconds = config.VastAI_KeepaliveSeconds,
-                AutoRefresh = config.VastAI_AutoRefresh
-            };
-            AddChild(CloudBackendTypes.VastAI, settings, "Vast.ai Serverless");
-            enabledCount++;
-        }
-        if (config.VastAIInstance_Enabled)
-        {
-            VastAIInstanceBackend.Settings settings = new()
-            {
-                InstanceId = config.VastAIInstance_InstanceId,
-                SwarmUIPort = config.VastAIInstance_SwarmUIPort,
-                TerminateOnShutdown = config.VastAIInstance_TerminateOnShutdown,
-                // Falls back to a label unique to this backend rather than a shared literal - see the
-                // ConfigComment on VastAIInstance_Label for why a shared default is a collision risk.
-                Label = string.IsNullOrWhiteSpace(config.VastAIInstance_Label) ? $"swarmui-cloudbackends-{BackendData.ID}" : config.VastAIInstance_Label,
-                Image = config.VastAIInstance_Image,
-                TemplateHashId = config.VastAIInstance_TemplateHashId,
-                OfferId = config.VastAIInstance_OfferId,
-                DiskGb = config.VastAIInstance_DiskGb,
-                NetworkVolumeId = config.VastAIInstance_NetworkVolumeId,
-                VolumeMountPath = config.VastAIInstance_VolumeMountPath,
-                Env = config.VastAIInstance_Env,
-                StartupTimeoutSec = config.VastAIInstance_StartupTimeoutSec,
-                PollIntervalMs = config.VastAIInstance_PollIntervalMs,
-                StartOnEnable = config.VastAIInstance_StartOnEnable,
-                MaxRuntimeMinutes = config.VastAIInstance_MaxRuntimeMinutes,
-                MaxSpendUsd = config.VastAIInstance_MaxSpendUsd
-            };
-            AddChild(CloudBackendTypes.VastAIInstance, settings, "Vast.ai Instances");
-            enabledCount++;
-        }
+        int enabledCount = Providers.Count(IsProviderEnabled);
         Status = BackendStatus.RUNNING;
         AddLoadStatus(enabledCount is 0
-            ? "No provider enabled - nothing started. Expand a provider section, enable it, and Save."
-            : $"{enabledCount} provider(s) enabled and starting.");
+            ? "No provider enabled - nothing available. Expand a provider section, enable it, and Save."
+            : $"{enabledCount} provider(s) enabled. Per-user backends are created on demand for each user with an API key set.");
     }
 
-    void AddChild(BackendHandler.BackendType type, AutoConfiguration settings, string label)
+    /// <summary>Returns the given user's existing child for a provider, in any status, or null.</summary>
+    public AbstractT2IBackend GetChildFor(string userId, ProviderDef def)
     {
-        BackendHandler.BackendData data = Handler.AddNewNonrealBackend(type, BackendData, settings, newData =>
+        if (ChildMap.TryGetValue($"{userId}/{def.Prefix}", out int id) && Program.Backends.AllBackends.TryGetValue(id, out BackendHandler.BackendData data))
         {
-            newData.AbstractBackend.Title = $"[Cloud Backends #{BackendData.ID}] {label}";
-            // AddNewNonrealBackend takes a `parent` argument but (as of this writing) never assigns it -
-            // set it ourselves so WebAPI calls can find "the RunPod Pods child of backend #N" by the one
-            // ID the frontend actually has (the parent's), instead of needing the child's own hidden
-            // negative ID, which is never exposed to the UI.
-            newData.AbstractParent = BackendData;
-        });
-        ChildIds.Add(data.ID);
+            return data.AbstractBackend as AbstractT2IBackend;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Ensures the given user has a child backend for the given provider, spawning one on their own API
+    /// key if needed. Idempotent and cheap when the child already exists (any status - an ERRORED child
+    /// is only respawned when the user's key has changed since it errored, so a bad key cannot become a
+    /// per-generation retry loop). Returns null without side effects when the section is disabled or
+    /// the user has no key; <paramref name="throwWhenUnavailable"/> upgrades those to readable errors
+    /// for explicit user actions.
+    ///
+    /// Cost safety: a spawned serverless child never auto-refreshes models (that wakes a billed worker;
+    /// the explicit refresh route covers it), and a spawned instance child never auto-starts its
+    /// instance (the explicit start route covers it) - a user generating on some other backend must
+    /// never be billed as a side effect.
+    /// </summary>
+    public async Task<AbstractT2IBackend> EnsureChildForUser(User user, ProviderDef def, bool throwWhenUnavailable = false)
+    {
+        if (user is null)
+        {
+            return null;
+        }
+        if (!IsProviderEnabled(def))
+        {
+            if (throwWhenUnavailable)
+            {
+                throw new SwarmReadableErrorException($"The {def.Label} section of Cloud Backends #{BackendData.ID} is not enabled.");
+            }
+            return null;
+        }
+        string key = $"{user.UserID}/{def.Prefix}";
+        string apiKey = user.GetGenericData(def.KeyType, "key")?.Trim();
+        AbstractT2IBackend existing = GetChildFor(user.UserID, def);
+        if (existing is not null && !(existing.Status == BackendStatus.ERRORED && existing is ICloudBackend cloud && !string.IsNullOrEmpty(apiKey) && !cloud.IsUsingApiKey(apiKey)))
+        {
+            return existing;
+        }
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            if (throwWhenUnavailable)
+            {
+                throw new SwarmReadableErrorException($"No {def.Label} API key on file for user '{user.UserID}'. Set it in User Settings, API Keys - it is never borrowed from another user.");
+            }
+            return null;
+        }
+        SemaphoreSlim spawnLock = SpawnLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+        await spawnLock.WaitAsync(Program.GlobalProgramCancel);
+        try
+        {
+            existing = GetChildFor(user.UserID, def);
+            if (existing is not null)
+            {
+                if (existing.Status == BackendStatus.ERRORED && existing is ICloudBackend cloud2 && !cloud2.IsUsingApiKey(apiKey))
+                {
+                    Logs.Info($"[CloudBackends] Respawning errored {def.Label} child for user '{user.UserID}' after an API key change.");
+                    await RemoveChild(existing.BackendData.ID, key);
+                }
+                else
+                {
+                    return existing;
+                }
+            }
+            AutoConfiguration settings = BuildChildSettings(def);
+            if (settings is CloudBackendBase.BaseSettings serverless)
+            {
+                serverless.AutoRefresh = false;
+            }
+            if (settings is CloudInstanceBackendBase.InstanceSettings instance)
+            {
+                instance.StartOnEnable = false;
+            }
+            if (settings is RunPodPodsBackend.Settings pods && string.IsNullOrWhiteSpace(pods.PodName))
+            {
+                // A name unique to this backend AND user, so each user's find-by-name reattaches their
+                // own pod. The local user keeps the pre-per-user default name, so upgrading does not
+                // orphan (and keep billing) a pod created under the old naming.
+                pods.PodName = user.UserID == SessionHandler.LocalUserID ? $"swarmui-cloudbackends-{BackendData.ID}" : $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
+            }
+            if (settings is VastAIInstanceBackend.Settings vast && string.IsNullOrWhiteSpace(vast.Label))
+            {
+                // Same unique fallback as the pod name above, for the same reasons.
+                vast.Label = user.UserID == SessionHandler.LocalUserID ? $"swarmui-cloudbackends-{BackendData.ID}" : $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
+            }
+            Logs.Info($"[CloudBackends] Spawning {def.Label} child of backend #{BackendData.ID} for user '{user.UserID}'.");
+            BackendHandler.BackendData data = Handler.AddNewNonrealBackend(def.Type(), BackendData, settings, newData =>
+            {
+                newData.AbstractBackend.Title = $"[Cloud Backends #{BackendData.ID}] {def.Label} ({user.UserID})";
+                switch (newData.AbstractBackend)
+                {
+                    case CloudBackendBase c: c.OwnerUserId = user.UserID; break;
+                    case CloudInstanceBackendBase i: i.OwnerUserId = user.UserID; break;
+                }
+                // AddNewNonrealBackend takes a `parent` argument but (as of this writing) never assigns
+                // it - set it ourselves so WebAPI calls can find "user X's RunPod Pods child of backend
+                // #N" by the one ID the frontend actually has (the parent's), instead of needing the
+                // child's own hidden negative ID, which is never exposed to the UI.
+                newData.AbstractParent = BackendData;
+            });
+            ChildMap[key] = data.ID;
+            return data.AbstractBackend as AbstractT2IBackend;
+        }
+        finally { spawnLock.Release(); }
+    }
+
+    /// <summary>
+    /// Waits for a just-spawned child to finish Init. The bound stays short deliberately: this only
+    /// ever gates child Init (credential validation, capped at 30s) - a cold instance boot happens
+    /// later inside explicit start calls, never here.
+    /// </summary>
+    public static async Task WaitForChildReady(AbstractT2IBackend child, int timeoutSec = 60)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
+        while (DateTime.UtcNow < deadline)
+        {
+            switch (child.Status)
+            {
+                case BackendStatus.RUNNING:
+                case BackendStatus.IDLE:
+                    return;
+                case BackendStatus.ERRORED:
+                case BackendStatus.DISABLED:
+                    string lastStatus = child.LoadStatusReport?.LastOrDefault()?.Message;
+                    throw new SwarmReadableErrorException($"Cloud backend failed to start.{(string.IsNullOrWhiteSpace(lastStatus) ? "" : $" {lastStatus}")}");
+            }
+            await Task.Delay(250, Program.GlobalProgramCancel);
+        }
+        throw new SwarmReadableErrorException($"Cloud backend did not finish starting within {timeoutSec}s.");
+    }
+
+    /// <summary>Deletes one child and forgets it. Must be called under the child's spawn lock.</summary>
+    async Task RemoveChild(int id, string mapKey)
+    {
+        ChildMap.TryRemove(mapKey, out _);
+        try { await Handler.DeleteById(id); }
+        catch (Exception ex) { Logs.Debug($"[CloudBackends] Removing child backend #{id} failed: {ex.Message}"); }
     }
 
     async Task TearDownChildren()
     {
-        foreach (int id in ChildIds)
+        foreach (KeyValuePair<string, int> pair in ChildMap)
         {
-            try { await Handler.DeleteById(id); }
-            catch (Exception ex) { Logs.Debug($"[CloudBackends] Removing child backend #{id} failed: {ex.Message}"); }
+            ChildMap.TryRemove(pair.Key, out _);
+            try { await Handler.DeleteById(pair.Value); }
+            catch (Exception ex) { Logs.Debug($"[CloudBackends] Removing child backend #{pair.Value} failed: {ex.Message}"); }
         }
-        ChildIds.Clear();
     }
 
     public override async Task Shutdown()
