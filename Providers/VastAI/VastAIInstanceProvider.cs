@@ -285,11 +285,14 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             ["rentable"] = new JObject { ["eq"] = true },
             ["rented"] = new JObject { ["eq"] = false },
             ["type"] = "on-demand",
-            ["order"] = new JArray(new JArray("dph_total", "asc")),
             ["allocated_storage"] = Math.Max(1, plan.DiskGb)
+            // No "order" field: Vast's current /bundles/ validation rejects the official CLI's own
+            // [[field, direction]] shape (confirmed live: "order.0/order.1: Input should be a valid
+            // tuple"), so cheapest-first is done client-side below instead of depending on that contract.
         };
         JObject resp = await ApiAsync(HttpMethod.Post, "/api/v0/bundles/", query, cancel) as JObject;
-        return resp?["offers"] as JArray ?? [];
+        JArray offers = resp?["offers"] as JArray ?? [];
+        return [.. offers.OrderBy(o => o["dph_total"]?.Value<double>() ?? double.MaxValue)];
     }
 
     /// <summary>
@@ -320,7 +323,8 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
                 ["id"] = o["id"]?.ToString(),
                 ["gpu_name"] = o["gpu_name"]?.ToString(),
                 ["num_gpus"] = o["num_gpus"]?.Value<int>(),
-                ["gpu_ram"] = o["gpu_ram"]?.Value<double>(),
+                // Vast reports gpu_ram in MB (confirmed against the official CLI's own display conversion); converted here so the field means what its name says.
+                ["gpu_ram"] = o["gpu_ram"]?.Value<double>() / 1000,
                 ["disk_space"] = o["disk_space"]?.Value<double>(),
                 ["geolocation"] = o["geolocation"]?.ToString(),
                 ["reliability"] = o["reliability"]?.Value<double>(),

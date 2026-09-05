@@ -82,23 +82,30 @@ public static class CloudBackendsWebAPI
         {
             T backend = await FindOrSpawnInstanceChild<T>(session, input.BackendId, input.Def);
             backend.CheckPermission(session);
-            int seen;
-            lock (backend.LoadStatusReport)
-            {
-                seen = backend.LoadStatusReport.Count;
-            }
+            // The real action must start unconditionally, before touching LoadStatusReport at all: core
+            // clears that list some time after a backend finishes loading (AbstractBackend.cs), so a
+            // child that has been alive a while already has it null by the time Start/Stop is called.
+            // Status streaming below is best-effort on top of that - starting/stopping must never be
+            // gated on it.
             Task action = input.Start ? backend.StartInstanceAsync() : backend.StopInstanceAsync();
+            int seen = 0;
             while (true)
             {
-                string[] fresh;
-                lock (backend.LoadStatusReport)
+                // Snapshot once per iteration and null-check before locking - core can null this out
+                // between iterations, and locking on null throws.
+                List<AbstractBackend.LoadStatus> report = backend.LoadStatusReport;
+                if (report is not null)
                 {
-                    fresh = [.. backend.LoadStatusReport.Skip(seen).Select(s => s.Message)];
-                    seen = backend.LoadStatusReport.Count;
-                }
-                foreach (string message in fresh)
-                {
-                    output(new JObject { ["status"] = message });
+                    string[] fresh;
+                    lock (report)
+                    {
+                        fresh = [.. report.Skip(seen).Select(s => s.Message)];
+                        seen = report.Count;
+                    }
+                    foreach (string message in fresh)
+                    {
+                        output(new JObject { ["status"] = message });
+                    }
                 }
                 if (action.IsCompleted)
                 {

@@ -97,10 +97,12 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         {
             InstanceId = ActiveInstanceId,
             Status = pod["status"]?.ToString() ?? "UNKNOWN",
-            GpuName = pod["gpu"]?["id"]?.ToString(),
-            GpuCount = pod["gpu"]?["count"]?.Value<int>() ?? 0,
+            // RunPod sends these as JSON null (not omitted) before the pod finishes provisioning a GPU/
+            // runtime - a JValue holding null still throws on `?[...]`, so cast rather than chain ?.
+            GpuName = (pod["gpu"] as JObject)?["id"]?.ToString(),
+            GpuCount = (pod["gpu"] as JObject)?["count"]?.Value<int>() ?? 0,
             CostPerHour = pod["cost"]?.Value<double>() ?? 0,
-            UptimeSeconds = pod["runtime"]?["uptime"]?.Value<int>() ?? 0,
+            UptimeSeconds = (pod["runtime"] as JObject)?["uptime"]?.Value<int>() ?? 0,
             AllowedActions = [.. (pod["actions"] as JArray ?? []).Select(a => a.ToString())],
             // The API never returns a proxy URL; it is constructed from the pod id and the internal port.
             PublicUrl = $"https://{ActiveInstanceId}-{plan.SwarmUIPort}.proxy.runpod.net"
@@ -184,8 +186,10 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         // Wait for SwarmUI itself, not just the pod: the proxy answers 502 while the container boots,
         // and handing an unready URL to the Swarm backend would just make it fail its own connect.
         await Api.WaitForSwarmAsync(publicUrl, deadline, $"Check that SwarmUI is installed in the pod and listening on port {plan.SwarmUIPort}, and that the port is exposed as http.", cancel);
-        string gpu = pod?["gpu"]?["id"]?.ToString();
-        int gpuCount = pod?["gpu"]?["count"]?.Value<int>() ?? plan.GpuCount;
+        // Cast, don't chain ?.: RunPod sends "gpu" as JSON null (not omitted) in early pod states, and a
+        // JValue holding null still throws on `?[...]` (only a C#-null JToken reference short-circuits).
+        string gpu = (pod?["gpu"] as JObject)?["id"]?.ToString();
+        int gpuCount = (pod?["gpu"] as JObject)?["count"]?.Value<int>() ?? plan.GpuCount;
         Logs.Info($"[RunPodPods] SwarmUI is up on pod '{podId}' at {publicUrl}");
         return new CloudInstanceInfo
         {
@@ -457,7 +461,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                     ["id"] = p["id"]?.ToString(),
                     ["name"] = p["name"]?.ToString(),
                     ["status"] = p["status"]?.ToString(),
-                    ["gpu"] = p["gpu"]?["id"]?.ToString(),
+                    ["gpu"] = (p["gpu"] as JObject)?["id"]?.ToString(),
                     ["cost_per_hr"] = p["cost"]?.Value<double>()
                 });
             }
