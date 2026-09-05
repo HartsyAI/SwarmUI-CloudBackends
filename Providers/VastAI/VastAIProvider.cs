@@ -139,18 +139,25 @@ public class VastAIProvider(string apiKey, string endpointName, string workerRou
     /// <summary>Asks the serverless engine for a worker. Returns the raw grant, which doubles as auth_data.</summary>
     public async Task<JObject> RouteAsync(int requestIdx, CancellationToken cancel = default, double cost = 100.0)
     {
+        string key = _endpointApiKey ?? apiKey;
         JObject payload = new()
         {
             ["endpoint"] = endpointName,
             ["cost"] = cost,
-            ["api_key"] = _endpointApiKey ?? apiKey,
-            ["request_idx"] = requestIdx
+            ["api_key"] = key,
+            ["request_idx"] = requestIdx,
+            // Matches the official vast-sdk client (vastai/serverless/client/endpoint.py Endpoint._route),
+            // which always sends this alongside request_idx - the routing engine's own retry/replay window.
+            ["replay_timeout"] = 60.0
         };
-        using HttpRequestMessage request = new(HttpMethod.Post, $"{RouteBase}/route/")
+        // The official client also puts the key on the query string (on every serverless call, not just
+        // this one - see _make_request in vastai/serverless/client/connection.py). Matched here even
+        // though the header alone authenticates fine, since it costs nothing and removes any doubt.
+        using HttpRequestMessage request = new(HttpMethod.Post, $"{RouteBase}/route/?api_key={Uri.EscapeDataString(key)}")
         {
             Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
         };
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _endpointApiKey ?? apiKey);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
         Logs.Debug($"[VastAI] POST /route/ (endpoint: {endpointName}, request_idx: {requestIdx})");
         using HttpResponseMessage response = await Http.SendAsync(request, cancel);
         string text = await response.Content.ReadAsStringAsync(cancel);
