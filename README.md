@@ -26,7 +26,7 @@ Every cloud backend belongs to exactly one user and runs on that user's own key:
 
 The two "rent a whole instance" sections (RunPod GPU Pods, Vast.ai Instances) additionally get **Start** / **Stop** buttons with a live status line (state, GPU, cost/hr, uptime). Starting always confirms first (with a live price estimate when available, since either kind of instance bills continuously until stopped). Two optional failsafes are also available on each: auto-stop after N minutes of runtime, and/or once estimated spend (the provider's own reported hourly rate x uptime) crosses a cap you set - useful if you might forget to stop it yourself. Neither provider exposes a real-time spend API, so the estimate is computed locally rather than polled.
 
-![RunPod GPU Pods section expanded, showing fields, Start/Stop buttons and the live status line](Assets/screenshots/runpod-pods-expanded.png)
+![RunPod GPU Pods section expanded, showing fields, Start/Stop buttons and the live status line](Assets/screenshots/runpod-live-dropdowns.png)
 
 ## Provider status
 
@@ -35,7 +35,7 @@ The two "rent a whole instance" sections (RunPod GPU Pods, Vast.ai Instances) ad
 | RunPod Serverless | Supported. Verified end to end against real hardware, including generation. |
 | RunPod Pods | Supported. Verified end to end live: create a pod, attach it as a real Swarm backend, generate, Start/Stop, terminate. |
 | Vast.ai Serverless | Built to the documented serverless contract. Config and credential handling verified against the live API; routing and generation are untested, since that needs a Vast account and a deployed worker. |
-| Vast.ai Instances | Built and verified against the official `vastai` Python SDK/CLI source (the prose docs are vague on the exact endpoints). Config/credential plumbing and the Start/Stop/confirm/error-surfacing UI flow are live-verified the same way RunPod Pods was; actual instance creation and networking are untested against a real Vast account, and creating a brand-new named network volume isn't supported yet (attaching an existing one is) - see "Known follow ups". |
+| Vast.ai Instances | Built and verified against the official `vastai` Python SDK/CLI source (the prose docs are vague, and sometimes wrong, on the exact endpoints). Config/credential plumbing, the live offer search (real GPUs/prices/locations), and the Start/Stop/confirm/error-surfacing UI flow are all live-verified against a real account; actual instance creation and networking are still untested, since that needs a funded account (search doesn't require a balance, renting does), and creating a brand-new named network volume isn't supported yet (attaching an existing one is) - see "Known follow ups". |
 
 ## How it works
 
@@ -98,6 +98,12 @@ Set `PodId` to attach an existing pod, or leave it blank and set `ImageName` (or
 
 Once you have a RunPod API key set in **User Settings > API Keys**, opening **Server > Backends** with *Show Advanced* on turns the GPU type, network volume, data center, template and pod ID fields into dropdowns populated live from your account, showing real availability and hourly price instead of asking you to type an exact GPU name from memory. Leaving GPU type on its blank "(cheapest available)" entry asks RunPod's catalog which GPUs are actually available for pods and tries them cheapest first; this matters because the API places exactly one GPU type per creation request and does not fall back on its own, so naming a single busy GPU type simply fails.
 
+![RunPod GPU Pods section with GPU Type and Network Volume both showing real, currently-selected account data](Assets/screenshots/runpod-live-dropdowns.png)
+
+![GPU Type dropdown open, listing real GPUs from the account's catalog with live price and availability, cheapest first](Assets/screenshots/runpod-gputype-dropdown-open.png)
+
+A field only stays a plain text box when your account genuinely has nothing to offer it yet - Pod ID before you've created any pods, for instance. Type an ID by hand there if you need to; it becomes a picker automatically once something exists to pick from.
+
 The pod's image must serve SwarmUI on `SwarmUIPort`, exposed as an http port so RunPod's proxy can reach it at `https://{podId}-{port}.proxy.runpod.net`. Note that RunPod's proxy applies no authentication of its own: anyone who knows the pod ID and port can reach that SwarmUI, so do not put anything sensitive on a pod you would not expose publicly.
 
 If you attach a `NetworkVolumeId`, the pod is automatically placed in that volume's data center, because a volume can only attach to a pod sitting next to it.
@@ -115,6 +121,12 @@ Same shape as RunPod Pods (bills continuously until stopped, `TerminateOnShutdow
 * **Port exposure is a Docker `-p` flag, not a structured field.** This extension adds `-p {SwarmUIPort}:{SwarmUIPort}` to the instance's `env` automatically; the image just needs to actually bind that port inside the container.
 * Once you have a Vast.ai API key set in **User Settings > API Keys**, the offer and network volume fields become live dropdowns the same way RunPod's do, showing real GPU/price/location instead of asking you to know an offer ID by memory.
 * **Creating a brand-new named network volume isn't supported yet** - attach one you already created on Vast.ai via `NetworkVolumeId`. Vast's volumes are themselves rented from a marketplace (their own offer-search step), which is out of scope for this pass.
+
+![Vast.ai Instances section with a real offer selected - GPU, price, location and reliability all live account data](Assets/screenshots/vastai-live-dropdowns.png)
+
+![Offer dropdown open, listing dozens of real rentable offers sorted cheapest first](Assets/screenshots/vastai-offer-dropdown-open.png)
+
+Network Volume stays a plain text box until your account actually has one - same reasoning as RunPod's Pod ID above.
 
 ## Concurrency and scaling
 
@@ -152,6 +164,8 @@ Serverless timings from live runs against an RTX class worker, SDXL at 1024x1024
 
 Pods, live end to end run: pod created and SwarmUI answering (RTX PRO 4500 Blackwell, warm network volume) in about 3 minutes; the Swarm backend attaches and reaches `running` within seconds of that; a generation through the attached backend, about 60 s including ComfyUI's own model load; termination on disable, immediate with zero pods left on the account.
 
+Per-user tenancy, live end to end run against a real account (RTX 2000 Ada, auto-picked as the cheapest available GPU, same warm network volume): child backend spawned on demand, real pod created and SwarmUI answering in about 3 minutes, a real image generated in 70 s (mostly one-time model load), then cleanly terminated - confirmed via RunPod's own account listing showing zero pods left. Total pod lifetime about 7 minutes, roughly $0.03.
+
 ## Troubleshooting
 
 Errors are written to point at the actual problem rather than leaving you guessing:
@@ -183,7 +197,7 @@ One gotcha while iterating: SwarmUI caches the built extension DLL against this 
 
 Known follow ups:
 
-* **Vast.ai Instances end to end**, which needs a real account - config/credential plumbing and the UI flow are live-verified, but actual instance creation, the random-port networking path, and generation through an attached instance are not.
+* **Vast.ai Instances end to end**, which needs a funded account - config/credential plumbing, the live dropdowns, and the UI flow are live-verified against a real (unfunded) account, but actual instance creation, the random-port networking path, and generation through an attached instance are not, since renting needs a balance that searching does not.
 * **Creating a brand-new named Vast.ai network volume** isn't supported - only attaching an existing one is. Vast's volumes are rented from their own marketplace (a separate offer-search step, `POST /api/v0/network_volumes/search/`), out of scope for this pass.
 * The serverless worker handler returns its cached SwarmUI session without revalidating it. The extension compensates by refreshing the remote session in place when it sees `invalid_session_id`.
 * The Vast.ai Serverless path end to end, which needs an account, a workergroup and a deployed worker.
