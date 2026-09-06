@@ -1,45 +1,125 @@
 # SwarmUI-CloudBackends
 
-Run your [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI) generations on cloud GPUs. Workers wake on demand when you generate and scale back to zero when idle, so you only pay while you are actually using a GPU.
+Run your [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI) generations on cloud GPUs. Workers wake on demand when you generate and scale back to zero when idle, so you only pay while you're actually using a GPU.
 
-The extension is modular by design: one shared core handles the SwarmUI side, and each cloud provider is a thin adapter. Adding a provider means implementing a small interface, not writing another backend.
-
-## One backend, one entry point
-
-**Server > Backends** has a single addable **Cloud Backends** type (behind *Show Advanced*), not four:
-
-![Add new backend - only one Cloud Backends button among the advanced types](Assets/screenshots/add-backend-button.png)
-
-Adding it gives you one settings card with a collapsible section per provider (RunPod Serverless / RunPod GPU Pods / Vast.ai Serverless / Vast.ai Instances), each with its own enable toggle and fields, no API key fields in this card (those stay in **User Settings > API Keys** as always). The card is a pool manager: enabling a section makes that provider available, and an actual hidden backend is created **per user, on that user's own API key**, the first time the user generates (serverless) or presses Start (instances). The internal `runpod_serverless_hidden`/`runpod_pods_hidden`/`vastai_serverless_hidden`/`vastai_instance_hidden` backend types still exist, they just aren't independently addable or listed in the per-generation backend-type dropdown.
-
-### Per-user backends
-
-Every cloud backend belongs to exactly one user and runs on that user's own key:
-
-* A user with no key on file gets a clean refusal ("No ... API key on file for user '...'"), never another user's worker or bill.
-* A user's generations only route to (and are only accepted by) their own cloud backends - this holds for serverless workers and for the whole backend tree attached to a rented instance.
-* Changing your API key takes effect on the next use automatically; no disable/re-enable cycle needed.
-* A created pod/instance is remembered per user (in the user database) and reattached after a SwarmUI restart instead of creating a second billed one; find-by-name/label (unique per backend and user by default) covers the same case as a fallback. Under `--no_persist` (or if the backend is later renumbered via an ID edit) the remembered ID is not written/found, and find-by-name/label alone carries reattachment.
-* Cost safety rule: an implicitly-created backend never spends money by itself. Serverless children never auto-refresh models (that wakes a billed worker - use the refresh button/route), and instance children never auto-start their instance (use Start).
-
-![Cloud Backends card with all four provider sections collapsed](Assets/screenshots/accordion-collapsed.png)
-
-The two "rent a whole instance" sections (RunPod GPU Pods, Vast.ai Instances) additionally get **Start** / **Stop** buttons with a live status line (state, GPU, cost/hr, uptime). Starting always confirms first (with a live price estimate when available, since either kind of instance bills continuously until stopped). Two optional failsafes are also available on each: auto-stop after N minutes of runtime, and/or once estimated spend (the provider's own reported hourly rate x uptime) crosses a cap you set - useful if you might forget to stop it yourself. Neither provider exposes a real-time spend API, so the estimate is computed locally rather than polled.
-
-![RunPod GPU Pods section expanded, showing fields, Start/Stop buttons and the live status line](Assets/screenshots/runpod-live-dropdowns.png)
+One shared core handles the SwarmUI side; each cloud provider is a thin adapter. Adding a provider means implementing a small interface, not writing another backend.
 
 ## Provider status
 
 | Provider | Status |
 |---|---|
-| RunPod Serverless | Supported. Verified end to end against real hardware, including generation. |
-| RunPod Pods | Supported. Verified end to end live: create a pod, attach it as a real Swarm backend, generate, Start/Stop, terminate. |
-| Vast.ai Serverless | Built to the documented serverless contract. Config and credential handling verified against the live API; routing and generation are untested, since that needs a Vast account and a deployed worker. |
-| Vast.ai Instances | Built and verified against the official `vastai` Python SDK/CLI source (the prose docs are vague, and sometimes wrong, on the exact endpoints). Config/credential plumbing, the live offer search (real GPUs/prices/locations), and the Start/Stop/confirm/error-surfacing UI flow are all live-verified against a real account; actual instance creation and networking are still untested, since that needs a funded account (search doesn't require a balance, renting does), and creating a brand-new named network volume isn't supported yet (attaching an existing one is) - see "Known follow ups". |
+| RunPod Serverless | ✅ Verified end to end against real hardware, including generation. |
+| RunPod Pods | ✅ Verified end to end live: create, attach, generate, Start/Stop, terminate. |
+| Vast.ai Instances | ✅ Verified end to end live, including a full from-scratch volume + install. |
+| Vast.ai Serverless | ⚠️ Built to the documented contract, config/credentials verified live. Routing and generation are untested (needs a deployed worker). |
+
+<details>
+<summary><b>Deeper detail per provider</b></summary>
+
+- **RunPod Pods**: create a pod, attach it as a real Swarm backend, generate, Start/Stop, terminate - all done live.
+- **Vast.ai Instances**: verified against the official `vastai` Python SDK/CLI source, since the prose docs are vague (and sometimes wrong) on exact endpoints. Config/credentials, live offer search, Start/Stop/confirm/error UI, instance creation, networking, and a real generation are all live-verified. Creating a brand-new *named* network volume isn't supported yet (attaching an existing one is) - see [Known follow-ups](#known-follow-ups).
+- **Vast.ai Serverless**: routing and generation are untested since that needs a Vast account with a deployed worker.
+
+</details>
+
+## Setup
+
+Every provider lives behind one **Cloud Backends** entry (**Server ▸ Backends ▸** *Show Advanced*), not four separate types:
+
+<img src="Assets/screenshots/add-backend-button.png" width="500" alt="Add new backend - only one Cloud Backends button among the advanced types">
+
+Adding it gives you one card with a collapsible section per provider, each with its own toggle. No API key fields here - those stay in **User Settings ▸ API Keys**.
+
+<img src="Assets/screenshots/accordion-collapsed.png" width="500" alt="Cloud Backends card with all four provider sections collapsed">
+
+> [!IMPORTANT]
+> Enabling a section and saving never starts (or bills) anything by itself. For "rent a whole instance" providers, it only makes the **Start** button usable - starting is always an explicit, confirmed action.
+
+### RunPod Serverless
+
+1. Deploy [RunPod-Worker-SwarmUI](https://github.com/HartsyAI/RunPod-Worker-SwarmUI) (`kalebbroo/swarmui-runpod:latest`) as an endpoint: network volume at `/runpod-volume`, ≥16 GB VRAM, ~15 GB container disk, execution timeout comfortably above your keepalive (3600s is safe), FlashBoot on.
+2. Set your RunPod key in **User Settings ▸ API Keys**.
+3. In the **RunPod Serverless** section: toggle on, set `EndpointId`, Save.
+
+Your key and endpoint are validated against RunPod's health API immediately, so a bad value fails at setup instead of at your first generation.
+
+### RunPod Pods
+
+Set `PodId` to attach an existing pod, or leave it blank plus `ImageName`/`TemplateId` to create one. Leave `PodName` blank too - it defaults to a name unique to this backend, avoiding collisions between multiple Cloud Backends entries.
+
+Once your API key is set, GPU type / network volume / data center / template / pod ID all become **live dropdowns** populated from your account - real availability and price, not a name typed from memory.
+
+<img src="Assets/screenshots/runpod-live-dropdowns.png" width="600" alt="RunPod GPU Pods section with GPU Type and Network Volume both showing real, currently-selected account data">
+
+<details>
+<summary>GPU Type dropdown, open</summary>
+
+<img src="Assets/screenshots/runpod-gputype-dropdown-open.png" width="600" alt="GPU Type dropdown open, listing real GPUs from the account's catalog with live price and availability, cheapest first">
+
+A field only stays a plain text box when your account genuinely has nothing to offer it yet (e.g. Pod ID before you've created any pods). Type by hand there if needed - it becomes a picker automatically once something exists to pick from.
+
+</details>
+
+> [!WARNING]
+> The pod's own SwarmUI needs at least one backend of its own (ComfyUI, typically) before anything can generate through it. A pod with an empty backend list attaches successfully but has nothing to route to. Adding one after attaching is picked up automatically within a few seconds.
+
+> [!WARNING]
+> A worker image built for RunPod **serverless** generally won't work as a pod without support for both - a serverless-only entrypoint's job handler has no jobs to serve in a pod, exits immediately, and takes the container with it. [RunPod-Worker-SwarmUI](https://github.com/HartsyAI/RunPod-Worker-SwarmUI) supports both from one image, picking serverless-vs-pod mode from whether `RUNPOD_ENDPOINT_ID` is set.
+
+`TerminateOnShutdown` (off by default) controls whether stopping the pod also destroys it. Off keeps the container disk around for a fast resume; only turn it on when a network volume already holds everything worth keeping. RunPod's proxy (`https://{podId}-{port}.proxy.runpod.net`) has no authentication of its own - don't put anything sensitive on a pod you wouldn't expose publicly. Attaching a `NetworkVolumeId` auto-places the pod in that volume's data center.
+
+### Vast.ai Instances
+
+Same shape as RunPod Pods (bills continuously until stopped, `TerminateOnShutdown` means the same thing, `Label` defaults to a unique name the same way `PodName` does), with a few differences:
+
+- **Instances come from a specific rentable offer**, not an abstract GPU type. Leave `OfferId` blank to auto-search and take the cheapest match - Vast has no RunPod-style retry across candidates, so if that exact offer is gone by generation time, pick another from the live dropdown.
+- **No proxy domain.** Vast maps your port to a random external port on a shared host IP, only known after creation, reachable at plain `http://{ip}:{port}` - no TLS, no auth. Same "don't expose anything sensitive" rule as RunPod, with weaker transport on top.
+- **Creating a brand-new named network volume isn't supported yet** - attach one you already made on Vast via `NetworkVolumeId`. (See [below](#never-used-vastai-before) if you don't have one yet.)
+
+Once your key is set, offer and network volume fields become live dropdowns the same way RunPod's do.
+
+<img src="Assets/screenshots/vastai-live-dropdowns.png" width="600" alt="Vast.ai Instances section with a real offer selected - GPU, price, location and reliability all live account data">
+
+<details>
+<summary>Offer dropdown, open</summary>
+
+<img src="Assets/screenshots/vastai-offer-dropdown-open.png" width="600" alt="Offer dropdown open, listing dozens of real rentable offers sorted cheapest first">
+
+</details>
+
+<details id="never-used-vastai-before">
+<summary><b>Never used Vast.ai before? Create a volume and install SwarmUI from scratch</b></summary>
+
+1. **Create a volume.** On [Search](https://cloud.vast.ai/search), pick a GPU and set **Add volume ▸ Create local volume** with the size you want.
+
+   > [!NOTE]
+   > Volumes are tied to the physical host you rent on - reattaching one to a later instance only works on that same machine.
+
+   <img src="Assets/screenshots/vastai-create-volume-and-rent.png" width="600" alt="Vast.ai search page with a GPU selected and Add volume set to Create local volume">
+
+2. **Rent it**, then open the instance once running. A fresh SwarmUI image runs its own first-time installer on first boot - same wizard as a local install, until the backend step:
+
+   <img src="Assets/screenshots/swarmui-installer-backend-choice.png" width="600" alt="SwarmUI installer's backend-choice step: ComfyUI (Local) vs None / Custom / Choose Later">
+
+   - **Using ComfyUI?** Pick **ComfyUI (Local)** and you're done - it installs and wires up automatically.
+   - Want a different backend? Pick **None / Custom / Choose Later** instead.
+
+3. If you'll reach this instance from outside the container, pick **"Just Yourself, with LAN access"** on the "who is this for" step, not "Just Yourself On This PC" - the latter refuses external connections regardless of what Vast does with the port.
+
+4. SwarmUI boots fine with no backend - it just has nothing to generate with yet:
+
+   <img src="Assets/screenshots/swarmui-fresh-no-backends.png" width="600" alt="Freshly installed SwarmUI, no backends configured, red banner pointing at Server > Backends">
+
+   Configure whatever backend you want under **Server ▸ Backends** from here.
+
+</details>
 
 ## How it works
 
-There are two shapes of provider here, because "wake a serverless worker per request" and "rent a whole instance that stays up" need different lifecycles.
+Two shapes of provider, because "wake a serverless worker per request" and "rent an instance that stays up" need different lifecycles.
+
+<details>
+<summary><b>Architecture</b></summary>
 
 **Serverless** (RunPod Serverless, Vast.ai) wakes a worker on the first generate and talks directly to its SwarmUI over HTTP:
 
@@ -53,9 +133,9 @@ There are two shapes of provider here, because "wake a serverless worker per req
   CloudWorkerInfo { PublicUrl, SessionId, WorkerId, Version }
 ```
 
-This deliberately does not reuse SwarmUI's built in `SwarmSwarmBackend`, which assumes the remote is reachable at startup and whose idle pings would keep a pay per second worker billing the whole time it is attached.
+This deliberately skips SwarmUI's built-in `SwarmSwarmBackend`, which assumes the remote is reachable at startup and whose idle pings would keep a pay-per-second worker billing the whole time it's attached.
 
-**Instance rental** (RunPod GPU Pods, Vast.ai Instances) is the opposite shape: once a pod is running, it stays up until you stop it, so there is no reason to reimplement the remote protocol. This backend only drives the provider's API to get a pod running with SwarmUI on it, then hands the URL to a swarm backend child and steps out of the way:
+**Instance rental** (RunPod GPU Pods, Vast.ai Instances) stays up until you stop it, so there's no reason to reimplement the remote protocol - this backend just drives the provider's API to get SwarmUI running, then hands the URL to a swarm backend child and steps out of the way:
 
 ```
   ICloudInstanceProvider          CloudInstanceBackendBase : AbstractT2IBackend
@@ -68,143 +148,112 @@ This deliberately does not reuse SwarmUI's built in `SwarmSwarmBackend`, which a
   CloudInstanceInfo { PublicUrl, InstanceId, Description }
 ```
 
-Sessions, model sync, parameter forwarding and generation are core Swarm code either way, either called directly (serverless) or delegated to (pods). Nothing here reimplements the remote-Swarm protocol from scratch.
+Sessions, model sync, parameter forwarding and generation are core Swarm code either way - called directly (serverless) or delegated to (pods). Nothing here reimplements the remote-Swarm protocol.
 
-The extension plugs into SwarmUI's own systems rather than reinventing them:
+`CloudBackendsBackend` is the one publicly registered type; each provider's own `BackendType` is built without the public registry, so it's usable as a hidden child without being independently addable (`CloudBackendTypes`). Serverless remote models merge into the model browser via `ExtraModelProviders`; a pod's models reach it through core's own `remote_swarm` provider instead, since the attached `SwarmSwarmBackend` is a real backend as far as core is concerned. Every action is reachable over the plain API (`CloudGetStatus`, `CloudRefreshModels`, `Cloud{Start,Stop,GetStatus}Pod`, `VastAI{Start,Stop,GetInstance}Status`, `CloudListProviders`), with `...WS` websocket variants for streaming progress while a cold instance boots.
 
-* `CloudBackendsBackend` is the one publicly registered backend type; each provider's own `BackendType` records are built without calling the public registry, so they're usable internally (as hidden children) without being independently addable. See `CloudBackendTypes`.
-* API keys live in the per user key store under **User Settings > API Keys** (`runpod_api`, `vastai_api`).
-* Serverless remote models are merged into the model browser through `ExtraModelProviders`, and generating with a cloud only model auto routes to the cloud backend. A pod's models reach the browser through core's own `remote_swarm` provider instead, since the attached `SwarmSwarmBackend` is a real backend as far as core is concerned.
-* Permissions: `use_runpod_serverless`, `use_runpod_pods`, `use_vastai`, `use_vastai_instances`, and `cloudbackends_status`.
-* Every action is reachable over the plain API (`CloudGetStatus`, `CloudRefreshModels`, `CloudStartPod`/`CloudStopPod`/`CloudGetPodStatus`, `VastAIStartInstance`/`VastAIStopInstance`/`VastAIGetInstanceStatus`, `CloudListProviders`), and the start/stop calls have websocket variants (`...WS`) that stream progress lines while a cold instance boots.
+</details>
 
-## Setup for RunPod Serverless
+## Per-user tenancy
 
-1. Deploy the worker: [RunPod-Worker-SwarmUI](https://github.com/HartsyAI/RunPod-Worker-SwarmUI), published as `kalebbroo/swarmui-runpod:latest`. The endpoint needs:
-   * A network volume mounted at `/runpod-volume`, where SwarmUI and your models are installed on first boot.
-   * A GPU with at least 16 GB VRAM, and roughly 15 GB of container disk.
-   * An execution timeout comfortably above your keepalive duration (3600s is a safe default), and FlashBoot enabled.
-2. In SwarmUI, open **User Settings > API Keys** and set your RunPod key.
-3. Open **Server > Backends**, enable *Show Advanced*, and add **Cloud Backends** (once, if you haven't already). Expand the **RunPod Serverless** section, toggle it on, set `EndpointId`, and Save.
-4. Initialization validates your key and endpoint against RunPod's health API before reporting as running, so a bad key or endpoint ID fails immediately with a clear message instead of at your first generation.
+Every cloud backend belongs to exactly one user and runs on that user's own key:
 
-## Setup for RunPod Pods
+- No key on file → clean refusal, never another user's worker or bill.
+- Your generations only route to (and are only accepted by) your own cloud backends - serverless workers and attached instance backends alike.
+- Changing your key takes effect on next use automatically.
+- A created pod/instance is remembered per user and reattached after a restart instead of billing a second one; find-by-name/label is the fallback.
 
-A pod is a GPU you rent by the hour, so unlike serverless it bills continuously from the moment it starts until you stop it. `TerminateOnShutdown` controls what happens when the pod is stopped (via the Stop Pod button, disabling the section, or a failsafe tripping): off (the default) stops the pod so it can resume quickly, keeping its container disk (and its storage cost); on destroys it, which only makes sense when a network volume holds everything worth keeping.
-
-Enabling the section and saving never starts (or bills) a pod by itself; it makes the **Start Pod** button usable. Starting is always an explicit action.
-
-Set `PodId` to attach an existing pod, or leave it blank and set `ImageName` (or `TemplateId`) so one can be created. Leave `PodName` blank too (recommended) - it defaults to a name unique to this backend, so creating looks for a pod already under that name before making a new one, and two separate Cloud Backends entries can't collide on the same pod name.
-
-Once you have a RunPod API key set in **User Settings > API Keys**, opening **Server > Backends** with *Show Advanced* on turns the GPU type, network volume, data center, template and pod ID fields into dropdowns populated live from your account, showing real availability and hourly price instead of asking you to type an exact GPU name from memory. Leaving GPU type on its blank "(cheapest available)" entry asks RunPod's catalog which GPUs are actually available for pods and tries them cheapest first; this matters because the API places exactly one GPU type per creation request and does not fall back on its own, so naming a single busy GPU type simply fails.
-
-![RunPod GPU Pods section with GPU Type and Network Volume both showing real, currently-selected account data](Assets/screenshots/runpod-live-dropdowns.png)
-
-![GPU Type dropdown open, listing real GPUs from the account's catalog with live price and availability, cheapest first](Assets/screenshots/runpod-gputype-dropdown-open.png)
-
-A field only stays a plain text box when your account genuinely has nothing to offer it yet - Pod ID before you've created any pods, for instance. Type an ID by hand there if you need to; it becomes a picker automatically once something exists to pick from.
-
-The pod's image must serve SwarmUI on `SwarmUIPort`, exposed as an http port so RunPod's proxy can reach it at `https://{podId}-{port}.proxy.runpod.net`. Note that RunPod's proxy applies no authentication of its own: anyone who knows the pod ID and port can reach that SwarmUI, so do not put anything sensitive on a pod you would not expose publicly.
-
-If you attach a `NetworkVolumeId`, the pod is automatically placed in that volume's data center, because a volume can only attach to a pod sitting next to it.
-
-**The pod's own SwarmUI needs at least one backend of its own** (ComfyUI, typically) before anything can generate through it; a pod with an empty backend list attaches successfully but has nothing to route to. If you add or change a backend on the pod after this extension has already attached to it, it is picked up automatically within a few seconds rather than needing a restart.
-
-> A worker image built for RunPod **serverless** will not generally work as a pod without support for both. Serverless-only entrypoints put the job handler in the foreground; in a pod that handler has no jobs to serve, so it exits immediately and takes the container with it, leaving nothing listening on the http port and the proxy answering 404. [RunPod-Worker-SwarmUI](https://github.com/HartsyAI/RunPod-Worker-SwarmUI) supports both from one image, selecting serverless or pod mode based on whether RunPod set `RUNPOD_ENDPOINT_ID` (or `SWARM_MODE` if set explicitly).
-
-## Setup for Vast.ai Instances
-
-Same shape as RunPod Pods (bills continuously until stopped, `TerminateOnShutdown` means the same thing, `Label` defaults to a name unique to this backend for the same collision reason `PodName` does), but Vast's actual mechanics differ in ways worth knowing before you set it up:
-
-* **Instances are created from a specific rentable offer**, not an abstract GPU type. Leave `OfferId` blank to search on-demand offers and take the cheapest match at create time (Vast has no RunPod-style automatic retry across candidates - an offer is one specific host slot, so if it's gone by the time Swarm tries to use it, pick another from the live dropdown rather than expecting a fallback).
-* **There is no proxy domain.** RunPod gives you a predictable `https://{id}-{port}.proxy.runpod.net`; Vast maps your port to a **random external port on a shared host IP**, only known after creation, reachable at **plain `http://{ip}:{port}` - no TLS, no authentication of its own**. Don't put anything sensitive on an instance you wouldn't expose publicly, same caveat as RunPod's proxy but with weaker transport security on top.
-* **Port exposure is a Docker `-p` flag, not a structured field.** This extension adds `-p {SwarmUIPort}:{SwarmUIPort}` to the instance's `env` automatically; the image just needs to actually bind that port inside the container.
-* Once you have a Vast.ai API key set in **User Settings > API Keys**, the offer and network volume fields become live dropdowns the same way RunPod's do, showing real GPU/price/location instead of asking you to know an offer ID by memory.
-* **Creating a brand-new named network volume isn't supported yet** - attach one you already created on Vast.ai via `NetworkVolumeId`. Vast's volumes are themselves rented from a marketplace (their own offer-search step), which is out of scope for this pass.
-
-![Vast.ai Instances section with a real offer selected - GPU, price, location and reliability all live account data](Assets/screenshots/vastai-live-dropdowns.png)
-
-![Offer dropdown open, listing dozens of real rentable offers sorted cheapest first](Assets/screenshots/vastai-offer-dropdown-open.png)
-
-Network Volume stays a plain text box until your account actually has one - same reasoning as RunPod's Pod ID above.
+> [!IMPORTANT]
+> An implicitly-created backend never spends money by itself. Serverless children never auto-refresh models (that wakes a billed worker - use the refresh route), and instance children never auto-start (use Start).
 
 ## Concurrency and scaling
 
-One backend instance owns exactly one worker. Concurrent generation requests share it: the first request wakes the worker, and the rest reuse the cached one. `MaxConcurrent` controls how many requests SwarmUI will hand to that single backend at once, and the worker's own SwarmUI queues them internally.
-
-Generation traffic goes straight to the worker's URL and never enters RunPod's job queue, so RunPod's autoscaler cannot see that load and will not add workers for it. To use more than one GPU, add more **Cloud Backends** entries under **Server > Backends** (each with its own provider section enabled). Each one wakes and owns its own worker.
-
-## Notes and limitations
-
-* **Cloud models must be discovered before you can generate with them.** Call `/API/CloudRefreshModels` once per server start (it is a deliberate action because it wakes a billed worker). Until then SwarmUI does not know those model names and will reject the request.
-* The model *list* is merged across users' serverless backends (core's model-list hook carries no user context); generation itself stays strictly per-user - routing a request at another user's model gets a clean refusal. Per-user listing needs a core PR.
-* Editing the Cloud Backends card's settings restarts it, which drops every user's hidden children (including stopping started instances); users get fresh ones on next use. Core restarts any backend you edit - this is the same behavior, just fanned out.
-* API keys are stored cleartext in `Data/Users.ldb` (and its periodic backups) by core's per-user key store. Protect that directory accordingly; masking there is core's to fix, not this extension's.
-* `GenerationTimeoutSec` above 600 is capped by the shared HTTP client's 10 minute ceiling.
-* `KeepaliveSeconds` (default 420) is what you pay for while idle, so lower is cheaper. It is automatically raised to at least `GenerationTimeoutSec` plus two minutes so a worker is never torn down mid generation.
-
-### Two behaviors worth knowing about RunPod
-
-**Cancelling a running job terminates the worker executing it.** So "cancel the old keepalive, submit a new one" kills the very worker you are trying to keep alive. Observed live: a healthy worker died about 13 seconds after such a cancel, and every later call to its proxy URL returned an empty body. Keepalives are blocking and run one at a time, so this extension extends a worker by submitting an *additional* job that queues behind the current one. Outstanding jobs are cancelled only on shutdown, where ending the worker is the point.
-
-**A cold worker's proxy answers with empty bodies** for the first few minutes, which is byte for byte identical to a dead worker. The backend retries, then waits it out rather than concluding the worker died, so a cold start costs one wake instead of a cascade of them.
-
-## Measured behavior
-
-Serverless timings from live runs against an RTX class worker, SDXL at 1024x1024 and 12 steps.
-
-| Operation | Time |
-|---|---|
-| Wake onto a FlashBoot warm worker, including discovery of 27 models | 15 to 40 s |
-| Fully cold worker, from container start to first image | 3 to 4 min |
-| First generation on an already woken worker | about 64 s |
-| Warm generation, worker reused and model resident | about 9 s |
-| Recovery from an invalidated remote session | about 9 s, refreshed in place with no re-wake |
-| Teardown to zero running workers and zero queued jobs | immediate on backend disable |
-
-Pods, live end to end run: pod created and SwarmUI answering (RTX PRO 4500 Blackwell, warm network volume) in about 3 minutes; the Swarm backend attaches and reaches `running` within seconds of that; a generation through the attached backend, about 60 s including ComfyUI's own model load; termination on disable, immediate with zero pods left on the account.
-
-Per-user tenancy, live end to end run against a real account (RTX 2000 Ada, auto-picked as the cheapest available GPU, same warm network volume): child backend spawned on demand, real pod created and SwarmUI answering in about 3 minutes, a real image generated in 70 s (mostly one-time model load), then cleanly terminated - confirmed via RunPod's own account listing showing zero pods left. Total pod lifetime about 7 minutes, roughly $0.03.
+One backend instance owns exactly one worker; concurrent requests share it (`MaxConcurrent` caps how many SwarmUI hands it at once, queued internally beyond that). To use more than one GPU, add more **Cloud Backends** entries, each with its own provider section - each one wakes and owns its own worker. Generation traffic never enters RunPod's own job queue, so its autoscaler won't add workers for this load.
 
 ## Troubleshooting
-
-Errors are written to point at the actual problem rather than leaving you guessing:
 
 | What you see | What it means |
 |---|---|
 | `RunPod API key was rejected (401)` | The key in User Settings is wrong or revoked. |
-| `RunPod endpoint '...' not found (404)` | The `EndpointId` backend setting does not match a real endpoint. |
-| `Cloud worker '...' is running SwarmUI, but that SwarmUI has no backends configured` | The worker booted, but its own SwarmUI has no backend. Open the worker URL given in the message, go to Server > Backends, and add one. |
-| `Cloud worker '...' refused to load model '...'` | The model is not present on the worker, or its backend cannot load it. |
-| `did not complete within Ns` | The worker did not wake in time. Raise `StartupTimeoutSec`, or check the RunPod console for capacity problems. |
-| A pod attaches and shows `running`, but generation says no backend matches | The pod's own SwarmUI has no backend configured (ComfyUI, typically). Open the pod's SwarmUI directly, add one under Server > Backends, and it will be picked up automatically within a few seconds. |
-| `Could not create a RunPod pod on any candidate GPU` | Every GPU tried came back unavailable or rejected. Check the account balance, or set `GpuTypeId` explicitly and check its availability in the dropdown. |
+| `RunPod endpoint '...' not found (404)` | `EndpointId` doesn't match a real endpoint. |
+| `Cloud worker '...' is running SwarmUI, but that SwarmUI has no backends configured` | Open the worker URL in the message, go to Server ▸ Backends, add one. |
+| `Cloud worker '...' refused to load model '...'` | Model isn't present on the worker, or its backend can't load it. |
+| `did not complete within Ns` | Worker didn't wake in time - raise `StartupTimeoutSec`, or check the console for capacity. |
+| Pod/instance shows `running`, but generation says no backend matches | Its own SwarmUI has no backend configured. Add one directly on it; picked up within seconds. |
+| `Could not create a RunPod pod on any candidate GPU` | Every GPU tried was unavailable/rejected - check balance, or set `GpuTypeId` explicitly. |
 
-For anything else, run SwarmUI with `--loglevel verbose` and look for lines tagged `[RunPod Serverless]` or `[CloudBackends]`.
+For anything else, run with `--loglevel verbose` and look for `[RunPod Serverless]` / `[CloudBackends]`.
+
+<details>
+<summary><b>Two RunPod behaviors worth knowing</b></summary>
+
+**Cancelling a running job terminates the worker executing it.** So "cancel the old keepalive, submit a new one" kills the very worker you're trying to keep alive - a healthy worker died ~13s after such a cancel in testing, every later proxy call returning empty. Keepalives are blocking and run one at a time, so this extension extends a worker with an *additional* queued job instead. Outstanding jobs are only cancelled on shutdown, where ending the worker is the point.
+
+**A cold worker's proxy answers with empty bodies** for the first few minutes - byte-for-byte identical to a dead one. The backend waits it out rather than concluding the worker died, so a cold start costs one wake instead of a cascade.
+
+</details>
+
+<details>
+<summary><b>Measured behavior (live runs)</b></summary>
+
+Serverless, RTX-class worker, SDXL 1024×1024 @ 12 steps:
+
+| Operation | Time |
+|---|---|
+| Wake onto a FlashBoot warm worker (incl. discovering 27 models) | 15–40 s |
+| Fully cold worker, container start to first image | 3–4 min |
+| First generation on an already-woken worker | ~64 s |
+| Warm generation, worker + model resident | ~9 s |
+| Recovery from an invalidated remote session | ~9 s, no re-wake |
+| Teardown to zero workers/queued jobs | immediate on disable |
+
+**Pods**: create → SwarmUI answering (RTX PRO 4500 Blackwell, warm volume) ~3 min; backend attaches and reaches `running` within seconds; generation ~60s incl. ComfyUI's model load; termination on disable is immediate.
+
+**Per-user tenancy**, real account (RTX 2000 Ada, auto-picked cheapest): child spawned on demand, pod up + SwarmUI answering ~3 min, real image in 70s (mostly one-time load), cleanly terminated (confirmed zero pods left via RunPod's own listing). Total lifetime ~7 min, ~$0.03.
+
+</details>
 
 ## Development
 
-Build with `dotnet build src/Extensions/SwarmUI-CloudBackends/SwarmUI-CloudBackends.csproj -c Release` from a SwarmUI checkout, or just launch SwarmUI, which builds extensions at startup.
+```bash
+dotnet build src/Extensions/SwarmUI-CloudBackends/SwarmUI-CloudBackends.csproj -c Release
+```
 
-One gotcha while iterating: SwarmUI caches the built extension DLL against this repository's git HEAD, so in Release mode it skips rebuilds until there is a new commit here. Either use the dev launch script or delete `src/bin/extensions/SwarmExtensionSwarmUI-CloudBackends/` after editing.
+or just launch SwarmUI, which builds extensions at startup.
 
-### Which APIs this targets
+> [!TIP]
+> SwarmUI caches the built extension DLL against this repo's git HEAD, so Release mode skips rebuilds until there's a new commit. Use the dev launch script, or delete `src/bin/extensions/SwarmExtensionSwarmUI-CloudBackends/` after editing.
 
-* **RunPod Pods** uses REST API **v2** (`https://api.runpod.io/v2`). RunPod retires REST v1 on 2026-11-15 and GraphQL in early 2027, so neither is a safe target. v2 is not a rename of v1: status is a single observed value across six states rather than v1's three-state `desiredStatus`, state changes go through one `/action` endpoint, and several field names differ.
-* **RunPod Serverless** uses the job API at `https://api.runpod.ai/v2/{endpointId}/` (`run`, `status`, `cancel`, `health`), which is a separate surface and unaffected by the v1 retirement. Note the host: the serverless job API is on **runpod.ai** while the REST control plane is on **runpod.io**, and the two are easy to mix up because both use a `/v2/` prefix. Calling the control-plane host with an endpoint ID returns a confusing 404.
-* **Vast.ai Serverless** uses `POST https://run.vast.ai/route/` for routing plus the console REST API at `https://console.vast.ai` for endpoint lookup. The grant returned by `/route/` is forwarded to the worker verbatim as `auth_data`, because its signature covers those exact fields.
-* **Vast.ai Instances** uses the same console REST API (`https://console.vast.ai`, auto-prefixed `/api/v0` unless the path is already versioned) - verified against the official `vastai` Python SDK/CLI source rather than the prose docs, which don't state the exact start/stop paths. Create is `PUT /api/v0/asks/{offerId}/`; start/stop are both `PUT /api/v0/instances/{id}/` with `{"state": "running"}` / `{"state": "stopped"}` in the body, not separate endpoints or RunPod's single `/action`+action-name shape. Port exposure is a Docker `-p` flag encoded as an `env` dict key, not a structured field, and the assigned external port is only known after creation (`GET /api/v0/instances/{id}/`'s `ports` field, Docker-inspect shaped).
+<details>
+<summary><b>Which APIs this targets</b></summary>
 
-Known follow ups:
+- **RunPod Pods** uses REST API **v2** (`api.runpod.io`). v1 retires 2026-11-15, GraphQL in early 2027 - neither is safe to target, and v2 isn't a rename: status is one observed value across six states rather than v1's three-state `desiredStatus`, state changes go through one `/action` endpoint, and field names differ.
+- **RunPod Serverless** uses the job API at `api.runpod.ai/v2/{endpointId}/` (`run`, `status`, `cancel`, `health`) - a separate host from the REST control plane (`.ai` vs `.io`), easy to mix up since both use `/v2/`. Hitting the control-plane host with an endpoint ID just 404s.
+- **Vast.ai Serverless** uses `POST run.vast.ai/route/` for routing plus the console REST API (`console.vast.ai`) for endpoint lookup. The grant `/route/` returns is forwarded to the worker verbatim as `auth_data`, since its signature covers those exact fields.
+- **Vast.ai Instances** uses the same console REST API (auto-prefixed `/api/v0`), verified against the official `vastai` Python SDK/CLI source rather than the prose docs. Create is `PUT /api/v0/asks/{offerId}/`; start/stop are both `PUT /api/v0/instances/{id}/` with `{"state": "running"|"stopped"}` - not separate endpoints or RunPod's `/action` shape. Port exposure is a Docker `-p` flag in an `env` dict; the assigned external port is only known after creation (`GET /api/v0/instances/{id}/`, Docker-inspect shaped).
 
-* **Vast.ai Instances end to end**, which needs a funded account - config/credential plumbing, the live dropdowns, and the UI flow are live-verified against a real (unfunded) account, but actual instance creation, the random-port networking path, and generation through an attached instance are not, since renting needs a balance that searching does not.
-* **Creating a brand-new named Vast.ai network volume** isn't supported - only attaching an existing one is. Vast's volumes are rented from their own marketplace (a separate offer-search step, `POST /api/v0/network_volumes/search/`), out of scope for this pass.
-* The serverless worker handler returns its cached SwarmUI session without revalidating it. The extension compensates by refreshing the remote session in place when it sees `invalid_session_id`.
-* The Vast.ai Serverless path end to end, which needs an account, a workergroup and a deployed worker.
-* All requests through one backend share a single remote session, so an interrupt cancels every in flight generation on that worker. Per request remote sessions would fix it.
-* Vast.ai's `/route/` signature is verified inside Vast's own SDK and the algorithm is not published, so `workers/vastai/vast_handler.py` does not verify it. Treat that handler as trusted-network only until it does.
-* No rate-limit backoff for RunPod (Vast's own client already backs off on 429/502/503/504): a RunPod 429 during a status poll or wait-for-running loop surfaces as an error rather than pausing on `Retry-After` and continuing.
-* No orphaned-instance detection: if SwarmUI is killed uncleanly while a RunPod Pods or Vast.ai Instances section is *disabled* but an instance from it is still running, nothing here notices on the next start (an instance created while the section was enabled is found again by label/name once you re-enable it or press Start, so this only bites the disabled-with-a-stray-instance case).
+</details>
+
+<details id="known-follow-ups">
+<summary><b>Known follow-ups</b></summary>
+
+- **Creating a brand-new named Vast.ai network volume** isn't supported - only attaching an existing one is. Vast's volumes are rented from their own marketplace (`POST /api/v0/network_volumes/search/`), out of scope for this pass.
+- The serverless worker handler returns its cached SwarmUI session without revalidating it; this extension compensates by refreshing in place on `invalid_session_id`.
+- The Vast.ai Serverless path needs a real account, workergroup, and deployed worker to verify end to end.
+- All requests through one backend share a single remote session, so an interrupt cancels every in-flight generation on that worker.
+- Vast.ai's `/route/` signature algorithm isn't published, so `workers/vastai/vast_handler.py` doesn't verify it - treat that handler as trusted-network only.
+- No rate-limit backoff for RunPod (Vast's client already backs off on 429/502/503/504): a RunPod 429 mid-poll surfaces as an error instead of pausing on `Retry-After`.
+- No orphaned-instance detection: if SwarmUI dies uncleanly while a section is *disabled* but its instance is still running, nothing notices on next start. (Re-enabling the section, or an instance created while it was still enabled, is found again by label/name - this only bites the disabled-with-a-stray-instance case.)
+
+</details>
+
+## Notes
+
+- API keys are stored cleartext in `Data/Users.ldb` (and its backups) by core's per-user key store - protect that directory. Masking there is core's to fix, not this extension's.
+- Cloud models must be discovered before you can generate with them: call `/API/CloudRefreshModels` once per server start (deliberately manual, since it wakes a billed worker).
+- The model *list* merges across users' serverless backends (core's hook carries no user context); generation itself stays strictly per-user.
+- Editing the Cloud Backends card restarts it, dropping every user's hidden children - they're recreated fresh on next use.
+- `GenerationTimeoutSec` above 600 is capped by the shared HTTP client's 10-minute ceiling. `KeepaliveSeconds` (default 420) is what you pay for while idle - it's auto-raised to at least `GenerationTimeoutSec` + 2 min so a worker never dies mid-generation.
 
 ## License
 
