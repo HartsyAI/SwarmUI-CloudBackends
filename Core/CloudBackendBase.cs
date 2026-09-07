@@ -245,6 +245,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         // Only clear if this same worker is still current: another request may have already recovered
         // and published a live replacement while our GetNewSession was timing out against the dead one.
         await ClearWorkerStateAsync(worker);
+        // The child points at the worker we just gave up on, so it goes with it. Leaving it would have the
+        // retry route straight back to a dead URL instead of waking a replacement.
+        await DetachChildAsync();
     }
 
     // ── SwarmUI backend lifecycle ─────────────────────────────────────────────
@@ -559,8 +562,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     public IEnumerable<BackendHandler.T2IBackendData> Grandchildren
         => ChildBackend?.AbstractBackend is SwarmSwarmBackend swarm ? swarm.ControlledNonrealBackends.Values : [];
 
-    /// <summary>True once at least one mirrored worker backend is up and able to take generations.</summary>
-    public bool HasRunningGrandchild => Grandchildren.Any(d => d.Backend.Status == BackendStatus.RUNNING);
+    /// <summary>True once at least one mirrored backend of the <em>current</em> worker is up and able to generate.</summary>
+    /// <remarks>The address check is not redundant. A child briefly outlives its worker (a wake can replace the
+    /// worker before the sleep check has dropped the old child), and its mirrored backends keep reporting
+    /// RUNNING until their idle monitor notices. Without this, that stale subtree would make this backend step
+    /// aside, and every request would be routed to a worker that no longer exists with nothing left to
+    /// re-attach a good child.</remarks>
+    public bool HasRunningGrandchild
+        => ChildAddress is not null && ChildAddress == CurrentWorker?.PublicUrl?.TrimEnd('/')
+            && Grandchildren.Any(d => d.Backend.Status == BackendStatus.RUNNING);
 
     /// <inheritdoc/>
     /// <remarks>Tops up an already-woken worker only. It must never wake one: core routes generations to the
@@ -806,7 +816,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// on. Only the cold path reaches this: once a mirrored backend is running, core routes straight to it and
     /// this backend refuses requests.
     /// </summary>
-    async Task<BackendHandler.T2IBackendData> WakeAndGetGeneratorAsync()
+    async Task<BackendHandler.T2IBackendData> WakeAndGetGeneratorAsync(T2IParamInput user_input)
     {
         CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
         await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
@@ -816,16 +826,43 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         int attempts = Math.Max(1, (BaseConfig.StartupTimeoutSec * 1000) / pollMs);
         for (int i = 0; i < attempts; i++)
         {
-            BackendHandler.T2IBackendData ready = Grandchildren.FirstOrDefault(d => d.Backend.Status == BackendStatus.RUNNING && !d.CheckIsInUse);
-            if (ready is not null)
+            List<BackendHandler.T2IBackendData> running = [.. Grandchildren.Where(d => d.Backend.Status == BackendStatus.RUNNING)];
+            // Wait for the whole mirror rather than pouncing on the first backend up: on a worker running more
+            // than one, an early one that cannot serve this request would otherwise fail it while the one that
+            // could was still loading. Give up waiting halfway through, though - a backend stuck loading on the
+            // worker forever must not block a request that another backend there could already have served.
+            bool settled = (ChildBackend?.AbstractBackend as SwarmSwarmBackend)?.AnyLoading is false || i > attempts / 2;
+            if (running.Count is not 0 && settled)
             {
                 AdoptChildModelLists();
-                return ready;
+                // Prefer a free one, but a busy one that can serve is still better than failing: it queues.
+                BackendHandler.T2IBackendData ready = running.FirstOrDefault(d => !d.CheckIsInUse && CanServe(d, user_input))
+                    ?? running.FirstOrDefault(d => CanServe(d, user_input));
+                if (ready is not null)
+                {
+                    return ready;
+                }
+                throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} worker is up, but none of its backends accept this request.");
             }
             await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
             await Task.Delay(pollMs, Program.GlobalProgramCancel);
         }
         throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} worker woke, but none of its backends became usable in time.");
+    }
+
+    /// <summary>
+    /// Whether a mirrored backend would accept this request, asked the same way core would have asked had it
+    /// routed there itself. Handing a request to a backend that has not been asked is not safe: the child pins
+    /// the remote backend by ID, so a wrong pick fails outright rather than being re-routed on the worker.
+    /// </summary>
+    static bool CanServe(BackendHandler.T2IBackendData data, T2IParamInput input)
+    {
+        HashSet<string> features = [.. data.Backend.SupportedFeatures];
+        if (input.RequiredFlags.Any(f => !features.Contains(f) && !T2IEngine.DisregardedFeatureFlags.Contains(f)))
+        {
+            return false;
+        }
+        return data.Backend.IsValidForThisBackend(input);
     }
 
     /// <remarks>
@@ -836,9 +873,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
         if (user_input.SourceSession is not null) { CheckPermission(user_input.SourceSession); }
-        // Claim the mirrored backend for real. Core reserved this backend, not that one, so without a claim a
-        // request arriving mid-generation would see it idle and double-book a remote that allows one job.
-        using T2IBackendAccess access = new(await WakeAndGetGeneratorAsync());
+        // Wrapped so a worker that dies between waking and being ready is recovered rather than cached as live:
+        // without this the dead worker is reused, and every request until its keepalive lapses fails the same way.
+        // Claim the mirrored backend for real, too. Core reserved this backend, not that one, so without a claim
+        // a request arriving mid-generation would see it idle and double-book a remote that allows one job.
+        using T2IBackendAccess access = new(await RunWithSession(() => WakeAndGetGeneratorAsync(user_input)));
         return await access.Backend.Generate(user_input);
     }
 
@@ -846,7 +885,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     public override async Task GenerateLive(T2IParamInput user_input, string batchId, Action<object> takeOutput)
     {
         if (user_input.SourceSession is not null) { CheckPermission(user_input.SourceSession); }
-        using T2IBackendAccess access = new(await WakeAndGetGeneratorAsync());
+        using T2IBackendAccess access = new(await RunWithSession(() => WakeAndGetGeneratorAsync(user_input)));
         await access.Backend.GenerateLive(user_input, batchId, takeOutput);
     }
 
