@@ -414,6 +414,19 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         finally { WorkerLock.Release(); }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>Tops up an already-woken worker only. It must never wake one: core routes generations to the
+    /// child, so this runs on any generation the child accepts, and waking here would spend the owner's money
+    /// on a path they did not explicitly ask to.</remarks>
+    public async Task OnChildGenerationStartingAsync()
+    {
+        CloudWorkerInfo worker = CurrentWorker;
+        if (worker is not null)
+        {
+            await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
+        }
+    }
+
     /// <summary>Accumulates keepalive expiry from the later of 'now' and the existing expiry.</summary>
     void ExtendKeepaliveExpiry(int keepaliveDuration)
     {

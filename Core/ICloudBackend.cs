@@ -25,4 +25,12 @@ public interface ICloudBackend
 
     /// <summary>Network-facing status summary of this backend for the CloudGetStatus route.</summary>
     JObject GetStatusNet();
+
+    /// <summary>
+    /// Called by an attached <see cref="OwnerBoundSwarmBackend"/> just before it generates, since core routes
+    /// generations to the child and this backend never sees them. Serverless uses it to keep the worker alive
+    /// for as long as work actually lasts; instances bill by the hour and do not care. Must never wake or rent
+    /// anything: it runs on a path the user did not explicitly ask to spend money on.
+    /// </summary>
+    Task OnChildGenerationStartingAsync();
 }
