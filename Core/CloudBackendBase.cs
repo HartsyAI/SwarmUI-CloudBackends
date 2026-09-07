@@ -488,6 +488,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// <summary>Detach body. Caller must hold <see cref="ChildLock"/>.</summary>
     async Task DetachChildInnerAsync()
     {
+        // Last chance to keep what the worker knew: once the child is gone so is its mirror of the worker's
+        // models, and this backend has to be able to answer for them while asleep.
+        AdoptChildModelLists();
         BackendHandler.BackendData child = ChildBackend;
         ChildBackend = null;
         ChildAddress = null;
@@ -521,6 +524,35 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             return;
         }
         Utilities.RunCheckedTask(() => DetachChildAsync(), $"{Provider?.ProviderName} detach idle child backend");
+    }
+
+    /// <summary>
+    /// Copies the attached child's mirrored model lists onto this backend. The child gets them from the
+    /// worker's own Swarm, which is the real list rather than anything guessed here, and keeping a copy after
+    /// the worker sleeps is what lets a sleeping endpoint still offer its models: the UI reads them through
+    /// <c>ExtraModelProviders</c>, and core's filter needs them to know a request is worth waking for.
+    /// Copied rather than aliased so a detached child cannot mutate what is now this backend's cache.
+    /// </summary>
+    void AdoptChildModelLists()
+    {
+        if (ChildBackend?.AbstractBackend is not SwarmSwarmBackend swarm || swarm.RemoteModels is null)
+        {
+            return;
+        }
+        // Only overwrite with a real listing; an empty one means the child has not finished mirroring yet, and
+        // committing that would drop a good cache and make every model look unavailable while asleep.
+        if (!swarm.RemoteModels.Any(kv => kv.Value.Count > 0))
+        {
+            return;
+        }
+        RemoteModels ??= new();
+        Models ??= new();
+        foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in swarm.RemoteModels)
+        {
+            RemoteModels[kv.Key] = kv.Value;
+            Models[kv.Key] = [.. kv.Value.Keys];
+        }
+        Program.ModelRefreshEvent?.Invoke();
     }
 
     /// <summary>The generating backends the attached child mirrors from the worker. Empty while asleep.</summary>
@@ -787,6 +819,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             BackendHandler.T2IBackendData ready = Grandchildren.FirstOrDefault(d => d.Backend.Status == BackendStatus.RUNNING && !d.CheckIsInUse);
             if (ready is not null)
             {
+                AdoptChildModelLists();
                 return ready;
             }
             await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);

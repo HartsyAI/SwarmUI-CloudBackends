@@ -121,19 +121,25 @@ Two shapes of provider, because "wake a serverless worker per request" and "rent
 <details>
 <summary><b>Architecture</b></summary>
 
-**Serverless** (RunPod Serverless, Vast.ai) wakes a worker on the first generate and talks directly to its SwarmUI over HTTP:
+**Serverless** (RunPod Serverless, Vast.ai) wakes a worker on the first generate, then hands its URL to a swarm child exactly like an instance does:
 
 ```
   ICloudProvider                 CloudBackendBase : AbstractT2IBackend
-    WakeupWorkerAsync    ---->     Wakes a GPU on the first generate, then talks
-    StartKeepaliveAsync            directly to the remote SwarmUI's own HTTP API
-    StopKeepaliveAsync             (GetNewSession, ListModels, SelectModel,
-    ValidateAsync                  GenerateText2Image, GenerateText2ImageWS).
+    WakeupWorkerAsync    ---->     Wakes a GPU on the first generate, attaches an
+    StartKeepaliveAsync            OwnerBoundSwarmBackend to it, and hands that first
+    StopKeepaliveAsync             request to the worker's own mirrored backends.
+    ValidateAsync                  Afterwards it steps aside and core routes to them.
 
   CloudWorkerInfo { PublicUrl, SessionId, WorkerId, Version }
 ```
 
-This deliberately skips SwarmUI's built-in `SwarmSwarmBackend`, which assumes the remote is reachable at startup and whose idle pings would keep a pay-per-second worker billing the whole time it's attached.
+The child is attached only while a worker is awake, which is what makes using core's `SwarmSwarmBackend` safe here: its idle polling would otherwise be a standing reason to keep a pay-per-second worker billing, but with nothing attached while asleep it only ever polls a worker that is already awake and already being paid for.
+
+So this backend is not in the generation path at all once a worker is up. What it keeps is the part only it can do: deciding when to spend money. It accepts a request only when no worker is awake, and takes one at a time, so a second request during a cold start waits for the mirrored backends rather than starting a duplicate wake.
+
+Keepalive follows real use rather than a fixed window: the child tells this backend before each generation, which tops the worker up, so a long generation cannot outrun its own keepalive. The child is dropped once the keepalive lapses and the subtree goes quiet. Between the worker's keepalive expiring and the next check (up to 5 seconds) the child is briefly still attached, so a request in that window either revives a worker that is still up, or fails once and cold-wakes cleanly on the retry.
+
+While asleep this backend answers for the models the worker had, copied from the child before it was dropped, so a sleeping endpoint still offers its models and only wakes for a request it can actually serve.
 
 **Instance rental** (RunPod GPU Pods, Vast.ai Instances) stays up until you stop it, so there's no reason to reimplement the remote protocol - this backend just drives the provider's API to get SwarmUI running, then hands the URL to a swarm backend child and steps out of the way:
 
@@ -148,7 +154,7 @@ This deliberately skips SwarmUI's built-in `SwarmSwarmBackend`, which assumes th
   CloudInstanceInfo { PublicUrl, InstanceId, Description }
 ```
 
-Sessions, model sync, parameter forwarding and generation are core Swarm code either way - called directly (serverless) or delegated to (pods). Nothing here reimplements the remote-Swarm protocol.
+Sessions, model sync, parameter forwarding and generation are core Swarm code in both shapes now, delegated to the attached child rather than reimplemented here. What differs is only the lifecycle: an instance keeps its child for as long as it is rented, a serverless worker only while it is awake.
 
 `CloudBackendsBackend` is the one publicly registered type; each provider's own `BackendType` is built without the public registry, so it's usable as a hidden child without being independently addable (`CloudBackendTypes`). Serverless remote models merge into the model browser via `ExtraModelProviders`; a pod's models reach it through core's own `remote_swarm` provider instead, since the attached `SwarmSwarmBackend` is a real backend as far as core is concerned. Every action is reachable over the plain API (`CloudGetStatus`, `CloudRefreshModels`, `Cloud{Start,Stop,GetStatus}Pod`, `VastAI{Start,Stop,GetInstance}Status`, `CloudListProviders`), with `...WS` websocket variants for streaming progress while a cold instance boots.
 
@@ -164,11 +170,13 @@ Every cloud backend belongs to exactly one user and runs on that user's own key:
 - A created pod/instance is remembered per user and reattached after a restart instead of billing a second one; find-by-name/label is the fallback.
 
 > [!IMPORTANT]
-> An implicitly-created backend never spends money by itself. Serverless children never auto-refresh models (that wakes a billed worker - use the refresh route), and instance children never auto-start (use Start).
+> An implicitly-created backend never spends money by itself. A sleeping serverless backend has nothing attached to it, so nothing polls and nothing can wake a billed worker behind your back; it answers for its models from the last time one was awake, and refreshing them for real is an explicit action (the refresh route). Instance backends never auto-start (use Start).
 
 ## Concurrency and scaling
 
-One backend instance owns exactly one worker; concurrent requests share it (`MaxConcurrent` caps how many SwarmUI hands it at once, queued internally beyond that). To use more than one GPU, add more **Cloud Backends** entries, each with its own provider section - each one wakes and owns its own worker. Generation traffic never enters RunPod's own job queue, so its autoscaler won't add workers for this load.
+One backend instance owns exactly one worker. Concurrency is whatever the worker's own backends report, since those are what core routes to; the `MaxConcurrent` setting no longer does anything and is kept only so existing configs still load. To use more than one GPU, add more **Cloud Backends** entries, each with its own provider section - each one wakes and owns its own worker. Generation traffic never enters RunPod's own job queue, so its autoscaler won't add workers for this load.
+
+Local backends are still preferred while they are free: a cloud backend is only picked once every local one is busy, which wakes a worker. That is the "generate locally, overflow to a cloud GPU" arrangement, and it is unchanged by any of the above.
 
 ## Troubleshooting
 
