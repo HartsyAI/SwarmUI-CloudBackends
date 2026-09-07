@@ -11,14 +11,14 @@ One shared core handles the SwarmUI side; each cloud provider is a thin adapter.
 | RunPod Serverless | ✅ Verified end to end against real hardware, including generation. |
 | RunPod Pods | ✅ Verified end to end live: create, attach, generate, Start/Stop, terminate. |
 | Vast.ai Instances | ✅ Verified end to end live, including a full from-scratch volume + install. |
-| Vast.ai Serverless | ⚠️ Config/credentials verified live, worker deployed on real hardware. A live worker reaching `Ready` is fixed but not yet re-confirmed end to end - see [Setup](#vastai-serverless). |
+| Vast.ai Serverless | ✅ Verified live: worker recruited, `Ready 1/1`, routed and woken through Vast. Needs a worker image with a model baked in - see [Setup](#vastai-serverless). |
 
 <details>
 <summary><b>Deeper detail per provider</b></summary>
 
 - **RunPod Pods**: create a pod, attach it as a real Swarm backend, generate, Start/Stop, terminate - all done live.
 - **Vast.ai Instances**: verified against the official `vastai` Python SDK/CLI source, since the prose docs are vague (and sometimes wrong) on exact endpoints. Config/credentials, live offer search, Start/Stop/confirm/error UI, instance creation, networking, and a real generation are all live-verified. Creating a brand-new *named* network volume isn't supported yet (attaching an existing one is) - see [Known follow-ups](#known-follow-ups).
-- **Vast.ai Serverless**: the worker ([`workers/vastai/vast_worker.py`](workers/vastai/vast_worker.py)) is a real `vastai`-SDK PyWorker, so it registers with the autoscaler and is genuinely routable, rather than a lookalike HTTP server that `/route/` would never return. Live deployment surfaced two real bugs, both fixed: Vast's default 8 GB container disk is smaller than the unpacked image (every worker died mid-pull), and the worker configured none of the three things the SDK needs to report ready (`model_log_file`, a `LogAction.ModelLoaded` pattern, or a lifecycle), so it could never leave `loading` and the autoscaler recycled it forever. Routing and a real generation still need one clean confirming run.
+- **Vast.ai Serverless**: the worker ([`workers/vastai/vast_worker.py`](workers/vastai/vast_worker.py)) is a real `vastai`-SDK PyWorker, so it registers with the autoscaler and is genuinely routable, rather than a lookalike HTTP server that `/route/` would never return. Verified live end to end: a worker was recruited, reached `Ready 1/1`, and was routed and woken through Vast's own `/route/`. Unlike RunPod, Vast cannot attach a network drive to a serverless worker, so the model has to be in the worker image - see [Setup](#vastai-serverless).
 
 </details>
 
@@ -116,13 +116,18 @@ Once your key is set, offer and network volume fields become live dropdowns the 
 
 ### Vast.ai Serverless
 
+> [!IMPORTANT]
+> **You need your own worker image, with a model baked into it.** Vast, unlike RunPod, cannot attach a network drive to a serverless worker, so nothing persists between workers and there is nowhere to keep models. Your image has to contain SwarmUI, a backend, and the model you intend to generate with. Everything below assumes such an image; `kalebbroo/swarmui-runpod:latest` gets a worker running and routable but ships no model, so it will come up with nothing to generate.
+>
+> If you want cloud GPUs with your existing models on a drive, use **RunPod Serverless** (network volume, still scales to zero) or **Vast.ai Instances** (attaches a Vast volume) instead.
+
 Vast's serverless is three nested objects: an **endpoint** (the autoscaling policy) contains **workergroups** (a template plus GPU-pool filters), which recruit real **instances**. You configure all three on Vast, then point this extension at the endpoint.
 
-1. **Create a template** ([Templates ▸ New](https://cloud.vast.ai/templates/)) with image `kalebbroo/swarmui-runpod:latest`, launch mode **Docker ENTRYPOINT**, and:
+1. **Create a template** ([Templates ▸ New](https://cloud.vast.ai/templates/)) with your image, launch mode **Docker ENTRYPOINT**, and:
 
    - Docker options: `-p 7801:7801 -p 8000:8000 -e VOLUME_PATH=/workspace -e SWARM_MODE=vast_serverless -e WORKER_PORT=8000`
    - Ports `7801` (SwarmUI) and `8000` (the PyWorker Vast talks to) both exposed
-   - **Container disk size: 40 GB.** The default 8 GB is smaller than the image and every worker will die mid-pull. See below.
+   - **Container disk** comfortably larger than your unpacked image - see the warning below
 
 2. **Create an endpoint** ([Serverless](https://cloud.vast.ai/serverless/)): Min Workers `0`, Max Workers `1` to start, Min Load `1`, Target Utilization `0.9`, Cold Multiplier `3.0`.
 
@@ -131,10 +136,12 @@ Vast's serverless is three nested objects: an **endpoint** (the autoscaling poli
 4. Set your Vast key in **User Settings ▸ API Keys**, then in the **Vast.ai Serverless** section: toggle on, set your endpoint name, Save.
 
 > [!IMPORTANT]
-> **Container disk must be ≥ 40 GB.** The image is ~6 GB compressed but ~16 GB unpacked, and Vast's default container disk is 8 GB. Instances then die partway through the pull and the autoscaler silently rotates to another host forever, with no error that names disk as the cause. The symptom is an endpoint that churns through hosts and never reaches `Ready Workers: 1/1`.
+> **Set container disk well above your image's unpacked size.** Vast's default is 8 GB, which is smaller than most usable worker images, and an undersized disk fails in a way that names no cause: instances die partway through the pull and the autoscaler quietly rotates to another host forever, never reaching `Ready Workers: 1/1`.
 
-> [!NOTE]
-> **Serverless workergroups cannot attach a volume.** Vast only has *local* volumes, tied to one physical machine, and no volume option exists anywhere in the endpoint/workergroup flow. That is why the worker image bakes a pre-built SwarmUI in rather than cloning and building at container start: a cold worker has to be up fast, with nothing persistent to cache into.
+Two things your image must do, since a serverless worker gets a bare container every time:
+
+- **Ship a configured backend**, not just SwarmUI. A SwarmUI with no backend starts normally and then cannot generate anything.
+- **Not require `VOLUME_PATH` to already exist.** There is no volume, so that path is just a directory on container disk that nothing creates for it.
 
 <details>
 <summary><b>Editing a template does not update it in place</b></summary>
