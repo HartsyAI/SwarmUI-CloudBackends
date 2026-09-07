@@ -204,6 +204,14 @@ Every cloud backend belongs to exactly one user and runs on that user's own key:
 > [!IMPORTANT]
 > An implicitly-created backend never spends money by itself. Serverless children never auto-refresh models (that wakes a billed worker - use the refresh route), and instance children never auto-start (use Start).
 
+> [!WARNING]
+> **`EndpointId` is shared by every user, while the API key is per-user** - each user's child is built from the same backend settings and only differs by whose key it runs on. Pods and instances are unaffected (they are *created*, and their name/label is already made unique per user), but the two serverless providers look up something that has to exist in the caller's own account:
+>
+> - **RunPod Serverless is owner-only.** Its endpoint ID is account-scoped and goes straight into the request URL, so any user other than the one whose account owns that endpoint gets `RunPod endpoint '...' not found (404)`. There is no per-user endpoint setting to point them elsewhere.
+> - **Vast.ai Serverless works for multiple users** only because it resolves by endpoint *name* within each caller's own account - so every user needs their own endpoint, named exactly the same.
+>
+> For a multi-user server, prefer pods/instances, or give each user their own Cloud Backends entry with their own endpoint.
+
 ## Concurrency and scaling
 
 One backend instance owns exactly one worker; concurrent requests share it (`MaxConcurrent` caps how many SwarmUI hands it at once, queued internally beyond that). To use more than one GPU, add more **Cloud Backends** entries, each with its own provider section - each one wakes and owns its own worker. Generation traffic never enters RunPod's own job queue, so its autoscaler won't add workers for this load.
