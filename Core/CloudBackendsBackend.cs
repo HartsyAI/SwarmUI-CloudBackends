@@ -28,7 +28,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public bool RunPodServerless_Enabled = false;
         [ConfigComment("Cloud endpoint identifier (RunPod serverless endpoint ID).")]
         public string RunPodServerless_EndpointId = "";
-        [ConfigComment("Max parallel generation requests.")]
+        [ConfigComment("Unused. Parallelism is set by the worker's own backends, which report their real limits once a worker is awake.\nKept so existing configs still load.")]
         public int RunPodServerless_MaxConcurrent = 10;
         [ConfigComment("Poll interval while waiting for worker startup (ms).")]
         public int RunPodServerless_PollIntervalMs = 2000;
@@ -98,7 +98,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [SuggestionPlaceholder(Text = "handler")]
         [ConfigComment("Route on the worker that serves the SwarmUI wakeup handler.")]
         public string VastAI_WorkerRoute = "handler";
-        [ConfigComment("Max parallel generation requests.")]
+        [ConfigComment("Unused. Parallelism is set by the worker's own backends, which report their real limits once a worker is awake.\nKept so existing configs still load.")]
         public int VastAI_MaxConcurrent = 10;
         [ConfigComment("Poll interval while waiting for worker startup (ms).")]
         public int VastAI_PollIntervalMs = 2000;

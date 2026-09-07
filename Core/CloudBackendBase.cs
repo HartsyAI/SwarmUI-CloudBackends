@@ -8,8 +8,6 @@ using SwarmUI.Core;
 using SwarmUI.Media;
 using SwarmUI.Text2Image;
 using SwarmUI.Utils;
-using SwarmUI.WebAPI;
-using System.Net.WebSockets;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
@@ -21,7 +19,9 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 ///   <see cref="GetApiKey"/>     - retrieve the provider-specific API key from the user session
 ///   <see cref="CheckPermission"/> - throw if the user lacks permission
 ///
-/// Everything else - worker caching, model refresh, Generate, GenerateLive, LoadModel - lives here.
+/// Everything else - worker waking and keepalive, model refresh, the attached child - lives here. Generation
+/// does not: core routes that to the worker's own backends, mirrored as children of the attached child, and
+/// this backend only steps in to wake a worker when there are none.
 /// </summary>
 public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 {
@@ -41,12 +41,25 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     public bool IsUsingApiKey(string apiKey) => apiKey == ProviderApiKey;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// This backend only accepts a request when there is no woken worker to take it, and its whole job then is
+    /// to wake one. Once the worker's own backends are mirrored as children, they are better candidates than
+    /// this one in every way - they advertise the models and features the worker really has, rather than a
+    /// cached guess - so this steps aside and lets core route to them directly.
+    /// </remarks>
     public override bool IsValidForThisBackend(T2IParamInput input)
     {
         string requester = input.SourceSession?.User?.UserID;
         if (requester is not null && requester != OwnerUserId)
         {
             input.RefusalReasons.Add($"{CloudProviderName ?? "Cloud"} backend #{BackendData?.ID} belongs to another user. Your own is created automatically once your API key is set in User Settings.");
+            return false;
+        }
+        if (HasRunningGrandchild)
+        {
+            // Deliberately silent: this is a routing decision, not a refusal. Reasons are only shown when
+            // every candidate declined, and adding one here would sit next to the mirrored backends' real
+            // reason ("does not have that model") saying the worker is awake, which reads as a contradiction.
             return false;
         }
         return true;
@@ -113,7 +126,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         [ConfigComment("Cloud endpoint identifier (endpoint ID, name, pod ID - provider-specific).")]
         public string EndpointId = "";
 
-        [ConfigComment("Max parallel generation requests.")]
+        [ConfigComment("Unused. Parallelism is set by the worker's own backends, which report their real limits once a worker is awake.\nKept so existing configs still load.")]
         public int MaxConcurrent = 10;
 
         [ConfigComment("Poll interval while waiting for worker startup (ms).")]
@@ -275,9 +288,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             Status = BackendStatus.ERRORED;
             return;
         }
-        MaxUsages = Math.Max(1, BaseConfig.MaxConcurrent);
+        // One at a time, deliberately. This backend now only serves the request that wakes a worker; the
+        // moment that request has one, the worker's own backends are mirrored as children and core routes to
+        // them instead. A second request arriving during a wake therefore waits rather than being handed a
+        // duplicate cold start, and picks up the mirrored backends once they exist.
+        MaxUsages = 1;
         Status = BackendStatus.RUNNING;
         CanLoadModels = true;
+        // Defensive: a re-enable can Init without a matching Shutdown, and a double subscription would run the
+        // sleep check twice per tick.
+        Program.TickEvent -= SleepTick;
         Program.TickEvent += SleepTick;
         // Models are deliberately NOT refreshed here: listing them wakes a billed worker, and a backend
         // that comes into being because its owner generated something must never spend money on its own.
@@ -749,117 +769,55 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 
     // ── Generation ────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Wakes a worker, attaches the child, and returns one of the worker's own mirrored backends to generate
+    /// on. Only the cold path reaches this: once a mirrored backend is running, core routes straight to it and
+    /// this backend refuses requests.
+    /// </summary>
+    async Task<BackendHandler.T2IBackendData> WakeAndGetGeneratorAsync()
+    {
+        CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
+        await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
+        await EnsureChildAttachedAsync(worker);
+        // The child mirrors the worker in the background, so its own children appear a moment after attach.
+        int pollMs = Math.Clamp(BaseConfig.PollIntervalMs, 250, 2000);
+        int attempts = Math.Max(1, (BaseConfig.StartupTimeoutSec * 1000) / pollMs);
+        for (int i = 0; i < attempts; i++)
+        {
+            BackendHandler.T2IBackendData ready = Grandchildren.FirstOrDefault(d => d.Backend.Status == BackendStatus.RUNNING && !d.CheckIsInUse);
+            if (ready is not null)
+            {
+                return ready;
+            }
+            await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
+            await Task.Delay(pollMs, Program.GlobalProgramCancel);
+        }
+        throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} worker woke, but none of its backends became usable in time.");
+    }
+
+    /// <remarks>
+    /// Generation itself belongs to the worker's own mirrored backends, which speak Swarm's remote protocol
+    /// properly - sessions, previews, interrupts and all. This path exists only because a sleeping endpoint has
+    /// no mirrored backend for core to pick yet, so the request that wakes the worker is handed on by hand.
+    /// </remarks>
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
         if (user_input.SourceSession is not null) { CheckPermission(user_input.SourceSession); }
-        return await RunWithSession(async () =>
-        {
-            // Worker acquisition must live INSIDE the retried lambda: on session recovery the
-            // worker (URL + session) may have been replaced, and a stale capture would retry forever.
-            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
-            await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
-            JObject resp = await CallWorkerAPI(worker, "GenerateText2Image", BuildRequest(user_input, worker.SessionId), BaseConfig.GenerationTimeoutSec);
-            Image[] images = ExtractImages(resp);
-            if (images.Length is 0) { throw new SwarmReadableErrorException("No images returned from remote worker."); }
-            return images;
-        });
+        // Claim the mirrored backend for real. Core reserved this backend, not that one, so without a claim a
+        // request arriving mid-generation would see it idle and double-book a remote that allows one job.
+        using T2IBackendAccess access = new(await WakeAndGetGeneratorAsync());
+        return await access.Backend.Generate(user_input);
     }
 
+    /// <inheritdoc cref="Generate"/>
     public override async Task GenerateLive(T2IParamInput user_input, string batchId, Action<object> takeOutput)
     {
         if (user_input.SourceSession is not null) { CheckPermission(user_input.SourceSession); }
-        await RunWithSession(async () =>
-        {
-            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
-            await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
-            using ClientWebSocket ws = await NetworkBackendUtils.ConnectWebsocket(worker.PublicUrl.TrimEnd('/'), "API/GenerateText2ImageWS", _ => { });
-            await ws.SendJson(BuildRequest(user_input, worker.SessionId), API.WebsocketTimeout);
-            bool interruptSent = false;
-            while (true)
-            {
-                if (user_input.InterruptToken.IsCancellationRequested && !interruptSent)
-                {
-                    // Send once: this loop runs per received message, and each InterruptAll carries a
-                    // 30s timeout, so re-sending would stall the drain until the socket finally closes.
-                    interruptSent = true;
-                    try { await CallWorkerAPI(worker, "InterruptAll", new JObject { ["other_sessions"] = false }, 30); }
-                    catch { /* best-effort */ }
-                }
-                JObject response = await ws.ReceiveJson(Utilities.ExtraLargeMaxReceive, true);
-                if (response is not null)
-                {
-                    AutoThrowException(response);
-                    HandleLiveResponse(response, batchId, user_input, takeOutput);
-                }
-                if (ws.CloseStatus.HasValue) { break; }
-            }
-            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, Program.GlobalProgramCancel);
-        });
+        using T2IBackendAccess access = new(await WakeAndGetGeneratorAsync());
+        await access.Backend.GenerateLive(user_input, batchId, takeOutput);
     }
 
     // ── Shared helpers ────────────────────────────────────────────────────────
-
-    /// <summary>Builds the remote GenerateText2Image request body from local generation input.</summary>
-    public JObject BuildRequest(T2IParamInput input, string sessionId)
-    {
-        input.ProcessPromptEmbeds(x => $"<embedding:{x}>");
-        JObject req = input.ToJSON();
-        req["session_id"] = sessionId;
-        req[T2IParamTypes.Images.Type.ID] = 1;
-        req[T2IParamTypes.DoNotSave.Type.ID] = true;
-        req.Remove(T2IParamTypes.ExactBackendID.Type.ID);
-        req.Remove(T2IParamTypes.BackendType.Type.ID);
-        if (input.ReceiveRawBackendData is not null) { req[T2IParamTypes.ForwardRawBackendData.Type.ID] = true; }
-        req[T2IParamTypes.ForwardSwarmData.Type.ID] = true;
-        return req;
-    }
-
-    /// <summary>Decodes the images array of a remote generation response.</summary>
-    public static Image[] ExtractImages(JObject response)
-    {
-        List<Image> images = [];
-        foreach (JToken t in response["images"] as JArray ?? [])
-        {
-            try { images.Add(ImageFile.FromDataString(t.ToString()) as Image); }
-            catch (Exception ex) { Logs.Warning($"Failed to decode image: {ex.Message}"); }
-        }
-        return [.. images];
-    }
-
-    /// <summary>Translates one remote websocket message (progress, image, raw data) into local generation output.</summary>
-    public static void HandleLiveResponse(JObject response, string batchId, T2IParamInput input, Action<object> takeOutput)
-    {
-        if (response.TryGetValue("gen_progress", out JToken val) && val is JObject objVal)
-        {
-            string actualId = batchId;
-            if (objVal.TryGetValue("batch_index", out JToken batchInd) && int.TryParse($"{batchInd}", out int remoteIdx)
-                && remoteIdx > 0 && int.TryParse(batchId, out int localIdx))
-            {
-                actualId = $"{localIdx + remoteIdx}";
-            }
-            objVal["batch_index"] = actualId;
-            objVal["request_id"] = $"{input.UserRequestId}";
-            takeOutput(objVal);
-        }
-        else if (response.TryGetValue("image", out val)) { takeOutput(ImageFile.FromDataString(val.ToString())); }
-        else if (response.TryGetValue("raw_backend_data", out JToken rawData))
-        {
-            string type = rawData["type"]?.ToString();
-            string datab64 = rawData["data"]?.ToString();
-            if (type is not null && datab64 is not null)
-            {
-                input.ReceiveRawBackendData?.Invoke(type, Convert.FromBase64String(datab64));
-            }
-        }
-        else if (response.TryGetValue("raw_swarm_data", out JToken rawSwarmTok) && rawSwarmTok is JObject rawSwarm)
-        {
-            if (rawSwarm.TryGetValue("params_used", out JToken paramsUsed))
-            {
-                foreach (JToken p in paramsUsed) { input.ParamsQueried.Add($"{p}"); }
-            }
-            if (input.Get(T2IParamTypes.ForwardSwarmData, false)) { takeOutput(response); }
-        }
-    }
 
     static string GetModelFromInput(T2IParamInput input)
     {
