@@ -8,8 +8,6 @@ using SwarmUI.Core;
 using SwarmUI.Media;
 using SwarmUI.Text2Image;
 using SwarmUI.Utils;
-using SwarmUI.WebAPI;
-using System.Net.WebSockets;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
@@ -21,7 +19,9 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 ///   <see cref="GetApiKey"/>     - retrieve the provider-specific API key from the user session
 ///   <see cref="CheckPermission"/> - throw if the user lacks permission
 ///
-/// Everything else - worker caching, model refresh, Generate, GenerateLive, LoadModel - lives here.
+/// Everything else - worker waking and keepalive, model refresh, the attached child - lives here. Generation
+/// does not: core routes that to the worker's own backends, mirrored as children of the attached child, and
+/// this backend only steps in to wake a worker when there are none.
 /// </summary>
 public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 {
@@ -41,12 +41,25 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     public bool IsUsingApiKey(string apiKey) => apiKey == ProviderApiKey;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// This backend only accepts a request when there is no woken worker to take it, and its whole job then is
+    /// to wake one. Once the worker's own backends are mirrored as children, they are better candidates than
+    /// this one in every way - they advertise the models and features the worker really has, rather than a
+    /// cached guess - so this steps aside and lets core route to them directly.
+    /// </remarks>
     public override bool IsValidForThisBackend(T2IParamInput input)
     {
         string requester = input.SourceSession?.User?.UserID;
         if (requester is not null && requester != OwnerUserId)
         {
             input.RefusalReasons.Add($"{CloudProviderName ?? "Cloud"} backend #{BackendData?.ID} belongs to another user. Your own is created automatically once your API key is set in User Settings.");
+            return false;
+        }
+        if (HasRunningGrandchild)
+        {
+            // Deliberately silent: this is a routing decision, not a refusal. Reasons are only shown when
+            // every candidate declined, and adding one here would sit next to the mirrored backends' real
+            // reason ("does not have that model") saying the worker is awake, which reads as a contradiction.
             return false;
         }
         return true;
@@ -93,6 +106,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// <summary>Guards all worker wake/extend/clear state transitions.</summary>
     public SemaphoreSlim WorkerLock = new(1, 1);
 
+    /// <summary>The owner-bound swarm child attached to the live worker, or null while no worker is awake.</summary>
+    public BackendHandler.BackendData ChildBackend = null;
+
+    /// <summary>URL <see cref="ChildBackend"/> was attached to, so a worker moving is noticed.</summary>
+    string ChildAddress = null;
+
+    /// <summary>Guards attach/detach so two requests cannot race the child lifecycle.</summary>
+    public SemaphoreSlim ChildLock = new(1, 1);
+
     /// <summary>Cancels outstanding keepalive jobs, swapped under <see cref="WorkerLock"/>.</summary>
     public CancellationTokenSource KeepaliveCts = null;
 
@@ -104,7 +126,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         [ConfigComment("Cloud endpoint identifier (endpoint ID, name, pod ID - provider-specific).")]
         public string EndpointId = "";
 
-        [ConfigComment("Max parallel generation requests.")]
+        [ConfigComment("Unused. Parallelism is set by the worker's own backends, which report their real limits once a worker is awake.\nKept so existing configs still load.")]
         public int MaxConcurrent = 10;
 
         [ConfigComment("Poll interval while waiting for worker startup (ms).")]
@@ -223,6 +245,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         // Only clear if this same worker is still current: another request may have already recovered
         // and published a live replacement while our GetNewSession was timing out against the dead one.
         await ClearWorkerStateAsync(worker);
+        // The child points at the worker we just gave up on, so it goes with it. Leaving it would have the
+        // retry route straight back to a dead URL instead of waking a replacement.
+        await DetachChildAsync();
     }
 
     // ── SwarmUI backend lifecycle ─────────────────────────────────────────────
@@ -266,9 +291,17 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             Status = BackendStatus.ERRORED;
             return;
         }
-        MaxUsages = Math.Max(1, BaseConfig.MaxConcurrent);
+        // One at a time, deliberately. This backend now only serves the request that wakes a worker; the
+        // moment that request has one, the worker's own backends are mirrored as children and core routes to
+        // them instead. A second request arriving during a wake therefore waits rather than being handed a
+        // duplicate cold start, and picks up the mirrored backends once they exist.
+        MaxUsages = 1;
         Status = BackendStatus.RUNNING;
         CanLoadModels = true;
+        // Defensive: a re-enable can Init without a matching Shutdown, and a double subscription would run the
+        // sleep check twice per tick.
+        Program.TickEvent -= SleepTick;
+        Program.TickEvent += SleepTick;
         // Models are deliberately NOT refreshed here: listing them wakes a billed worker, and a backend
         // that comes into being because its owner generated something must never spend money on its own.
         // The CloudRefreshModels route is the explicit, user-initiated way to do it.
@@ -277,8 +310,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 
     public override async Task Shutdown()
     {
+        Program.TickEvent -= SleepTick;
         string name = Provider?.ProviderName ?? GetType().Name;
         Logs.Info($"[{name}] Backend {BackendData?.ID} shutting down...");
+        await DetachChildAsync();
         // Swap under the same lock GetOrWakeWorkerAsync uses: shutdown can land while other requests are
         // still in flight (ShutdownBackendCleanly only drains down to MaxUsages), and disposing the CTS
         // out from under them would throw ObjectDisposedException on .Token.
@@ -412,6 +447,142 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             return CurrentWorker;
         }
         finally { WorkerLock.Release(); }
+    }
+
+    // ── Child backend lifecycle ───────────────────────────────────────────────
+    // A serverless worker only exists in bursts, so unlike an instance the child is attached per wake and
+    // removed once the worker is gone. Nothing is attached while asleep, which is what guarantees no polling
+    // can wake a billed worker behind the owner's back: SwarmSwarmBackend's idle monitor only ever re-polls a
+    // worker that is already awake and already being paid for.
+
+    /// <summary>Attaches a child to the given worker, replacing one pointed at a stale URL.</summary>
+    public async Task EnsureChildAttachedAsync(CloudWorkerInfo worker)
+    {
+        string address = worker.PublicUrl.TrimEnd('/');
+        await ChildLock.WaitAsync(Program.GlobalProgramCancel);
+        try
+        {
+            if (ChildBackend is not null && ChildAddress == address)
+            {
+                return;
+            }
+            // A wake can land on a different worker than last time, and the URL carries the host and port, so
+            // a surviving child would be pointed at something that no longer exists. Replace rather than
+            // re-address: SwarmSwarmBackend builds its whole mirrored subtree against the address it loaded with.
+            if (ChildBackend is not null)
+            {
+                await DetachChildInnerAsync();
+            }
+            ChildBackend = CloudChildBackend.Attach(this, address, $"[{Provider?.ProviderName} worker {worker.WorkerId}] Cloud Serverless", BaseConfig.StartupTimeoutSec);
+            ChildAddress = address;
+            Logs.Info($"[{Provider?.ProviderName}] Attached Swarm backend #{ChildBackend.ID} to worker '{worker.WorkerId}'.");
+        }
+        finally { ChildLock.Release(); }
+    }
+
+    /// <summary>Removes the attached child, if any.</summary>
+    public async Task DetachChildAsync()
+    {
+        await ChildLock.WaitAsync(CancellationToken.None);
+        try { await DetachChildInnerAsync(); }
+        finally { ChildLock.Release(); }
+    }
+
+    /// <summary>Detach body. Caller must hold <see cref="ChildLock"/>.</summary>
+    async Task DetachChildInnerAsync()
+    {
+        // Last chance to keep what the worker knew: once the child is gone so is its mirror of the worker's
+        // models, and this backend has to be able to answer for them while asleep.
+        AdoptChildModelLists();
+        BackendHandler.BackendData child = ChildBackend;
+        ChildBackend = null;
+        ChildAddress = null;
+        await CloudChildBackend.DetachAsync(Handler, child, Provider?.ProviderName);
+    }
+
+    /// <summary>Throttles <see cref="SleepTick"/>, which core fires roughly once a second.</summary>
+    long LastSleepCheck = 0;
+
+    /// <summary>
+    /// Drops the child once its worker's keepalive has run out, so nothing is left polling a URL that no
+    /// longer answers and the backend list does not accumulate dead subtrees. Cost is already handled by the
+    /// keepalive expiring on the provider's side; this is the local half of going back to sleep.
+    /// </summary>
+    void SleepTick()
+    {
+        if (Environment.TickCount64 < LastSleepCheck + 5000)
+        {
+            return;
+        }
+        LastSleepCheck = Environment.TickCount64;
+        if (ChildBackend is null || (CurrentWorker is not null && DateTime.UtcNow < WorkerKeepaliveExpiry))
+        {
+            return;
+        }
+        // Expiry is the worker's clock, not the request's: a generation already accepted keeps running on the
+        // remote, and detaching mid-flight would drop its results. The keepalive top-up on generation start
+        // means this only lingers for work that really is still going.
+        if (BackendData.CheckIsInUseAtAll || Grandchildren.Any(d => d.CheckIsInUseAtAll))
+        {
+            return;
+        }
+        Utilities.RunCheckedTask(() => DetachChildAsync(), $"{Provider?.ProviderName} detach idle child backend");
+    }
+
+    /// <summary>
+    /// Copies the attached child's mirrored model lists onto this backend. The child gets them from the
+    /// worker's own Swarm, which is the real list rather than anything guessed here, and keeping a copy after
+    /// the worker sleeps is what lets a sleeping endpoint still offer its models: the UI reads them through
+    /// <c>ExtraModelProviders</c>, and core's filter needs them to know a request is worth waking for.
+    /// Copied rather than aliased so a detached child cannot mutate what is now this backend's cache.
+    /// </summary>
+    void AdoptChildModelLists()
+    {
+        if (ChildBackend?.AbstractBackend is not SwarmSwarmBackend swarm || swarm.RemoteModels is null)
+        {
+            return;
+        }
+        // Only overwrite with a real listing; an empty one means the child has not finished mirroring yet, and
+        // committing that would drop a good cache and make every model look unavailable while asleep.
+        if (!swarm.RemoteModels.Any(kv => kv.Value.Count > 0))
+        {
+            return;
+        }
+        RemoteModels ??= new();
+        Models ??= new();
+        foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in swarm.RemoteModels)
+        {
+            RemoteModels[kv.Key] = kv.Value;
+            Models[kv.Key] = [.. kv.Value.Keys];
+        }
+        Program.ModelRefreshEvent?.Invoke();
+    }
+
+    /// <summary>The generating backends the attached child mirrors from the worker. Empty while asleep.</summary>
+    public IEnumerable<BackendHandler.T2IBackendData> Grandchildren
+        => ChildBackend?.AbstractBackend is SwarmSwarmBackend swarm ? swarm.ControlledNonrealBackends.Values : [];
+
+    /// <summary>True once at least one mirrored backend of the <em>current</em> worker is up and able to generate.</summary>
+    /// <remarks>The address check is not redundant. A child briefly outlives its worker (a wake can replace the
+    /// worker before the sleep check has dropped the old child), and its mirrored backends keep reporting
+    /// RUNNING until their idle monitor notices. Without this, that stale subtree would make this backend step
+    /// aside, and every request would be routed to a worker that no longer exists with nothing left to
+    /// re-attach a good child.</remarks>
+    public bool HasRunningGrandchild
+        => ChildAddress is not null && ChildAddress == CurrentWorker?.PublicUrl?.TrimEnd('/')
+            && Grandchildren.Any(d => d.Backend.Status == BackendStatus.RUNNING);
+
+    /// <inheritdoc/>
+    /// <remarks>Tops up an already-woken worker only. It must never wake one: core routes generations to the
+    /// child, so this runs on any generation the child accepts, and waking here would spend the owner's money
+    /// on a path they did not explicitly ask to.</remarks>
+    public async Task OnChildGenerationStartingAsync()
+    {
+        CloudWorkerInfo worker = CurrentWorker;
+        if (worker is not null)
+        {
+            await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
+        }
     }
 
     /// <summary>Accumulates keepalive expiry from the later of 'now' and the existing expiry.</summary>
@@ -640,117 +811,85 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 
     // ── Generation ────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Wakes a worker, attaches the child, and returns one of the worker's own mirrored backends to generate
+    /// on. Only the cold path reaches this: once a mirrored backend is running, core routes straight to it and
+    /// this backend refuses requests.
+    /// </summary>
+    async Task<BackendHandler.T2IBackendData> WakeAndGetGeneratorAsync(T2IParamInput user_input)
+    {
+        CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
+        await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
+        await EnsureChildAttachedAsync(worker);
+        // The child mirrors the worker in the background, so its own children appear a moment after attach.
+        int pollMs = Math.Clamp(BaseConfig.PollIntervalMs, 250, 2000);
+        int attempts = Math.Max(1, (BaseConfig.StartupTimeoutSec * 1000) / pollMs);
+        for (int i = 0; i < attempts; i++)
+        {
+            List<BackendHandler.T2IBackendData> running = [.. Grandchildren.Where(d => d.Backend.Status == BackendStatus.RUNNING)];
+            // Wait for the whole mirror rather than pouncing on the first backend up: on a worker running more
+            // than one, an early one that cannot serve this request would otherwise fail it while the one that
+            // could was still loading. Give up waiting halfway through, though - a backend stuck loading on the
+            // worker forever must not block a request that another backend there could already have served.
+            bool settled = (ChildBackend?.AbstractBackend as SwarmSwarmBackend)?.AnyLoading is false || i > attempts / 2;
+            if (running.Count is not 0 && settled)
+            {
+                AdoptChildModelLists();
+                // Prefer a free one, but a busy one that can serve is still better than failing: it queues.
+                BackendHandler.T2IBackendData ready = running.FirstOrDefault(d => !d.CheckIsInUse && CanServe(d, user_input))
+                    ?? running.FirstOrDefault(d => CanServe(d, user_input));
+                if (ready is not null)
+                {
+                    return ready;
+                }
+                throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} worker is up, but none of its backends accept this request.");
+            }
+            await RenewKeepaliveIfNeededAsync(worker, KeepaliveDuration);
+            await Task.Delay(pollMs, Program.GlobalProgramCancel);
+        }
+        throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} worker woke, but none of its backends became usable in time.");
+    }
+
+    /// <summary>
+    /// Whether a mirrored backend would accept this request, asked the same way core would have asked had it
+    /// routed there itself. Handing a request to a backend that has not been asked is not safe: the child pins
+    /// the remote backend by ID, so a wrong pick fails outright rather than being re-routed on the worker.
+    /// </summary>
+    static bool CanServe(BackendHandler.T2IBackendData data, T2IParamInput input)
+    {
+        HashSet<string> features = [.. data.Backend.SupportedFeatures];
+        if (input.RequiredFlags.Any(f => !features.Contains(f) && !T2IEngine.DisregardedFeatureFlags.Contains(f)))
+        {
+            return false;
+        }
+        return data.Backend.IsValidForThisBackend(input);
+    }
+
+    /// <remarks>
+    /// Generation itself belongs to the worker's own mirrored backends, which speak Swarm's remote protocol
+    /// properly - sessions, previews, interrupts and all. This path exists only because a sleeping endpoint has
+    /// no mirrored backend for core to pick yet, so the request that wakes the worker is handed on by hand.
+    /// </remarks>
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
         if (user_input.SourceSession is not null) { CheckPermission(user_input.SourceSession); }
-        return await RunWithSession(async () =>
-        {
-            // Worker acquisition must live INSIDE the retried lambda: on session recovery the
-            // worker (URL + session) may have been replaced, and a stale capture would retry forever.
-            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
-            await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
-            JObject resp = await CallWorkerAPI(worker, "GenerateText2Image", BuildRequest(user_input, worker.SessionId), BaseConfig.GenerationTimeoutSec);
-            Image[] images = ExtractImages(resp);
-            if (images.Length is 0) { throw new SwarmReadableErrorException("No images returned from remote worker."); }
-            return images;
-        });
+        // Wrapped so a worker that dies between waking and being ready is recovered rather than cached as live:
+        // without this the dead worker is reused, and every request until its keepalive lapses fails the same way.
+        // Claim the mirrored backend for real, too. Core reserved this backend, not that one, so without a claim
+        // a request arriving mid-generation would see it idle and double-book a remote that allows one job.
+        using T2IBackendAccess access = new(await RunWithSession(() => WakeAndGetGeneratorAsync(user_input)));
+        return await access.Backend.Generate(user_input);
     }
 
+    /// <inheritdoc cref="Generate"/>
     public override async Task GenerateLive(T2IParamInput user_input, string batchId, Action<object> takeOutput)
     {
         if (user_input.SourceSession is not null) { CheckPermission(user_input.SourceSession); }
-        await RunWithSession(async () =>
-        {
-            CloudWorkerInfo worker = await GetOrWakeWorkerAsync(KeepaliveDuration);
-            await WaitForWorkerBackendsLoadedAsync(worker, BaseConfig.StartupTimeoutSec);
-            using ClientWebSocket ws = await NetworkBackendUtils.ConnectWebsocket(worker.PublicUrl.TrimEnd('/'), "API/GenerateText2ImageWS", _ => { });
-            await ws.SendJson(BuildRequest(user_input, worker.SessionId), API.WebsocketTimeout);
-            bool interruptSent = false;
-            while (true)
-            {
-                if (user_input.InterruptToken.IsCancellationRequested && !interruptSent)
-                {
-                    // Send once: this loop runs per received message, and each InterruptAll carries a
-                    // 30s timeout, so re-sending would stall the drain until the socket finally closes.
-                    interruptSent = true;
-                    try { await CallWorkerAPI(worker, "InterruptAll", new JObject { ["other_sessions"] = false }, 30); }
-                    catch { /* best-effort */ }
-                }
-                JObject response = await ws.ReceiveJson(Utilities.ExtraLargeMaxReceive, true);
-                if (response is not null)
-                {
-                    AutoThrowException(response);
-                    HandleLiveResponse(response, batchId, user_input, takeOutput);
-                }
-                if (ws.CloseStatus.HasValue) { break; }
-            }
-            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, null, Program.GlobalProgramCancel);
-        });
+        using T2IBackendAccess access = new(await RunWithSession(() => WakeAndGetGeneratorAsync(user_input)));
+        await access.Backend.GenerateLive(user_input, batchId, takeOutput);
     }
 
     // ── Shared helpers ────────────────────────────────────────────────────────
-
-    /// <summary>Builds the remote GenerateText2Image request body from local generation input.</summary>
-    public JObject BuildRequest(T2IParamInput input, string sessionId)
-    {
-        input.ProcessPromptEmbeds(x => $"<embedding:{x}>");
-        JObject req = input.ToJSON();
-        req["session_id"] = sessionId;
-        req[T2IParamTypes.Images.Type.ID] = 1;
-        req[T2IParamTypes.DoNotSave.Type.ID] = true;
-        req.Remove(T2IParamTypes.ExactBackendID.Type.ID);
-        req.Remove(T2IParamTypes.BackendType.Type.ID);
-        if (input.ReceiveRawBackendData is not null) { req[T2IParamTypes.ForwardRawBackendData.Type.ID] = true; }
-        req[T2IParamTypes.ForwardSwarmData.Type.ID] = true;
-        return req;
-    }
-
-    /// <summary>Decodes the images array of a remote generation response.</summary>
-    public static Image[] ExtractImages(JObject response)
-    {
-        List<Image> images = [];
-        foreach (JToken t in response["images"] as JArray ?? [])
-        {
-            try { images.Add(ImageFile.FromDataString(t.ToString()) as Image); }
-            catch (Exception ex) { Logs.Warning($"Failed to decode image: {ex.Message}"); }
-        }
-        return [.. images];
-    }
-
-    /// <summary>Translates one remote websocket message (progress, image, raw data) into local generation output.</summary>
-    public static void HandleLiveResponse(JObject response, string batchId, T2IParamInput input, Action<object> takeOutput)
-    {
-        if (response.TryGetValue("gen_progress", out JToken val) && val is JObject objVal)
-        {
-            string actualId = batchId;
-            if (objVal.TryGetValue("batch_index", out JToken batchInd) && int.TryParse($"{batchInd}", out int remoteIdx)
-                && remoteIdx > 0 && int.TryParse(batchId, out int localIdx))
-            {
-                actualId = $"{localIdx + remoteIdx}";
-            }
-            objVal["batch_index"] = actualId;
-            objVal["request_id"] = $"{input.UserRequestId}";
-            takeOutput(objVal);
-        }
-        else if (response.TryGetValue("image", out val)) { takeOutput(ImageFile.FromDataString(val.ToString())); }
-        else if (response.TryGetValue("raw_backend_data", out JToken rawData))
-        {
-            string type = rawData["type"]?.ToString();
-            string datab64 = rawData["data"]?.ToString();
-            if (type is not null && datab64 is not null)
-            {
-                input.ReceiveRawBackendData?.Invoke(type, Convert.FromBase64String(datab64));
-            }
-        }
-        else if (response.TryGetValue("raw_swarm_data", out JToken rawSwarmTok) && rawSwarmTok is JObject rawSwarm)
-        {
-            if (rawSwarm.TryGetValue("params_used", out JToken paramsUsed))
-            {
-                foreach (JToken p in paramsUsed) { input.ParamsQueried.Add($"{p}"); }
-            }
-            if (input.Get(T2IParamTypes.ForwardSwarmData, false)) { takeOutput(response); }
-        }
-    }
 
     static string GetModelFromInput(T2IParamInput input)
     {

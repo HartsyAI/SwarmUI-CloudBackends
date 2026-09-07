@@ -290,41 +290,18 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         finally { InstanceLock.Release(); }
     }
 
-    /// <summary>
-    /// Hands the instance URL to a swarm backend as a non-real child. That child is a control instance
-    /// in its own right: it mirrors the remote's backends, models and features, and spawns its own
-    /// children which perform generation. The child is an <see cref="OwnerBoundSwarmBackend"/> (not
-    /// core's plain SwarmSwarmBackend) so the whole tree refuses generations from anyone but the owner.
-    /// </summary>
+    /// <summary>Hands the instance URL to an owner-bound swarm child, which does all the real work.</summary>
     internal void AttachChildBackend()
     {
-        SwarmSwarmBackend.SwarmSwarmBackendSettings settings = new()
-        {
-            Address = CurrentInstance.PublicUrl,
-            // AllowIdle does two things we need: SwarmSwarmBackend only re-polls the remote's backend
-            // list (ReviseRemoteDataList) via its idle monitor, so without this a backend added on the
-            // instance after attach (or removed and re-added) is never picked up without a manual
-            // restart. It also lets a transient connectivity blip recover on its own by going IDLE
-            // instead of ERRORED, which matters more here than for a same-machine remote since a cloud
-            // proxy URL is more prone to brief hiccups.
-            AllowIdle = true,
-            AllowForwarding = false,
-            AllowWebsocket = true,
-            ConnectionAttemptTimeoutSeconds = Math.Max(30, InstanceConfig.StartupTimeoutSec / 4)
-        };
-        ChildBackend = Handler.AddNewNonrealBackend(CloudBackendTypes.OwnerBoundSwarm, BackendData, settings, newData =>
-        {
-            SwarmSwarmBackend swarm = newData.AbstractBackend as SwarmSwarmBackend;
-            swarm.IsSpecialControlled = true;
-            swarm.CanLoadModels = false;
-            swarm.Title = $"[{Provider.ProviderName} {CurrentInstance.InstanceId}] {(string.IsNullOrWhiteSpace(CurrentInstance.Description) ? "Cloud Instance" : CurrentInstance.Description)}";
-            // Core's AddNewNonrealBackend takes a parent argument but never assigns it - set it
-            // ourselves, since OwnerBoundSwarmBackend's ownership walk relies on this exact link.
-            newData.AbstractParent = BackendData;
-            newData.UpdateLastReleaseTime();
-        });
+        string title = $"[{Provider.ProviderName} {CurrentInstance.InstanceId}] {(string.IsNullOrWhiteSpace(CurrentInstance.Description) ? "Cloud Instance" : CurrentInstance.Description)}";
+        ChildBackend = CloudChildBackend.Attach(this, CurrentInstance.PublicUrl, title, InstanceConfig.StartupTimeoutSec);
         Logs.Info($"[{Provider.ProviderName}] Attached Swarm backend #{ChildBackend.ID} to instance '{CurrentInstance.InstanceId}'.");
     }
+
+    /// <inheritdoc/>
+    /// <remarks>A rented instance bills for wall-clock time until it is stopped, so generation activity
+    /// changes nothing about its lifetime. Only serverless has anything to do here.</remarks>
+    public Task OnChildGenerationStartingAsync() => Task.CompletedTask;
 
     /// <summary>Removes the child backend and releases the cloud instance.</summary>
     public async Task StopInstanceAsync()
@@ -334,10 +311,9 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         {
             if (ChildBackend is not null)
             {
-                int id = ChildBackend.ID;
+                BackendHandler.BackendData child = ChildBackend;
                 ChildBackend = null;
-                try { await Handler.DeleteById(id); }
-                catch (Exception ex) { Logs.Debug($"[{Provider?.ProviderName}] Removing child backend #{id} failed: {ex.Message}"); }
+                await CloudChildBackend.DetachAsync(Handler, child, Provider?.ProviderName);
             }
             if (Provider is not null && CurrentInstance is not null)
             {
