@@ -93,6 +93,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// <summary>Guards all worker wake/extend/clear state transitions.</summary>
     public SemaphoreSlim WorkerLock = new(1, 1);
 
+    /// <summary>The owner-bound swarm child attached to the live worker, or null while no worker is awake.</summary>
+    public BackendHandler.BackendData ChildBackend = null;
+
+    /// <summary>URL <see cref="ChildBackend"/> was attached to, so a worker moving is noticed.</summary>
+    string ChildAddress = null;
+
+    /// <summary>Guards attach/detach so two requests cannot race the child lifecycle.</summary>
+    public SemaphoreSlim ChildLock = new(1, 1);
+
     /// <summary>Cancels outstanding keepalive jobs, swapped under <see cref="WorkerLock"/>.</summary>
     public CancellationTokenSource KeepaliveCts = null;
 
@@ -269,6 +278,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         MaxUsages = Math.Max(1, BaseConfig.MaxConcurrent);
         Status = BackendStatus.RUNNING;
         CanLoadModels = true;
+        Program.TickEvent += SleepTick;
         // Models are deliberately NOT refreshed here: listing them wakes a billed worker, and a backend
         // that comes into being because its owner generated something must never spend money on its own.
         // The CloudRefreshModels route is the explicit, user-initiated way to do it.
@@ -277,8 +287,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 
     public override async Task Shutdown()
     {
+        Program.TickEvent -= SleepTick;
         string name = Provider?.ProviderName ?? GetType().Name;
         Logs.Info($"[{name}] Backend {BackendData?.ID} shutting down...");
+        await DetachChildAsync();
         // Swap under the same lock GetOrWakeWorkerAsync uses: shutdown can land while other requests are
         // still in flight (ShutdownBackendCleanly only drains down to MaxUsages), and disposing the CTS
         // out from under them would throw ObjectDisposedException on .Token.
@@ -413,6 +425,90 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         finally { WorkerLock.Release(); }
     }
+
+    // ── Child backend lifecycle ───────────────────────────────────────────────
+    // A serverless worker only exists in bursts, so unlike an instance the child is attached per wake and
+    // removed once the worker is gone. Nothing is attached while asleep, which is what guarantees no polling
+    // can wake a billed worker behind the owner's back: SwarmSwarmBackend's idle monitor only ever re-polls a
+    // worker that is already awake and already being paid for.
+
+    /// <summary>Attaches a child to the given worker, replacing one pointed at a stale URL.</summary>
+    public async Task EnsureChildAttachedAsync(CloudWorkerInfo worker)
+    {
+        string address = worker.PublicUrl.TrimEnd('/');
+        await ChildLock.WaitAsync(Program.GlobalProgramCancel);
+        try
+        {
+            if (ChildBackend is not null && ChildAddress == address)
+            {
+                return;
+            }
+            // A wake can land on a different worker than last time, and the URL carries the host and port, so
+            // a surviving child would be pointed at something that no longer exists. Replace rather than
+            // re-address: SwarmSwarmBackend builds its whole mirrored subtree against the address it loaded with.
+            if (ChildBackend is not null)
+            {
+                await DetachChildInnerAsync();
+            }
+            ChildBackend = CloudChildBackend.Attach(this, address, $"[{Provider?.ProviderName} worker {worker.WorkerId}] Cloud Serverless", BaseConfig.StartupTimeoutSec);
+            ChildAddress = address;
+            Logs.Info($"[{Provider?.ProviderName}] Attached Swarm backend #{ChildBackend.ID} to worker '{worker.WorkerId}'.");
+        }
+        finally { ChildLock.Release(); }
+    }
+
+    /// <summary>Removes the attached child, if any.</summary>
+    public async Task DetachChildAsync()
+    {
+        await ChildLock.WaitAsync(CancellationToken.None);
+        try { await DetachChildInnerAsync(); }
+        finally { ChildLock.Release(); }
+    }
+
+    /// <summary>Detach body. Caller must hold <see cref="ChildLock"/>.</summary>
+    async Task DetachChildInnerAsync()
+    {
+        BackendHandler.BackendData child = ChildBackend;
+        ChildBackend = null;
+        ChildAddress = null;
+        await CloudChildBackend.DetachAsync(Handler, child, Provider?.ProviderName);
+    }
+
+    /// <summary>Throttles <see cref="SleepTick"/>, which core fires roughly once a second.</summary>
+    long LastSleepCheck = 0;
+
+    /// <summary>
+    /// Drops the child once its worker's keepalive has run out, so nothing is left polling a URL that no
+    /// longer answers and the backend list does not accumulate dead subtrees. Cost is already handled by the
+    /// keepalive expiring on the provider's side; this is the local half of going back to sleep.
+    /// </summary>
+    void SleepTick()
+    {
+        if (Environment.TickCount64 < LastSleepCheck + 5000)
+        {
+            return;
+        }
+        LastSleepCheck = Environment.TickCount64;
+        if (ChildBackend is null || (CurrentWorker is not null && DateTime.UtcNow < WorkerKeepaliveExpiry))
+        {
+            return;
+        }
+        // Expiry is the worker's clock, not the request's: a generation already accepted keeps running on the
+        // remote, and detaching mid-flight would drop its results. The keepalive top-up on generation start
+        // means this only lingers for work that really is still going.
+        if (BackendData.CheckIsInUseAtAll || Grandchildren.Any(d => d.CheckIsInUseAtAll))
+        {
+            return;
+        }
+        Utilities.RunCheckedTask(() => DetachChildAsync(), $"{Provider?.ProviderName} detach idle child backend");
+    }
+
+    /// <summary>The generating backends the attached child mirrors from the worker. Empty while asleep.</summary>
+    public IEnumerable<BackendHandler.T2IBackendData> Grandchildren
+        => ChildBackend?.AbstractBackend is SwarmSwarmBackend swarm ? swarm.ControlledNonrealBackends.Values : [];
+
+    /// <summary>True once at least one mirrored worker backend is up and able to take generations.</summary>
+    public bool HasRunningGrandchild => Grandchildren.Any(d => d.Backend.Status == BackendStatus.RUNNING);
 
     /// <inheritdoc/>
     /// <remarks>Tops up an already-woken worker only. It must never wake one: core routes generations to the
