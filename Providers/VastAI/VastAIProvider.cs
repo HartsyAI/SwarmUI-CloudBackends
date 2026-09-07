@@ -20,8 +20,10 @@ namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
 /// /route/ is forwarded as auth_data verbatim, because its signature covers those exact fields.
 ///
 /// The route the worker exposes and the shape of payload are defined by the worker image, not by Vast.
-/// This provider targets the handler in workers/vastai/vast_handler.py, which serves the configured
-/// route and answers an { action } payload with { public_url, session_id, worker_id, version }.
+/// This provider targets the handler in workers/vastai/vast_worker.py, a real vastai-SDK PyWorker
+/// (not a bespoke HTTP server - that's what actually registers with Vast's autoscaler and makes the
+/// worker routable at all). It serves the configured route and answers with
+/// { success, public_url, session_id, worker_id, version }.
 /// </summary>
 public class VastAIProvider(string apiKey, string endpointName, string workerRoute = "handler") : ICloudProvider
 {

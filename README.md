@@ -11,14 +11,14 @@ One shared core handles the SwarmUI side; each cloud provider is a thin adapter.
 | RunPod Serverless | ✅ Verified end to end against real hardware, including generation. |
 | RunPod Pods | ✅ Verified end to end live: create, attach, generate, Start/Stop, terminate. |
 | Vast.ai Instances | ✅ Verified end to end live, including a full from-scratch volume + install. |
-| Vast.ai Serverless | ⚠️ Built to the documented contract, config/credentials verified live. Routing and generation are untested (needs a deployed worker). |
+| Vast.ai Serverless | ✅ Verified live: worker recruited, `Ready 1/1`, routed and woken through Vast. Needs a worker image with a model baked in - see [Setup](#vastai-serverless). |
 
 <details>
 <summary><b>Deeper detail per provider</b></summary>
 
 - **RunPod Pods**: create a pod, attach it as a real Swarm backend, generate, Start/Stop, terminate - all done live.
 - **Vast.ai Instances**: verified against the official `vastai` Python SDK/CLI source, since the prose docs are vague (and sometimes wrong) on exact endpoints. Config/credentials, live offer search, Start/Stop/confirm/error UI, instance creation, networking, and a real generation are all live-verified. Creating a brand-new *named* network volume isn't supported yet (attaching an existing one is) - see [Known follow-ups](#known-follow-ups).
-- **Vast.ai Serverless**: routing and generation are untested since that needs a Vast account with a deployed worker.
+- **Vast.ai Serverless**: the worker ([`workers/vastai/vast_worker.py`](workers/vastai/vast_worker.py)) is a real `vastai`-SDK PyWorker, so it registers with the autoscaler and is genuinely routable, rather than a lookalike HTTP server that `/route/` would never return. Verified live end to end: a worker was recruited, reached `Ready 1/1`, and was routed and woken through Vast's own `/route/`. Unlike RunPod, Vast cannot attach a network drive to a serverless worker, so the model has to be in the worker image - see [Setup](#vastai-serverless).
 
 </details>
 
@@ -114,6 +114,44 @@ Once your key is set, offer and network volume fields become live dropdowns the 
 
 </details>
 
+### Vast.ai Serverless
+
+> [!IMPORTANT]
+> **You need your own worker image, with a model baked into it.** Vast, unlike RunPod, cannot attach a network drive to a serverless worker, so nothing persists between workers and there is nowhere to keep models. Your image has to contain SwarmUI, a backend, and the model you intend to generate with. Everything below assumes such an image; `kalebbroo/swarmui-runpod:latest` gets a worker running and routable but ships no model, so it will come up with nothing to generate.
+>
+> If you want cloud GPUs with your existing models on a drive, use **RunPod Serverless** (network volume, still scales to zero) or **Vast.ai Instances** (attaches a Vast volume) instead.
+
+Vast's serverless is three nested objects: an **endpoint** (the autoscaling policy) contains **workergroups** (a template plus GPU-pool filters), which recruit real **instances**. You configure all three on Vast, then point this extension at the endpoint.
+
+1. **Create a template** ([Templates ▸ New](https://cloud.vast.ai/templates/)) with your image, launch mode **Docker ENTRYPOINT**, and:
+
+   - Docker options: `-p 7801:7801 -p 8000:8000 -e VOLUME_PATH=/workspace -e SWARM_MODE=vast_serverless -e WORKER_PORT=8000`
+   - Ports `7801` (SwarmUI) and `8000` (the PyWorker Vast talks to) both exposed
+   - **Container disk** comfortably larger than your unpacked image - see the warning below
+
+2. **Create an endpoint** ([Serverless](https://cloud.vast.ai/serverless/)): Min Workers `0`, Max Workers `1` to start, Min Load `1`, Target Utilization `0.9`, Cold Multiplier `3.0`.
+
+3. **Create a workergroup** under it, choosing that template. Its GPU-pool filters inherit the template's disk size, so fix the disk on the template first.
+
+4. Set your Vast key in **User Settings ▸ API Keys**, then in the **Vast.ai Serverless** section: toggle on, set your endpoint name, Save.
+
+> [!IMPORTANT]
+> **Set container disk well above your image's unpacked size.** Vast's default is 8 GB, which is smaller than most usable worker images, and an undersized disk fails in a way that names no cause: instances die partway through the pull and the autoscaler quietly rotates to another host forever, never reaching `Ready Workers: 1/1`.
+
+Two things your image must do, since a serverless worker gets a bare container every time:
+
+- **Ship a configured backend**, not just SwarmUI. A SwarmUI with no backend starts normally and then cannot generate anything.
+- **Not require `VOLUME_PATH` to already exist.** There is no volume, so that path is just a directory on container disk that nothing creates for it.
+
+<details>
+<summary><b>Editing a template does not update it in place</b></summary>
+
+Saving from **Templates** creates a *new* template rather than modifying the existing one, and your workergroup keeps pointing at the old copy. It is easy to end up with several identically-named templates and "verify" the wrong one - during this extension's own testing that hid a workergroup still running a months-old image tag while a duplicate template showed the current one.
+
+Edit the template through **Serverless ▸ Edit workergroup ▸ (pencil)** instead, which shows the config the workergroup actually uses, and use **Save & Use**. Editing an existing workergroup can also fail with `search_params and search_query conflict`; deleting it and creating a fresh one under the same endpoint works.
+
+</details>
+
 ## How it works
 
 Two shapes of provider, because "wake a serverless worker per request" and "rent an instance that stays up" need different lifecycles.
@@ -166,6 +204,14 @@ Every cloud backend belongs to exactly one user and runs on that user's own key:
 > [!IMPORTANT]
 > An implicitly-created backend never spends money by itself. Serverless children never auto-refresh models (that wakes a billed worker - use the refresh route), and instance children never auto-start (use Start).
 
+> [!WARNING]
+> **`EndpointId` is shared by every user, while the API key is per-user** - each user's child is built from the same backend settings and only differs by whose key it runs on. Pods and instances are unaffected (they are *created*, and their name/label is already made unique per user), but the two serverless providers look up something that has to exist in the caller's own account:
+>
+> - **RunPod Serverless is owner-only.** Its endpoint ID is account-scoped and goes straight into the request URL, so any user other than the one whose account owns that endpoint gets `RunPod endpoint '...' not found (404)`. There is no per-user endpoint setting to point them elsewhere.
+> - **Vast.ai Serverless works for multiple users** only because it resolves by endpoint *name* within each caller's own account - so every user needs their own endpoint, named exactly the same.
+>
+> For a multi-user server, prefer pods/instances, or give each user their own Cloud Backends entry with their own endpoint.
+
 ## Concurrency and scaling
 
 One backend instance owns exactly one worker; concurrent requests share it (`MaxConcurrent` caps how many SwarmUI hands it at once, queued internally beyond that). To use more than one GPU, add more **Cloud Backends** entries, each with its own provider section - each one wakes and owns its own worker. Generation traffic never enters RunPod's own job queue, so its autoscaler won't add workers for this load.
@@ -200,8 +246,8 @@ Serverless, RTX-class worker, SDXL 1024×1024 @ 12 steps:
 
 | Operation | Time |
 |---|---|
-| Wake onto a FlashBoot warm worker (incl. discovering 27 models) | 15–40 s |
-| Fully cold worker, container start to first image | 3–4 min |
+| Wake onto a FlashBoot warm worker (incl. discovering 27 models) | 15-40 s |
+| Fully cold worker, container start to first image | 3-4 min |
 | First generation on an already-woken worker | ~64 s |
 | Warm generation, worker + model resident | ~9 s |
 | Recovery from an invalidated remote session | ~9 s, no re-wake |
@@ -239,9 +285,7 @@ or just launch SwarmUI, which builds extensions at startup.
 
 - **Creating a brand-new named Vast.ai network volume** isn't supported - only attaching an existing one is. Vast's volumes are rented from their own marketplace (`POST /api/v0/network_volumes/search/`), out of scope for this pass.
 - The serverless worker handler returns its cached SwarmUI session without revalidating it; this extension compensates by refreshing in place on `invalid_session_id`.
-- The Vast.ai Serverless path needs a real account, workergroup, and deployed worker to verify end to end.
 - All requests through one backend share a single remote session, so an interrupt cancels every in-flight generation on that worker.
-- Vast.ai's `/route/` signature algorithm isn't published, so `workers/vastai/vast_handler.py` doesn't verify it - treat that handler as trusted-network only.
 - No rate-limit backoff for RunPod (Vast's client already backs off on 429/502/503/504): a RunPod 429 mid-poll surfaces as an error instead of pausing on `Retry-After`.
 - No orphaned-instance detection: if SwarmUI dies uncleanly while a section is *disabled* but its instance is still running, nothing notices on next start. (Re-enabling the section, or an instance created while it was still enabled, is found again by label/name - this only bites the disabled-with-a-stray-instance case.)
 
