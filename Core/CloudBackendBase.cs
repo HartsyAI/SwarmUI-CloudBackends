@@ -592,10 +592,18 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 continue;
             }
             slot.NextLeaseCheckTick = now + 15_000;
-            using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(30));
-            if (!await slot.Provider.IsLeaseActiveAsync(slot.Worker, cancel.Token))
+            try
             {
-                await RemoveSlotAsync(slot, "lease ended");
+                using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(30));
+                if (!await slot.Provider.IsLeaseActiveAsync(slot.Worker, cancel.Token))
+                {
+                    await RemoveSlotAsync(slot, "lease ended");
+                }
+            }
+            catch (Exception ex)
+            {
+                // One worker's unexpected failure must not stop the others from being checked.
+                Logs.Warning($"[{slot.Provider.ProviderName}] Checking worker {slot.Worker.WorkerId} failed: {ex.Message}");
             }
         }
     }

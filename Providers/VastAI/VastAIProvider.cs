@@ -11,6 +11,16 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
 
+/// <summary>A failed Vast.ai request, with the HTTP status so callers can tell a definitive answer from a transient one.</summary>
+public class VastApiException(int status, string message) : SwarmReadableErrorException(message)
+{
+    /// <summary>HTTP status Vast.ai (or the worker's PyWorker) answered with.</summary>
+    public readonly int Status = status;
+
+    /// <summary>True for answers that mean the session is gone for good: invalid grant, or no such session.</summary>
+    public bool EndsSession => Status is 400 or 401 or 403 or 404 or 410;
+}
+
 /// <summary>
 /// <see cref="ICloudProvider"/> for Vast.ai Serverless endpoints running the Hartsy Vast worker image
 /// (github.com/HartsyAI/Vast-Worker-SwarmUI).
@@ -102,7 +112,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
             };
             try
             {
-                JObject lease = await LeaseCallAsync(workerUrl, worker);
+                JObject lease = await LeaseCallAsync(workerUrl, worker, Program.GlobalProgramCancel);
                 ApplyLease(worker, lease);
                 await RefreshExpirationAsync(worker, CancellationToken.None);
                 Logs.Info($"{Tag} Session {worker.LeaseId} holds worker {worker.WorkerId}.");
@@ -146,7 +156,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     }
 
     /// <summary>Calls the worker's /lease route through the session (which also extends the session by one lifetime).</summary>
-    async Task<JObject> LeaseCallAsync(string workerUrl, CloudWorkerInfo worker)
+    async Task<JObject> LeaseCallAsync(string workerUrl, CloudWorkerInfo worker, CancellationToken cancel)
     {
         JObject envelope = new()
         {
@@ -154,7 +164,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
             ["session_id"] = worker.LeaseId,
             ["payload"] = new JObject { ["session_id"] = worker.LeaseId }
         };
-        using HttpResponseMessage response = await VastTls.Http.PostAsync($"{workerUrl.TrimEnd('/')}/lease", Json(envelope), Program.GlobalProgramCancel);
+        using HttpResponseMessage response = await VastTls.Http.PostAsync($"{workerUrl.TrimEnd('/')}/lease", Json(envelope), cancel);
         return await ReadJsonAsync(response, "lease");
     }
 
@@ -208,7 +218,13 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
             worker.FailedLeaseChecks = 0;
             return active;
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.IO.IOException)
+        catch (VastApiException ex) when (ex.EndsSession)
+        {
+            // A definite answer that the session or its grant is gone: end the lease now, so its place is freed.
+            Logs.Debug($"{Tag} Session {worker.LeaseId} is no longer valid ({ex.Status}); treating the lease as ended.");
+            return false;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.IO.IOException or VastApiException)
         {
             // The check talks to the worker itself, so a network blip and a dead worker look alike. One failure keeps
             // the lease (ending it would interrupt a healthy worker's generation and lease a replacement); only a run of
@@ -229,9 +245,23 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         {
             return;
         }
-        await LeaseCallAsync(SessionUrl(worker), worker);
-        await RefreshExpirationAsync(worker, cancel);
-        Logs.Debug($"{Tag} Renewed session {worker.LeaseId}.");
+        // One renewal per worker at a time, re-checked inside: every /lease call adds a whole lifetime, so two
+        // concurrent callers that both saw the old expiry would stack paid lifetimes onto an idle worker.
+        await worker.RenewLock.WaitAsync(cancel);
+        try
+        {
+            if (!NeedsRenewal(worker.LeaseExpiration, worker.LeaseLifetime, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0))
+            {
+                return;
+            }
+            await LeaseCallAsync(SessionUrl(worker), worker, cancel);
+            await RefreshExpirationAsync(worker, cancel);
+            Logs.Debug($"{Tag} Renewed session {worker.LeaseId}.");
+        }
+        finally
+        {
+            worker.RenewLock.Release();
+        }
     }
 
     /// <summary>Lease checks in a row that must fail to reach a worker before its lease is treated as ended (about a minute, at one check every 15s).</summary>
@@ -443,13 +473,14 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     static async Task<JObject> ReadJsonAsync(HttpResponseMessage response, string what)
     {
         string text = await response.Content.ReadAsStringAsync();
+        int status = (int)response.StatusCode;
         if (response.StatusCode is HttpStatusCode.Unauthorized)
         {
-            throw new SwarmReadableErrorException($"Vast.ai refused the {what} request (401). The session or routing grant is no longer valid.");
+            throw new VastApiException(status, $"Vast.ai refused the {what} request (401). The session or routing grant is no longer valid.");
         }
         if (!response.IsSuccessStatusCode)
         {
-            throw new SwarmReadableErrorException($"Vast.ai {what} failed ({(int)response.StatusCode}): {text[..Math.Min(text.Length, 300)]}");
+            throw new VastApiException(status, $"Vast.ai {what} failed ({status}): {text[..Math.Min(text.Length, 300)]}");
         }
         try
         {

@@ -139,6 +139,19 @@ public class VastSessionTests
     }
 
     [Test]
+    public void OnlyDefinitiveSessionAnswersEndALease()
+    {
+        foreach (int status in new[] { 400, 401, 403, 404, 410 })
+        {
+            Assert.That(new VastApiException(status, "x").EndsSession, Is.True, $"status {status}");
+        }
+        foreach (int status in new[] { 429, 500, 502, 503 })
+        {
+            Assert.That(new VastApiException(status, "x").EndsSession, Is.False, $"status {status}");
+        }
+    }
+
+    [Test]
     public void OneUnreachableCheckDoesNotEndALease()
     {
         Assert.That(VastAIProvider.IsUnreachableForGood(1), Is.False);

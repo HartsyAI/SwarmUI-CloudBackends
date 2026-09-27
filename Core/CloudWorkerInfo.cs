@@ -34,4 +34,7 @@ public class CloudWorkerInfo
 
     /// <summary>Lease checks in a row that could not reach the worker. Reset by any answer.</summary>
     public int FailedLeaseChecks;
+
+    /// <summary>Serializes renewals of this lease, so concurrent callers cannot each add a lifetime.</summary>
+    public readonly SemaphoreSlim RenewLock = new(1, 1);
 }
