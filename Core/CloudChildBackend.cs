@@ -17,7 +17,13 @@ internal static class CloudChildBackend
     /// children which perform generation. It is an <see cref="OwnerBoundSwarmBackend"/> rather than core's
     /// plain SwarmSwarmBackend so the whole tree refuses generations from anyone but the owner.
     /// </summary>
-    public static BackendHandler.BackendData Attach(AbstractT2IBackend owner, string address, string title, int connectTimeoutSec)
+    /// <param name="owner">The cloud backend the child hangs off.</param>
+    /// <param name="address">The worker's SwarmUI (gateway) address.</param>
+    /// <param name="title">Display title for the child.</param>
+    /// <param name="connectTimeoutSec">Connection budget; the child gets a quarter of it per attempt.</param>
+    /// <param name="authorizationHeader">Full <c>Authorization</c> header value (e.g. <c>Bearer ...</c>) the worker's gateway requires, or null.
+    /// Core's swarm backend sends it on every HTTP call and WebSocket, and its generating children inherit it.</param>
+    public static BackendHandler.BackendData Attach(AbstractT2IBackend owner, string address, string title, int connectTimeoutSec, string authorizationHeader = null)
     {
         SwarmSwarmBackend.SwarmSwarmBackendSettings settings = new()
         {
@@ -30,7 +36,8 @@ internal static class CloudChildBackend
             AllowIdle = true,
             AllowForwarding = false,
             AllowWebsocket = true,
-            ConnectionAttemptTimeoutSeconds = Math.Max(30, connectTimeoutSec / 4)
+            ConnectionAttemptTimeoutSeconds = Math.Max(30, connectTimeoutSec / 4),
+            AuthorizationHeader = authorizationHeader ?? ""
         };
         return owner.Handler.AddNewNonrealBackend(CloudBackendTypes.OwnerBoundSwarm, owner.BackendData, settings, newData =>
         {

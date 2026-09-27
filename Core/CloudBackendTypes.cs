@@ -18,6 +18,12 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 /// </summary>
 public static class CloudBackendTypes
 {
+    /// <summary>Default worker image for RunPod pods: the Hartsy RunPod worker, pinned to the release this version was tested with.</summary>
+    public const string DefaultRunPodImage = "hartsy/swarmui-worker-runpod:2.0.0-comfyui";
+
+    /// <summary>Default worker image for Vast.ai instances: the Hartsy Vast.ai worker, pinned to the release this version was tested with.</summary>
+    public const string DefaultVastImage = "hartsy/swarmui-worker-vast:1.0.0-hartsyinference";
+
     /// <summary>Hidden type record for the RunPod Serverless child backend.</summary>
     public static BackendHandler.BackendType RunPodServerless { get; private set; }
 

@@ -81,7 +81,13 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
     /// is listening, so this is the real readiness gate. On timeout, throws a readable error ending in
     /// <paramref name="failureHint"/> (provider-specific advice on what to check).
     /// </summary>
-    public async Task WaitForSwarmAsync(string publicUrl, DateTime deadline, string failureHint, CancellationToken cancel = default)
+    /// <param name="publicUrl">The instance's SwarmUI (gateway) address.</param>
+    /// <param name="deadline">When to give up.</param>
+    /// <param name="failureHint">Provider-specific advice appended to the timeout error.</param>
+    /// <param name="cancel">Cancels the wait.</param>
+    /// <param name="workerToken">The instance's gateway token, sent as a Bearer token, or null for an unsecured SwarmUI.</param>
+    /// <param name="client">HTTP client to use (e.g. one that trusts Vast.ai's CA), or null for the default.</param>
+    public async Task WaitForSwarmAsync(string publicUrl, DateTime deadline, string failureHint, CancellationToken cancel = default, string workerToken = null, HttpClient client = null)
     {
         Exception last = null;
         while (DateTime.UtcNow < deadline)
@@ -89,10 +95,21 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             cancel.ThrowIfCancellationRequested();
             try
             {
-                JObject session = await Http.PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], null, cancel);
+                JObject session = await (client ?? Http).PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], workerToken is null ? null : req => req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", workerToken), cancel);
+                if (session?["error_id"]?.ToString() == "worker_unauthorized")
+                {
+                    throw new SwarmReadableErrorException($"The SwarmUI at {publicUrl} refused this backend's token. If you created that instance yourself, set its SWARMUI_WORKER_TOKEN to match, or let this backend create the instance.");
+                }
                 if (!string.IsNullOrWhiteSpace(session?["session_id"]?.ToString())) { return; }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException) { last = ex; }
+            catch (SwarmReadableErrorException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                last = ex;
+            }
             Logs.Verbose($"[{providerName}] Waiting for SwarmUI on {publicUrl} to answer...");
             await Task.Delay(5000, cancel);
         }

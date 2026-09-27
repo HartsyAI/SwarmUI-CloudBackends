@@ -36,6 +36,12 @@ public class VastAIInstancePlan
     /// <summary>Extra environment variables, KEY=VALUE per line/comma. The SwarmUI port mapping is added automatically.</summary>
     public string Env = "";
 
+    /// <summary>Gateway token for the instance's SwarmUI worker, injected as SWARMUI_WORKER_TOKEN when creating it.</summary>
+    public string WorkerToken = "";
+
+    /// <summary>Reach the instance over HTTPS with Vast's instance certificate (the Hartsy Vast worker serves it).</summary>
+    public bool UseTls = true;
+
     /// <summary>If true the instance is destroyed on shutdown; if false it is only stopped, so it can resume.</summary>
     public bool TerminateOnShutdown = false;
 }
@@ -111,7 +117,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             CostPerHour = inst["dph_total"]?.Value<double>() ?? 0,
             UptimeSeconds = (int)((inst["uptime_mins"]?.Value<double>() ?? 0) * 60),
             // Plain HTTP, no TLS: Vast has no proxy domain, just {public_ipaddr}:{mapped_external_port}.
-            PublicUrl = (!string.IsNullOrWhiteSpace(ip) && mappedPort is not null) ? $"http://{ip}:{mappedPort}" : null
+            PublicUrl = (!string.IsNullOrWhiteSpace(ip) && mappedPort is not null) ? $"{(plan.UseTls ? "https" : "http")}://{ip}:{mappedPort}" : null
         };
     }
 
@@ -169,7 +175,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         // Wait for SwarmUI itself, not just the port mapping: the mapped port answers as soon as the
         // container's network namespace exists, well before whatever is inside it has started listening.
-        await Api.WaitForSwarmAsync(liveStatus.PublicUrl, deadline, $"Check that SwarmUI is installed and listening on port {plan.SwarmUIPort}, and that '-p {plan.SwarmUIPort}:{plan.SwarmUIPort}' actually applied (some Vast templates strip extra docker options).", cancel);
+        await Api.WaitForSwarmAsync(liveStatus.PublicUrl, deadline, $"Check that SwarmUI is installed and listening on port {plan.SwarmUIPort}, and that '-p {plan.SwarmUIPort}:{plan.SwarmUIPort}' actually applied (some Vast templates strip extra docker options).", cancel, string.IsNullOrWhiteSpace(plan.WorkerToken) ? null : plan.WorkerToken, plan.UseTls ? VastTls.Http : null);
         Logs.Info($"[VastAI Instances] SwarmUI is up on instance '{instanceId}' at {liveStatus.PublicUrl}");
         return new CloudInstanceInfo
         {
@@ -241,6 +247,15 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         // Port exposure is a Docker -p flag encoded as an env dict key (Vast has no structured ports
         // field on create), so it's merged into the same object as any user-supplied env vars.
         JObject env = CloudApiClient.ParseEnv(plan.Env);
+        if (!string.IsNullOrWhiteSpace(plan.WorkerToken))
+        {
+            env["SWARMUI_WORKER_TOKEN"] = plan.WorkerToken;
+        }
+        // Tells the worker image where the volume (and so the models) is mounted.
+        if (env["VOLUME_PATH"] is null && !string.IsNullOrWhiteSpace(plan.VolumeMountPath))
+        {
+            env["VOLUME_PATH"] = plan.VolumeMountPath;
+        }
         env[$"-p {plan.SwarmUIPort}:{plan.SwarmUIPort}"] = "1";
         JObject body = new()
         {
@@ -373,5 +388,31 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     public Task<JToken> ApiAsync(HttpMethod method, string path, JObject body, CancellationToken cancel = default, bool allowNotFound = false)
     {
         return Api.ApiAsync(method, path, body, cancel, allowNotFound);
+    }
+
+    /// <summary>Label prefix of every instance this extension creates, used to recognise its orphans.</summary>
+    public const string ManagedLabelPrefix = "swarmui-cloudbackends";
+
+    /// <summary>Running instances on the account that this extension created, as <c>{id, name, status, cost_per_hr}</c>.</summary>
+    public async Task<List<JObject>> ListManagedRunningAsync(CancellationToken cancel = default)
+    {
+        List<JObject> result = [];
+        foreach (JObject instance in (await ListInstancesAsync(cancel)).OfType<JObject>())
+        {
+            string label = instance["label"]?.ToString() ?? "";
+            string status = instance["actual_status"]?.ToString() ?? "";
+            if (label.StartsWith(ManagedLabelPrefix, StringComparison.OrdinalIgnoreCase) && status == "running")
+            {
+                result.Add(new JObject { ["id"] = instance["id"]?.ToString(), ["name"] = label, ["status"] = status, ["cost_per_hr"] = instance["dph_total"] });
+            }
+        }
+        return result;
+    }
+
+    /// <summary>Stops any instance on the account by ID (orphan cleanup). Keeps its disk.</summary>
+    public async Task StopInstanceByIdAsync(string instanceId, CancellationToken cancel = default)
+    {
+        Logs.Info($"[VastAI Instances] Stopping instance '{instanceId}' on request...");
+        await ApiAsync(HttpMethod.Put, $"/api/v0/instances/{instanceId}/", new JObject { ["state"] = "stopped" }, cancel, allowNotFound: true);
     }
 }

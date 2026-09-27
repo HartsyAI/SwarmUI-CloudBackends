@@ -24,20 +24,20 @@ public class CloudBackendsBackend : AbstractT2IBackend
     public class Settings : AutoConfiguration
     {
         // ── RunPod Serverless ────────────────────────────────────────────────
-        [ConfigComment("Enable a RunPod Serverless worker.")]
+        [ConfigComment("Enable RunPod Serverless.")]
         public bool RunPodServerless_Enabled = false;
-        [ConfigComment("Cloud endpoint identifier (RunPod serverless endpoint ID).")]
+        [ConfigComment("RunPod serverless endpoint ID.")]
         public string RunPodServerless_EndpointId = "";
-        [ConfigComment("Unused. Parallelism is set by the worker's own backends, which report their real limits once a worker is awake.\nKept so existing configs still load.")]
-        public int RunPodServerless_MaxConcurrent = 10;
-        [ConfigComment("Poll interval while waiting for worker startup (ms).")]
-        public int RunPodServerless_PollIntervalMs = 2000;
-        [ConfigComment("Max worker startup timeout (seconds).")]
+        [ConfigComment("Most workers this backend may run at once. When every running worker is busy, another one is started, up to this many.\nAlso limited by the endpoint's own maximum. 1 means never more than one worker.")]
+        public int RunPodServerless_MaxWorkers = 1;
+        [ConfigComment("How long a worker may sit with no generation before it shuts down, in seconds.\nLower costs less; higher avoids a cold start between bursts of work.")]
+        public int RunPodServerless_IdleSeconds = 120;
+        [ConfigComment("Longest a single worker lease may last, in seconds. The endpoint's execution timeout must be longer.\nA worker still in use when its lease ends is simply leased again.")]
+        public int RunPodServerless_MaxLeaseSeconds = 3600;
+        [ConfigComment("How long to wait for a worker to start and answer, in seconds.")]
         public int RunPodServerless_StartupTimeoutSec = 800;
-        [ConfigComment("Per-generation timeout (seconds).")]
-        public int RunPodServerless_GenerationTimeoutSec = 300;
-        [ConfigComment("How long to keep a woken worker alive after each request (seconds).")]
-        public int RunPodServerless_KeepaliveSeconds = 420;
+        [ConfigComment("How often to poll while waiting for a worker, in milliseconds.")]
+        public int RunPodServerless_PollIntervalMs = 2000;
 
         // ── RunPod GPU Pods ──────────────────────────────────────────────────
         [ConfigComment("Enable a RunPod GPU Pod.")]
@@ -52,9 +52,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [SuggestionPlaceholder(Text = "blank = a name unique to this backend")]
         [ConfigComment("Name given to pods this backend creates, and used to find that pod again later.\nLeave blank to use a name unique to this backend (recommended) - a shared literal name here across two or more Cloud Backends instances would make each backend's 'find an existing pod by name' step liable to attach to the other's pod instead of creating its own.")]
         public string RunPodPods_PodName = "";
-        [SuggestionPlaceholder(Text = "docker image with SwarmUI")]
-        [ConfigComment("Docker image to create the pod from. Ignored when TemplateId is set.")]
-        public string RunPodPods_ImageName = "";
+        [ConfigComment("Docker image to create the pod from. Ignored when TemplateId is set.\nUse the Hartsy RunPod worker image (pinned to a release), which secures the pod with a token this backend manages.")]
+        public string RunPodPods_ImageName = CloudBackendTypes.DefaultRunPodImage;
         [SuggestionPlaceholder(Text = "RunPod template id")]
         [ConfigComment("RunPod template to create the pod from, instead of naming an image directly.")]
         public string RunPodPods_TemplateId = "";
@@ -91,23 +90,18 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public double RunPodPods_MaxSpendUsd = 0;
 
         // ── Vast.ai Serverless ───────────────────────────────────────────────
-        [ConfigComment("Enable a Vast.ai Serverless worker.")]
+        [ConfigComment("Enable Vast.ai Serverless.")]
         public bool VastAI_Enabled = false;
-        [ConfigComment("Vast.ai serverless endpoint NAME (matches on /route/).")]
+        [ConfigComment("Vast.ai serverless endpoint name.")]
         public string VastAI_EndpointId = "";
-        [SuggestionPlaceholder(Text = "handler")]
-        [ConfigComment("Route on the worker that serves the SwarmUI wakeup handler.")]
-        public string VastAI_WorkerRoute = "handler";
-        [ConfigComment("Unused. Parallelism is set by the worker's own backends, which report their real limits once a worker is awake.\nKept so existing configs still load.")]
-        public int VastAI_MaxConcurrent = 10;
-        [ConfigComment("Poll interval while waiting for worker startup (ms).")]
-        public int VastAI_PollIntervalMs = 2000;
-        [ConfigComment("Max worker startup timeout (seconds).")]
+        [ConfigComment("Most workers this backend may run at once. When every running worker is busy, another one is started, up to this many.\nAlso limited by the endpoint's own maximum. 1 means never more than one worker.")]
+        public int VastAI_MaxWorkers = 1;
+        [ConfigComment("How long a worker may sit with no generation before it shuts down, in seconds.\nLower costs less; higher avoids a cold start between bursts of work.")]
+        public int VastAI_IdleSeconds = 120;
+        [ConfigComment("How long to wait for a worker to start and answer, in seconds.")]
         public int VastAI_StartupTimeoutSec = 800;
-        [ConfigComment("Per-generation timeout (seconds).")]
-        public int VastAI_GenerationTimeoutSec = 300;
-        [ConfigComment("How long to keep a woken worker alive after each request (seconds).")]
-        public int VastAI_KeepaliveSeconds = 420;
+        [ConfigComment("How often to poll while waiting for a worker, in milliseconds.")]
+        public int VastAI_PollIntervalMs = 2000;
 
         // ── Vast.ai Instances ────────────────────────────────────────────────
         // Prefixed VastAIInstance_ (not VastAI_, which the Serverless section above already owns).
@@ -123,9 +117,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [SuggestionPlaceholder(Text = "blank = a label unique to this backend")]
         [ConfigComment("Label given to instances this backend creates, and used to find that instance again later.\nLeave blank to use a label unique to this backend (recommended) - a shared literal label across two or more Cloud Backends instances would make each backend's find-by-label step liable to attach to the other's instance instead of creating its own.")]
         public string VastAIInstance_Label = "";
-        [SuggestionPlaceholder(Text = "docker image with SwarmUI")]
-        [ConfigComment("Docker image to create the instance from. Ignored when TemplateHashId is set.")]
-        public string VastAIInstance_Image = "";
+        [ConfigComment("Docker image to create the instance from. Ignored when TemplateHashId is set.\nUse the Hartsy Vast.ai worker image (pinned to a release), which serves HTTPS and is secured with a token this backend manages.")]
+        public string VastAIInstance_Image = CloudBackendTypes.DefaultVastImage;
         [SuggestionPlaceholder(Text = "Vast.ai template hash")]
         [ConfigComment("Vast.ai template to create the instance from, instead of naming an image directly.")]
         public string VastAIInstance_TemplateHashId = "";

@@ -1,208 +1,308 @@
-using Hartsy.Extensions.CloudBackends.Core;
-using Newtonsoft.Json.Linq;
-using SwarmUI.Backends;
-using SwarmUI.Utils;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using Hartsy.Extensions.CloudBackends.Core;
+using Newtonsoft.Json.Linq;
+using SwarmUI.Backends;
+using SwarmUI.Core;
+using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.RunPod;
 
 /// <summary>
-/// <see cref="ICloudProvider"/> for RunPod Serverless endpoints.
+/// <see cref="ICloudProvider"/> for RunPod Serverless (queue) endpoints running the Hartsy RunPod worker image
+/// (github.com/HartsyAI/RunPod-Worker-SwarmUI, version 2 or later).
 ///
-/// Wakeup: POST /run with action=wakeup, poll GET /status/{jobId} until COMPLETED.
-///         The custom handler returns {public_url, session_id, worker_id} in the job output.
-/// Keepalive: Submit a separate long-running keepalive job via /run; cancel it on shutdown.
+/// A lease is one async job, <c>{"action": "lease"}</c>, handled by a streaming (generator) handler. Its first
+/// streamed output carries the worker's proxy URL and a per-lease gateway token; the job then keeps running,
+/// holding its worker, until the worker has been idle and ends it. A running lease occupies its worker, so a
+/// second queued lease is real queue pressure and RunPod's autoscaler adds a worker for it.
+/// See https://docs.runpod.io/serverless/workers/handler-functions for the streaming contract.
 /// </summary>
 public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloudProvider
 {
+    /// <summary>Shared client for RunPod's APIs.</summary>
     static readonly HttpClient Http = NetworkBackendUtils.MakeHttpClient();
 
-    readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _keepaliveJobIds = new();
+    /// <summary>The lease protocol this extension speaks. Workers older than this are refused.</summary>
+    public const int RequiredProtocol = 2;
 
+    /// <summary>Log prefix.</summary>
+    const string Tag = "[RunPodServerless]";
+
+    /// <inheritdoc/>
     public string ProviderName => "RunPod Serverless";
+
+    /// <inheritdoc/>
     public string ApiKeyType => "runpod_api";
 
-    // ── ICloudProvider ────────────────────────────────────────────────────────
-
-    public async Task<CloudWorkerInfo> WakeupWorkerAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
+    /// <inheritdoc/>
+    public void Dispose()
     {
-        string jobId = await SubmitJobAsync(new JObject { ["action"] = "wakeup" }, cancel);
-        Logs.Info($"[RunPodServerless] Wakeup job {jobId} submitted. Waiting for worker (max {maxWaitSeconds}s)...");
-        JObject output;
+    }
+
+    // ── Leases ────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public async Task<CloudWorkerInfo> AcquireWorkerAsync(LeaseRequest request, CancellationToken cancel)
+    {
+        JObject input = new()
+        {
+            ["action"] = "lease",
+            ["idle_seconds"] = request.IdleSeconds,
+            ["startup_grace_seconds"] = request.StartupGraceSeconds,
+            ["max_lease_seconds"] = request.MaxLeaseSeconds
+        };
+        string jobId = await SubmitJobAsync(input, CancellationToken.None);
+        Logs.Info($"{Tag} Lease job {jobId} submitted for endpoint {endpointId}.");
+        DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec);
+        int pollMs = Math.Clamp(request.PollIntervalMs, 1000, 5000);
+        string lastStatus = null;
+        bool withdrawn = false;
         try
         {
-            output = await WaitForJobAsync(jobId, Math.Clamp(pollIntervalMs, 1000, 10000), maxWaitSeconds, cancel);
+            while (true)
+            {
+                if (DateTime.UtcNow > deadline)
+                {
+                    throw new SwarmReadableErrorException($"No RunPod worker picked up the lease within {request.StartupTimeoutSec}s. Check the endpoint's max workers, GPU availability, and worker logs.");
+                }
+                JObject stream = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/stream/{jobId}", CancellationToken.None);
+                string status = stream["status"]?.ToString() ?? "UNKNOWN";
+                if (status != lastStatus)
+                {
+                    Logs.Debug($"{Tag} Lease job {jobId}: {status}");
+                    lastStatus = status;
+                }
+                JObject first = FirstOutput(stream);
+                if (first is not null)
+                {
+                    return ToWorker(jobId, first);
+                }
+                if (status is "COMPLETED" or "FAILED" or "CANCELLED" or "TIMED_OUT")
+                {
+                    throw await DescribeEndedJobAsync(jobId, status);
+                }
+                if (cancel.IsCancellationRequested && status is "IN_QUEUE")
+                {
+                    // Nobody needs this worker anymore and none has been assigned: withdraw it before it bills.
+                    withdrawn = true;
+                    await CancelJobAsync(jobId);
+                    Logs.Debug($"{Tag} Lease job {jobId} withdrawn while still queued.");
+                    cancel.ThrowIfCancellationRequested();
+                }
+                // Once IN_PROGRESS a worker is already assigned and billing, so it is kept (see the interface docs).
+                await Task.Delay(pollMs, Program.GlobalProgramCancel);
+            }
         }
-        catch (Exception)
+        catch (Exception) when (!withdrawn)
         {
-            // Don't leave the wakeup job queued: it would wake (and bill) a worker later with nobody listening.
             await CancelJobAsync(jobId);
             throw;
         }
-        if (output["success"]?.Value<bool>() is false)
+    }
+
+    /// <summary>The first streamed output, or null if none has arrived yet.</summary>
+    static JObject FirstOutput(JObject stream)
+    {
+        if (stream["stream"] is JArray chunks && chunks.Count > 0)
         {
-            throw new SwarmReadableErrorException($"Worker wakeup failed: {output["error"]}");
+            return chunks[0]["output"] as JObject;
         }
+        return null;
+    }
+
+    /// <summary>Validates a lease's first output and turns it into worker info.</summary>
+    CloudWorkerInfo ToWorker(string jobId, JObject output)
+    {
+        if (output["success"]?.Value<bool>() is not true)
+        {
+            throw new SwarmReadableErrorException($"RunPod worker refused the lease: {output["error"] ?? output}");
+        }
+        int protocol = output["protocol"]?.Value<int>() ?? 0;
         string publicUrl = output["public_url"]?.ToString();
-        string sessionId = output["session_id"]?.ToString();
-        if (string.IsNullOrEmpty(publicUrl) || string.IsNullOrEmpty(sessionId))
+        string token = output["token"]?.ToString();
+        if (protocol < RequiredProtocol || string.IsNullOrWhiteSpace(publicUrl) || string.IsNullOrWhiteSpace(token))
         {
-            throw new SwarmReadableErrorException($"Wakeup job completed but did not return public_url/session_id. Output: {output}");
+            throw new SwarmReadableErrorException($"The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at hartsy/swarmui-worker-runpod 2.0.0 or later.");
         }
-        Logs.Info($"[RunPodServerless] Worker ready: {output["worker_id"]} at {publicUrl}");
+        Logs.Info($"{Tag} Lease {jobId} holds worker {output["worker_id"]}.");
         return new CloudWorkerInfo
         {
-            PublicUrl = publicUrl,
-            SessionId = sessionId,
+            PublicUrl = publicUrl.TrimEnd('/'),
+            Token = token,
             WorkerId = output["worker_id"]?.ToString(),
-            Version = output["version"]?.ToString()
+            LeaseId = jobId,
+            Protocol = protocol
         };
     }
 
-    /// <summary>
-    /// Submits an additional keepalive job. Keepalive jobs are blocking and run one at a time, so a
-    /// newly submitted job queues behind the running one and seamlessly extends the worker's life.
-    ///
-    /// Deliberately does NOT cancel the currently running keepalive: RunPod terminates the worker that
-    /// is executing a cancelled job, so "cancel old, submit new" kills the worker mid-session (observed
-    /// live: worker died ~13s after such a cancel, and every later call to its proxy URL returned empty).
-    /// Outstanding jobs are cancelled only by <see cref="StopKeepaliveAsync"/>, where ending the worker
-    /// is the desired outcome.
-    /// </summary>
-    public async Task<bool> StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
+    /// <summary>Builds a readable error for a lease job that ended before streaming a worker.</summary>
+    async Task<Exception> DescribeEndedJobAsync(string jobId, string status)
+    {
+        JObject job = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{jobId}", CancellationToken.None);
+        // Aggregated streaming jobs report output as an array of chunks; plain jobs as one object.
+        JToken output = job["output"];
+        string error = job["error"]?.ToString() ?? (output as JObject)?["error"]?.ToString() ?? ((output as JArray)?.FirstOrDefault() as JObject)?["error"]?.ToString();
+        if (error is not null && error.Contains("Unknown action", StringComparison.OrdinalIgnoreCase))
+        {
+            return new SwarmReadableErrorException("The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at hartsy/swarmui-worker-runpod 2.0.0 or later.");
+        }
+        return new SwarmReadableErrorException($"RunPod lease job {jobId} ended ({status}) before a worker was ready{(error is null ? "." : $": {error}")}");
+    }
+
+    /// <inheritdoc/>
+    public async Task<bool> IsLeaseActiveAsync(CloudWorkerInfo worker, CancellationToken cancel)
     {
         try
         {
-            string jobId = await SubmitJobAsync(new JObject { ["action"] = "keepalive", ["duration"] = durationSeconds, ["interval"] = 30 }, cancel);
-            _keepaliveJobIds[jobId] = 0;
-            Logs.Debug($"[RunPodServerless] Keepalive job submitted: {jobId} (duration: {durationSeconds}s, outstanding: {_keepaliveJobIds.Count})");
+            JObject job = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{worker.LeaseId}", cancel);
+            return job["status"]?.ToString() is "IN_PROGRESS" or "IN_QUEUE";
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A status check failing is not evidence the worker is gone. The generations themselves will tell.
+            Logs.Debug($"{Tag} Lease status check failed for {worker.LeaseId}: {ex.Message}");
             return true;
         }
-        catch (Exception ex) { Logs.Warning($"[RunPodServerless] Failed to submit keepalive job (worker may scale down early): {ex.Message}"); return false; }
     }
 
-    public async Task StopKeepaliveAsync()
+    /// <inheritdoc/>
+    /// <remarks>The worker ends its own lease when idle, so there is nothing to renew.</remarks>
+    public Task RenewLeaseAsync(CloudWorkerInfo worker, CancellationToken cancel)
     {
-        foreach (string jobId in _keepaliveJobIds.Keys.ToArray())
-        {
-            if (_keepaliveJobIds.TryRemove(jobId, out _))
-            {
-                Logs.Debug($"[RunPodServerless] Cancelling keepalive job {jobId}...");
-                await CancelJobAsync(jobId);
-            }
-        }
+        return Task.CompletedTask;
     }
 
-    public void Dispose()
+    /// <inheritdoc/>
+    /// <remarks>Cancelling a running RunPod job stops the worker running it, which is exactly what releasing means here.</remarks>
+    public Task ReleaseLeaseAsync(CloudWorkerInfo worker)
     {
-        // Backend Shutdown() already awaited StopKeepaliveAsync; this is a best-effort backstop.
-        // Fire-and-forget instead of sync-over-async to avoid deadlock risk.
-        foreach (string jobId in _keepaliveJobIds.Keys.ToArray())
-        {
-            if (_keepaliveJobIds.TryRemove(jobId, out _)) { _ = CancelJobAsync(jobId); }
-        }
+        return CancelJobAsync(worker.LeaseId);
     }
 
+    // ── Validation ────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
     public async Task ValidateAsync(CancellationToken cancel = default)
     {
         if (string.IsNullOrWhiteSpace(endpointId))
         {
             throw new SwarmReadableErrorException("No RunPod serverless endpoint ID is set. Set 'EndpointId' in the backend settings.");
         }
-        JObject health = await GetHealthAsync(cancel);
-        Logs.Debug($"[RunPodServerless] Endpoint {endpointId} health: workers={health["workers"]?.ToString(Newtonsoft.Json.Formatting.None)}, jobs={health["jobs"]?.ToString(Newtonsoft.Json.Formatting.None)}");
+        JObject health = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/health", cancel);
+        Logs.Debug($"{Tag} Endpoint {endpointId} health: workers={health["workers"]?.ToString(Newtonsoft.Json.Formatting.None)}, jobs={health["jobs"]?.ToString(Newtonsoft.Json.Formatting.None)}");
     }
 
-    // ── RunPod REST API helpers ───────────────────────────────────────────────
-
-    /// <summary>Submit an async job to the RunPod endpoint. Returns job ID immediately.</summary>
-    public async Task<string> SubmitJobAsync(JObject input, CancellationToken cancel = default)
+    /// <inheritdoc/>
+    public async Task<JArray> CheckEndpointAsync(LeaseRequest request, int maxWorkers, CancellationToken cancel)
     {
-        string url = $"https://api.runpod.ai/v2/{endpointId}/run";
+        JArray findings = [];
+        JObject endpoint = await GetJsonAsync($"https://rest.runpod.io/v1/endpoints/{endpointId}?includeTemplate=true", cancel);
+        int workersMax = endpoint["workersMax"]?.Value<int>() ?? 0;
+        long executionTimeoutMs = endpoint["executionTimeoutMs"]?.Value<long>() ?? 0;
+        string image = endpoint["template"]?["imageName"]?.ToString() ?? "";
+        if (executionTimeoutMs > 0 && executionTimeoutMs / 1000 <= request.MaxLeaseSeconds)
+        {
+            findings.Add(Finding("error", $"The endpoint's execution timeout ({executionTimeoutMs / 1000}s) must be longer than Max Lease Seconds ({request.MaxLeaseSeconds}s), or RunPod will stop workers mid-lease. Raise it on the endpoint to at least {request.MaxLeaseSeconds + 300}s."));
+        }
+        if (workersMax > 0 && workersMax < maxWorkers)
+        {
+            findings.Add(Finding("warning", $"Max Workers is {maxWorkers}, but the endpoint allows only {workersMax}. Scaling will stop at {workersMax}."));
+        }
+        if (image.Length > 0 && !image.Contains("swarmui-worker-runpod", StringComparison.OrdinalIgnoreCase))
+        {
+            findings.Add(Finding("warning", $"The endpoint runs '{image}', not the Hartsy RunPod worker (hartsy/swarmui-worker-runpod). Other images will not answer lease requests."));
+        }
+        if (image.EndsWith(":latest", StringComparison.OrdinalIgnoreCase) || (image.Length > 0 && !image.Contains(':')))
+        {
+            findings.Add(Finding("warning", $"The endpoint's image '{image}' is not pinned to a version. Pin a release tag so workers do not change underneath you."));
+        }
+        return findings;
+    }
+
+    /// <summary>Builds one validation finding.</summary>
+    static JObject Finding(string level, string message)
+    {
+        return new JObject { ["level"] = level, ["message"] = message };
+    }
+
+    // ── RunPod API ────────────────────────────────────────────────────────────
+
+    /// <summary>Submits an async job and returns its ID.</summary>
+    async Task<string> SubmitJobAsync(JObject input, CancellationToken cancel)
+    {
         JObject payload = new() { ["input"] = input };
-        using HttpRequestMessage request = new(HttpMethod.Post, url)
-        {
-            Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
-        };
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        Logs.Debug($"[RunPodServerless] POST /run (action: {input["action"]})");
-        using HttpResponseMessage response = await Http.SendAsync(request, cancel);
-        if (!response.IsSuccessStatusCode)
-        {
-            string error = await response.Content.ReadAsStringAsync(cancel);
-            throw new HttpRequestException($"RunPod /run failed ({response.StatusCode}): {error}");
-        }
-        JObject result = JObject.Parse(await response.Content.ReadAsStringAsync(cancel));
-        string jobId = result["id"]?.ToString();
-        if (string.IsNullOrEmpty(jobId)) { throw new Exception($"RunPod /run did not return a job ID. Response: {result}"); }
-        Logs.Debug($"[RunPodServerless] Job submitted: {jobId}");
-        return jobId;
+        using HttpResponseMessage response = await HttpRetry.SendAsync(Http, () => Request(HttpMethod.Post, $"https://api.runpod.ai/v2/{endpointId}/run", payload), Tag, cancel);
+        JObject result = await ReadJsonAsync(response, "/run", cancel);
+        return result["id"]?.ToString() ?? throw new SwarmReadableErrorException($"RunPod did not return a job ID for the lease request.");
     }
 
-    /// <summary>Poll GET /status/{jobId} until the job is COMPLETED or FAILED.</summary>
-    public async Task<JObject> WaitForJobAsync(string jobId, int pollIntervalMs, int timeoutSec, CancellationToken cancel = default)
+    /// <summary>GETs a RunPod API URL as JSON, with readable errors.</summary>
+    async Task<JObject> GetJsonAsync(string url, CancellationToken cancel)
     {
-        DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
-        string lastStatus = "";
-        while (DateTime.UtcNow < deadline)
-        {
-            cancel.ThrowIfCancellationRequested();
-            string url = $"https://api.runpod.ai/v2/{endpointId}/status/{jobId}";
-            using HttpRequestMessage req = new(HttpMethod.Get, url);
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-            using HttpResponseMessage res = await Http.SendAsync(req, cancel);
-            JObject result = JObject.Parse(await res.Content.ReadAsStringAsync(cancel));
-            string status = result["status"]?.ToString() ?? "UNKNOWN";
-            if (status != lastStatus)
-            {
-                int elapsed = (int)(DateTime.UtcNow - deadline.AddSeconds(-timeoutSec)).TotalSeconds;
-                Logs.Info($"[RunPodServerless] Job {jobId}: {status} (after {elapsed}s)");
-                lastStatus = status;
-            }
-            if (status is "COMPLETED") { return result["output"] as JObject ?? new JObject(); }
-            if (status is "FAILED") { throw new SwarmReadableErrorException($"RunPod job {jobId} failed: {result["error"]}"); }
-            if (status is "CANCELLED" or "TIMED_OUT") { throw new SwarmReadableErrorException($"RunPod job {jobId} ended without completing: {status}"); }
-            await Task.Delay(pollIntervalMs, cancel);
-        }
-        throw new TimeoutException($"RunPod job {jobId} did not complete within {timeoutSec}s");
+        using HttpResponseMessage response = await HttpRetry.SendAsync(Http, () => Request(HttpMethod.Get, url, null), Tag, cancel);
+        return await ReadJsonAsync(response, new Uri(url).AbsolutePath, cancel);
     }
 
-    /// <summary>GET /health for the endpoint. Throws readable errors on bad key (401) or unknown endpoint (404).</summary>
-    public async Task<JObject> GetHealthAsync(CancellationToken cancel = default)
+    /// <summary>Cancels a job. Best-effort: never throws.</summary>
+    public async Task CancelJobAsync(string jobId)
     {
-        string url = $"https://api.runpod.ai/v2/{endpointId}/health";
-        using HttpRequestMessage req = new(HttpMethod.Get, url);
-        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        using HttpResponseMessage res = await Http.SendAsync(req, cancel);
-        if (res.StatusCode is System.Net.HttpStatusCode.Unauthorized)
+        if (string.IsNullOrEmpty(jobId))
         {
-            throw new SwarmReadableErrorException("RunPod API key was rejected (401). Check your key in User Settings -> API Keys.");
+            return;
         }
-        if (res.StatusCode is System.Net.HttpStatusCode.NotFound)
-        {
-            throw new SwarmReadableErrorException($"RunPod endpoint '{endpointId}' not found (404). Check the EndpointId backend setting.");
-        }
-        if (!res.IsSuccessStatusCode)
-        {
-            throw new SwarmReadableErrorException($"RunPod /health for endpoint '{endpointId}' failed: {res.StatusCode}");
-        }
-        return JObject.Parse(await res.Content.ReadAsStringAsync(cancel));
-    }
-
-    /// <summary>Cancel a queued or running job. Best-effort - does not throw.</summary>
-    public async Task CancelJobAsync(string jobId, CancellationToken cancel = default)
-    {
-        if (string.IsNullOrEmpty(jobId)) { return; }
         try
         {
-            string url = $"https://api.runpod.ai/v2/{endpointId}/cancel/{jobId}";
-            using HttpRequestMessage req = new(HttpMethod.Post, url);
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-            await Http.SendAsync(req, cancel);
-            Logs.Debug($"[RunPodServerless] Cancelled job {jobId}");
+            using HttpResponseMessage response = await HttpRetry.SendAsync(Http, () => Request(HttpMethod.Post, $"https://api.runpod.ai/v2/{endpointId}/cancel/{jobId}", null), Tag, CancellationToken.None);
+            Logs.Debug($"{Tag} Cancelled job {jobId} ({(int)response.StatusCode}).");
         }
-        catch (Exception ex) { Logs.Verbose($"[RunPodServerless] Cancel failed for {jobId}: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Verbose($"{Tag} Cancel failed for {jobId}: {ex.Message}");
+        }
+    }
+
+    /// <summary>Builds an authenticated request.</summary>
+    HttpRequestMessage Request(HttpMethod method, string url, JObject body)
+    {
+        HttpRequestMessage request = new(method, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        if (body is not null)
+        {
+            request.Content = new StringContent(body.ToString(), Encoding.UTF8, "application/json");
+        }
+        return request;
+    }
+
+    /// <summary>Reads a JSON response, turning RunPod's error statuses into readable messages.</summary>
+    async Task<JObject> ReadJsonAsync(HttpResponseMessage response, string what, CancellationToken cancel)
+    {
+        string text = await response.Content.ReadAsStringAsync(cancel);
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw new SwarmReadableErrorException("RunPod rejected the API key (401/403). Check your key in User Settings, API Keys.");
+        }
+        if (response.StatusCode is HttpStatusCode.NotFound)
+        {
+            throw new SwarmReadableErrorException($"RunPod endpoint '{endpointId}' was not found. Check the Endpoint ID setting.");
+        }
+        if (response.StatusCode is HttpStatusCode.TooManyRequests)
+        {
+            throw new SwarmReadableErrorException("RunPod is rate limiting this account. Wait a minute and try again.");
+        }
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new SwarmReadableErrorException($"RunPod API {what} failed ({(int)response.StatusCode}): {text[..Math.Min(text.Length, 300)]}");
+        }
+        try
+        {
+            return JObject.Parse(text);
+        }
+        catch (Newtonsoft.Json.JsonException)
+        {
+            throw new SwarmReadableErrorException($"RunPod API {what} returned something that is not JSON.");
+        }
     }
 }

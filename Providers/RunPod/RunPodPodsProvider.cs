@@ -35,6 +35,9 @@ public class RunPodPodPlan
     public string TemplateId = "";
     public string Env = "";
 
+    /// <summary>Gateway token for the pod's SwarmUI worker, injected as SWARMUI_WORKER_TOKEN when creating it.</summary>
+    public string WorkerToken = "";
+
     /// <summary>If true the pod is destroyed on shutdown; if false it is only stopped, so it can resume.</summary>
     public bool TerminateOnShutdown = false;
 }
@@ -185,7 +188,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         string publicUrl = $"https://{podId}-{plan.SwarmUIPort}.proxy.runpod.net";
         // Wait for SwarmUI itself, not just the pod: the proxy answers 502 while the container boots,
         // and handing an unready URL to the Swarm backend would just make it fail its own connect.
-        await Api.WaitForSwarmAsync(publicUrl, deadline, $"Check that SwarmUI is installed in the pod and listening on port {plan.SwarmUIPort}, and that the port is exposed as http.", cancel);
+        await Api.WaitForSwarmAsync(publicUrl, deadline, $"Check that the pod runs the Hartsy RunPod worker image and that port {plan.SwarmUIPort} is exposed as http.", cancel, NullIfEmpty(plan.WorkerToken));
         // Cast, don't chain ?.: RunPod sends "gpu" as JSON null (not omitted) in early pod states, and a
         // JValue holding null still throws on `?[...]` (only a C#-null JToken reference short-circuits).
         string gpu = (pod?["gpu"] as JObject)?["id"]?.ToString();
@@ -338,6 +341,15 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             };
         }
         JObject env = CloudApiClient.ParseEnv(plan.Env);
+        if (!string.IsNullOrWhiteSpace(plan.WorkerToken))
+        {
+            env["SWARMUI_WORKER_TOKEN"] = plan.WorkerToken;
+        }
+        // Tells the worker image where the volume (and so the models) is mounted.
+        if (env["VOLUME_PATH"] is null && !string.IsNullOrWhiteSpace(plan.VolumeMountPath))
+        {
+            env["VOLUME_PATH"] = plan.VolumeMountPath;
+        }
         if (env.HasValues) { body["env"] = env; }
         return body;
     }
@@ -535,5 +547,37 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     public Task<JToken> ApiAsync(HttpMethod method, string path, JObject body, CancellationToken cancel = default, bool allowNotFound = false)
     {
         return Api.ApiAsync(method, path, body, cancel, allowNotFound);
+    }
+
+    /// <summary>Null for an empty string.</summary>
+    static string NullIfEmpty(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
+
+    /// <summary>Name prefix of every pod this extension creates, used to recognise its orphans.</summary>
+    public const string ManagedNamePrefix = "swarmui-cloudbackends";
+
+    /// <summary>Running pods on the account that this extension created, as <c>{id, name, status, cost_per_hr}</c>.</summary>
+    public async Task<List<JObject>> ListManagedRunningAsync(CancellationToken cancel = default)
+    {
+        List<JObject> result = [];
+        foreach (JObject pod in (await ListPodsAsync(cancel)).OfType<JObject>())
+        {
+            string name = pod["name"]?.ToString() ?? "";
+            string status = pod["desiredStatus"]?.ToString() ?? "";
+            if (name.StartsWith(ManagedNamePrefix, StringComparison.OrdinalIgnoreCase) && status == "RUNNING")
+            {
+                result.Add(new JObject { ["id"] = pod["id"], ["name"] = name, ["status"] = status, ["cost_per_hr"] = pod["costPerHr"] });
+            }
+        }
+        return result;
+    }
+
+    /// <summary>Stops any pod on the account by ID (orphan cleanup). Keeps its disk.</summary>
+    public async Task StopPodByIdAsync(string podId, CancellationToken cancel = default)
+    {
+        Logs.Info($"[RunPodPods] Stopping pod '{podId}' on request...");
+        await ApiAsync(HttpMethod.Post, $"/pods/{podId}/action", new JObject { ["action"] = "stop" }, cancel, allowNotFound: true);
     }
 }

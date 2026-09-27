@@ -103,6 +103,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
             CloudType = config.CloudType,
             DataCenterId = config.DataCenterId?.Trim() ?? "",
             Env = config.PodEnv ?? "",
+            WorkerToken = WorkerToken ?? "",
             TerminateOnShutdown = config.TerminateOnShutdown
         });
     }

@@ -62,6 +62,16 @@ public class CloudBackendsExtension : Extension
 
     // ── Extension lifecycle ───────────────────────────────────────────────────
 
+    public CloudBackendsExtension()
+    {
+        // Shown in the Extensions tab until the repo is on the official extension list, which then takes over.
+        ExtensionAuthor = "Hartsy";
+        Description = "Run SwarmUI generations on RunPod and Vast.ai GPUs, on demand: serverless workers that start when you generate, scale out under load, and shut down when idle, plus rented pods and instances.";
+        License = "MIT";
+        ReadmeURL = "https://github.com/HartsyAI/SwarmUI-CloudBackends";
+        Tags = ["backend", "paid", "cloud"];
+    }
+
     public override void OnPreInit()
     {
         Logs.Init("Initializing Hartsy's Cloud Backends Extension...");

@@ -289,7 +289,7 @@ class CloudBackendsHelper {
                 header.appendChild(headerToggle);
             }
             let actions = createDiv(null, `cloudbackends-provider-actions cloudbackends-actions-${provider.prefix.slice(0, -1).toLowerCase()}`);
-            let instanceControls = provider.is_instance ? this.setupInstanceActions(actions, backendId, provider) : null;
+            let instanceControls = provider.is_instance ? this.setupInstanceActions(actions, backendId, provider) : this.setupServerlessActions(actions, backendId, provider);
             let statusLoadedOnce = false;
             header.addEventListener('click', () => {
                 let opening = body.style.display == 'none';
@@ -312,6 +312,7 @@ class CloudBackendsHelper {
             }
             body.appendChild(actions);
         }
+        this.setupOrphanNotice(cardBody);
     }
 
     // ── Instance actions (Start/Stop/status) ─────────────────────────────────
@@ -431,6 +432,150 @@ class CloudBackendsHelper {
                 0, e => setBusy(false, `Status: stop failed - ${e}`));
         });
         return { refresh };
+    }
+
+    // ── Serverless actions (workers, discover, validate) ─────────────────────
+
+    /**
+     * Builds the controls for a serverless section: the live list of leased workers (each with a Stop
+     * button), Discover models, and Validate. Everything goes through the extension's API routes.
+     * Returns { refresh() }, called on first expand so a collapsed section never calls the provider.
+     */
+    setupServerlessActions(actionsDiv, backendId, provider) {
+        let discoverButton = document.createElement('button');
+        discoverButton.className = 'basic-button cloudbackends-discover';
+        discoverButton.innerText = 'Discover models';
+        discoverButton.title = 'Starts a worker (billed) and learns which models it has. Needed once per endpoint if you have none of its models locally.';
+        let validateButton = document.createElement('button');
+        validateButton.className = 'basic-button cloudbackends-validate';
+        validateButton.innerText = 'Validate';
+        validateButton.title = 'Checks the endpoint\'s settings on the provider against this card. Costs nothing.';
+        let refreshButton = document.createElement('button');
+        refreshButton.className = 'basic-button cloudbackends-refresh';
+        refreshButton.innerText = 'Refresh';
+        let statusLine = createDiv(null, 'cloudbackends-pod-status');
+        statusLine.innerText = 'Workers: expand to load';
+        let workerList = createDiv(null, 'cloudbackends-worker-list');
+        actionsDiv.appendChild(discoverButton);
+        actionsDiv.appendChild(validateButton);
+        actionsDiv.appendChild(refreshButton);
+        actionsDiv.appendChild(statusLine);
+        actionsDiv.appendChild(workerList);
+        let refresh = () => {
+            genericRequest('CloudListWorkers', { 'backend_id': `${backendId}`, 'provider': provider.prefix }, data => {
+                this.renderWorkers(workerList, statusLine, backendId, data.backends || [], refresh);
+            }, 0, e => {
+                statusLine.innerText = `Workers: ${e}`;
+            });
+        };
+        discoverButton.addEventListener('click', () => {
+            if (!confirm('Discover models starts a worker if none is running, which bills until it goes idle. Continue?')) {
+                return;
+            }
+            discoverButton.disabled = true;
+            statusLine.innerText = 'Discovering models (a cold start can take a few minutes)...';
+            genericRequest('CloudRefreshModels', {}, data => {
+                discoverButton.disabled = false;
+                statusLine.innerText = data.message || 'Models discovered.';
+                refresh();
+            }, 0, e => {
+                discoverButton.disabled = false;
+                statusLine.innerText = `Discover failed: ${e}`;
+            });
+        });
+        validateButton.addEventListener('click', () => {
+            statusLine.innerText = 'Validating...';
+            genericRequest('CloudValidateBackend', { 'backend_id': `${backendId}` }, data => {
+                let lines = [];
+                for (let result of data.results || []) {
+                    for (let finding of result.findings || []) {
+                        lines.push(`${result.provider}: ${finding.level}: ${finding.message}`);
+                    }
+                }
+                statusLine.innerText = lines.length == 0 ? 'Validate: no problems found.' : lines.join('\n');
+            }, 0, e => {
+                statusLine.innerText = `Validate failed: ${e}`;
+            });
+        });
+        refreshButton.addEventListener('click', () => refresh());
+        return { refresh };
+    }
+
+    /** Renders the leased-worker list for one serverless section. */
+    renderWorkers(listDiv, statusLine, backendId, backends, refresh) {
+        listDiv.innerHTML = '';
+        let total = 0;
+        for (let backend of backends) {
+            for (let worker of backend.workers || []) {
+                total++;
+                let row = createDiv(null, 'cloudbackends-worker-row');
+                let label = document.createElement('span');
+                label.innerText = `${worker.worker_id} · ${worker.in_use ? 'generating' : 'idle'} · up ${this.formatDuration(worker.age_seconds)}`;
+                let stop = document.createElement('button');
+                stop.className = 'basic-button cloudbackends-worker-stop';
+                stop.innerText = 'Stop';
+                stop.addEventListener('click', () => {
+                    if (!confirm(`Release worker ${worker.worker_id} now? Anything it is generating fails.`)) {
+                        return;
+                    }
+                    stop.disabled = true;
+                    genericRequest('CloudStopWorker', { 'backend_id': `${backendId}`, 'worker_id': worker.worker_id }, () => refresh(), 0, e => {
+                        stop.disabled = false;
+                        statusLine.innerText = `Stop failed: ${e}`;
+                    });
+                });
+                row.appendChild(label);
+                row.appendChild(stop);
+                listDiv.appendChild(row);
+            }
+        }
+        let starting = backends.reduce((sum, b) => sum + (b.workers_starting || 0), 0);
+        let max = backends.reduce((sum, b) => sum + (b.max_workers || 0), 0);
+        statusLine.innerText = total == 0 && starting == 0 ? 'Workers: none running (they start when you generate).' : `Workers: ${total} running${starting ? `, ${starting} starting` : ''} (max ${max}).`;
+    }
+
+    // ── Orphans ──────────────────────────────────────────────────────────────
+
+    /** Shows a notice on the card if the user has pods/instances this extension created that nothing has attached. */
+    setupOrphanNotice(cardBody) {
+        if (cardBody.querySelector('.cloudbackends-orphans')) {
+            return;
+        }
+        let notice = createDiv(null, 'cloudbackends-orphans');
+        notice.style.display = 'none';
+        cardBody.prepend(notice);
+        let load = () => {
+            genericRequest('CloudListOrphans', {}, data => {
+                let orphans = data.orphans || [];
+                notice.innerHTML = '';
+                notice.style.display = orphans.length == 0 ? 'none' : 'block';
+                if (orphans.length == 0) {
+                    return;
+                }
+                let title = createDiv(null, 'cloudbackends-orphans-title');
+                title.innerText = `${orphans.length} cloud machine(s) created by Cloud Backends are running but not attached to any card. They bill until stopped.`;
+                notice.appendChild(title);
+                for (let orphan of orphans) {
+                    let row = createDiv(null, 'cloudbackends-worker-row');
+                    let label = document.createElement('span');
+                    label.innerText = `${orphan.provider}: ${orphan.name} (${orphan.id})${orphan.cost_per_hr ? ` · $${(+orphan.cost_per_hr).toFixed(2)}/hr` : ''}`;
+                    let stop = document.createElement('button');
+                    stop.className = 'basic-button cloudbackends-worker-stop';
+                    stop.innerText = 'Stop';
+                    stop.addEventListener('click', () => {
+                        stop.disabled = true;
+                        genericRequest('CloudStopOrphan', { 'provider': orphan.provider, 'resource_id': orphan.id }, () => load(), 0, e => {
+                            stop.disabled = false;
+                            label.innerText += ` · stop failed: ${e}`;
+                        });
+                    });
+                    row.appendChild(label);
+                    row.appendChild(stop);
+                    notice.appendChild(row);
+                }
+            }, 0, e => console.log(`[CloudBackends] Could not check for orphaned instances: ${e}`));
+        };
+        load();
     }
 }
 

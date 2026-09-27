@@ -178,6 +178,12 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// </summary>
     protected string PersistedInstanceId { get; private set; }
 
+    /// <summary>
+    /// The gateway token for this owner's instance, created once and remembered alongside the instance ID so a
+    /// restart can reattach. Injected into instances this backend creates, and sent by the attached child. Never logged.
+    /// </summary>
+    protected string WorkerToken;
+
     /// <summary>Remembers the provider's active instance ID in the owner's user data (no-op if unchanged or unknown).</summary>
     void PersistActiveInstanceId()
     {
@@ -204,6 +210,12 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend has no valid owner user ('{OwnerUserId}').");
             apiKey = GetApiKey(owner);
             PersistedInstanceId = owner.GetGenericData("cloudbackends", PersistName)?.Trim();
+            WorkerToken = owner.GetGenericData("cloudbackends", $"{PersistName}_token")?.Trim();
+            if (string.IsNullOrWhiteSpace(WorkerToken))
+            {
+                WorkerToken = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(36)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+                owner.SaveGenericData("cloudbackends", $"{PersistName}_token", WorkerToken);
+            }
         }
         catch (Exception ex)
         {
@@ -294,7 +306,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     internal void AttachChildBackend()
     {
         string title = $"[{Provider.ProviderName} {CurrentInstance.InstanceId}] {(string.IsNullOrWhiteSpace(CurrentInstance.Description) ? "Cloud Instance" : CurrentInstance.Description)}";
-        ChildBackend = CloudChildBackend.Attach(this, CurrentInstance.PublicUrl, title, InstanceConfig.StartupTimeoutSec);
+        ChildBackend = CloudChildBackend.Attach(this, GetChildAddress(CurrentInstance.PublicUrl), title, InstanceConfig.StartupTimeoutSec, $"Bearer {WorkerToken}");
         Logs.Info($"[{Provider.ProviderName}] Attached Swarm backend #{ChildBackend.ID} to instance '{CurrentInstance.InstanceId}'.");
     }
 
@@ -302,6 +314,18 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// <remarks>A rented instance bills for wall-clock time until it is stopped, so generation activity
     /// changes nothing about its lifetime. Only serverless has anything to do here.</remarks>
     public Task OnChildGenerationStartingAsync() => Task.CompletedTask;
+
+    /// <summary>The address the child connects to for an instance URL. Vast.ai overrides this with a TLS relay.</summary>
+    protected virtual string GetChildAddress(string publicUrl)
+    {
+        return publicUrl;
+    }
+
+    /// <summary>Called after the child is detached, to free anything <see cref="GetChildAddress"/> created.</summary>
+    protected virtual Task OnChildDetachedAsync()
+    {
+        return Task.CompletedTask;
+    }
 
     /// <summary>Removes the child backend and releases the cloud instance.</summary>
     public async Task StopInstanceAsync()
@@ -314,6 +338,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
                 BackendHandler.BackendData child = ChildBackend;
                 ChildBackend = null;
                 await CloudChildBackend.DetachAsync(Handler, child, Provider?.ProviderName);
+                await OnChildDetachedAsync();
             }
             if (Provider is not null && CurrentInstance is not null)
             {

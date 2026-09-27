@@ -80,6 +80,7 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
             NetworkVolumeId = config.NetworkVolumeId?.Trim() ?? "",
             VolumeMountPath = config.VolumeMountPath?.Trim() ?? "/workspace",
             Env = config.Env ?? "",
+            WorkerToken = WorkerToken ?? "",
             TerminateOnShutdown = config.TerminateOnShutdown
         });
     }
@@ -109,6 +110,32 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         if (string.IsNullOrWhiteSpace(config.InstanceId) && string.IsNullOrWhiteSpace(config.Image) && string.IsNullOrWhiteSpace(config.TemplateHashId))
         {
             throw new SwarmReadableErrorException("Nothing to start. Set 'InstanceId' to use an existing instance, or set an 'Image' (or 'TemplateHashId') so one can be created.");
+        }
+    }
+
+    /// <summary>The TLS relay to the current instance, if any.</summary>
+    VastTlsRelay Relay;
+
+    /// <inheritdoc/>
+    /// <remarks>Vast instances serve HTTPS with Vast's own CA, which the child cannot verify; it goes through a pinned relay.</remarks>
+    protected override string GetChildAddress(string publicUrl)
+    {
+        if (!publicUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            return publicUrl;
+        }
+        Relay = new VastTlsRelay(publicUrl);
+        return Relay.LocalUrl;
+    }
+
+    /// <inheritdoc/>
+    protected override async Task OnChildDetachedAsync()
+    {
+        VastTlsRelay relay = Relay;
+        Relay = null;
+        if (relay is not null)
+        {
+            await relay.DisposeAsync();
         }
     }
 }

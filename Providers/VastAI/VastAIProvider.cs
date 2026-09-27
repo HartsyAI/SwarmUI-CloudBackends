@@ -1,267 +1,444 @@
-using Hartsy.Extensions.CloudBackends.Core;
-using Newtonsoft.Json.Linq;
-using SwarmUI.Backends;
-using SwarmUI.Utils;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using Hartsy.Extensions.CloudBackends.Core;
+using Newtonsoft.Json.Linq;
+using SwarmUI.Backends;
+using SwarmUI.Core;
+using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
 
 /// <summary>
-/// <see cref="ICloudProvider"/> for Vast.ai serverless endpoints.
+/// <see cref="ICloudProvider"/> for Vast.ai Serverless endpoints running the Hartsy Vast worker image
+/// (github.com/HartsyAI/Vast-Worker-SwarmUI).
 ///
-/// Vast routing is a control plane only: POST https://run.vast.ai/route/ asks the serverless engine for a
-/// worker and returns a signed grant, after which the client talks straight to the worker's IP and port.
-/// There is no proxy or tunnel in the data path.
+/// A lease is a native Vast <b>session</b>, created the way Vast's own client SDK does it
+/// (vastai/serverless/client/client.py <c>start_endpoint_session</c>): <c>/route/</c> for a signed grant, then
+/// <c>/session/create</c> on the worker. The session counts as that worker's load and each worker takes one,
+/// so further sessions route to or recruit other workers. The worker's <c>/lease</c> route then returns its
+/// HTTPS gateway address and a per-lease token.
 ///
-/// Requests to a worker carry the envelope { auth_data, session_id, payload }. The grant returned by
-/// /route/ is forwarded as auth_data verbatim, because its signature covers those exact fields.
-///
-/// The route the worker exposes and the shape of payload are defined by the worker image, not by Vast.
-/// This provider targets the handler in workers/vastai/vast_worker.py, a real vastai-SDK PyWorker
-/// (not a bespoke HTTP server - that's what actually registers with Vast's autoscaler and makes the
-/// worker routable at all). It serves the configured route and answers with
-/// { success, public_url, session_id, worker_id, version }.
+/// Vast adds a full lifetime to a session's expiry on every request made with it, so renewal is conditional:
+/// only when the remaining time falls below half a lifetime. When the client stops renewing, the session
+/// expires, the worker revokes the token, and Vast scales the worker down.
 /// </summary>
-public class VastAIProvider(string apiKey, string endpointName, string workerRoute = "handler") : ICloudProvider
+public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
 {
+    /// <summary>Client for Vast's control plane (system trust store).</summary>
     static readonly HttpClient Http = NetworkBackendUtils.MakeHttpClient();
+
+    /// <summary>Vast's serverless routing base URL.</summary>
     const string RouteBase = "https://run.vast.ai";
+
+    /// <summary>Vast's console API base URL.</summary>
     const string ConsoleBase = "https://console.vast.ai";
 
-    /// <summary>
-    /// Per-endpoint key used for /route/ calls. Vast issues one key per serverless endpoint, which is
-    /// what the routing engine expects; the account key is only used to look it up.
-    /// </summary>
-    string _endpointApiKey;
+    /// <summary>Load one session represents. Matches the worker's calibration (lease_controller.SESSION_COST).</summary>
+    public const int SessionCost = 100;
 
+    /// <summary>The lease protocol this extension speaks.</summary>
+    public const int RequiredProtocol = 2;
+
+    /// <summary>Log prefix.</summary>
+    const string Tag = "[VastAI]";
+
+    /// <summary>Per-endpoint key used for /route/, looked up once by endpoint name.</summary>
+    string EndpointApiKey;
+
+    /// <summary>TLS relays per lease, disposed when the lease is released.</summary>
+    readonly ConcurrentDictionary<string, VastTlsRelay> Relays = new();
+
+    /// <inheritdoc/>
     public string ProviderName => "Vast.ai";
+
+    /// <inheritdoc/>
     public string ApiKeyType => "vastai_api";
 
-    // ── ICloudProvider ────────────────────────────────────────────────────────
+    // ── Leases ────────────────────────────────────────────────────────────────
 
+    /// <inheritdoc/>
+    public async Task<CloudWorkerInfo> AcquireWorkerAsync(LeaseRequest request, CancellationToken cancel)
+    {
+        await ResolveEndpointKeyAsync(cancel);
+        DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec);
+        int pollMs = Math.Clamp(request.PollIntervalMs, 1000, 15000);
+        // request_idx holds our place in the engine's queue; dropping it on a retry sends us to the back.
+        int requestIdx = 0;
+        string lastStatus = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            // Before a session exists nothing is held for us, so withdrawing is just stopping.
+            cancel.ThrowIfCancellationRequested();
+            JObject grant = await RouteAsync(requestIdx, cancel);
+            requestIdx = grant["request_idx"]?.Value<int>() ?? requestIdx;
+            string workerUrl = grant["url"]?.ToString();
+            if (string.IsNullOrWhiteSpace(workerUrl))
+            {
+                string status = grant["status"]?.ToString() ?? "waiting";
+                if (status != lastStatus)
+                {
+                    Logs.Info($"{Tag} Waiting for a worker on endpoint '{endpointName}' (engine status: {status})...");
+                    lastStatus = status;
+                }
+                await Task.Delay(pollMs, cancel);
+                continue;
+            }
+            JObject session = await CreateSessionAsync(workerUrl, grant, request.IdleSeconds);
+            if (session is null)
+            {
+                // That worker already holds a session: ask the engine again, which routes elsewhere or recruits.
+                requestIdx = 0;
+                await Task.Delay(pollMs, cancel);
+                continue;
+            }
+            CloudWorkerInfo worker = new()
+            {
+                LeaseId = session["session_id"].ToString(),
+                SessionAuth = grant,
+                LeaseLifetime = request.IdleSeconds
+            };
+            try
+            {
+                JObject lease = await LeaseCallAsync(workerUrl, worker);
+                ApplyLease(worker, lease);
+                await RefreshExpirationAsync(worker, CancellationToken.None);
+                Logs.Info($"{Tag} Session {worker.LeaseId} holds worker {worker.WorkerId}.");
+                return worker;
+            }
+            catch (Exception)
+            {
+                await ReleaseLeaseAsync(worker);
+                throw;
+            }
+        }
+        throw new SwarmReadableErrorException($"No Vast.ai worker became available for endpoint '{endpointName}' within {request.StartupTimeoutSec}s (last engine status: {lastStatus ?? "unknown"}). Check the endpoint's max workers and that its workergroup can find matching offers.");
+    }
+
+    /// <summary>Opens a session on the routed worker. Returns null if that worker is already full.</summary>
+    async Task<JObject> CreateSessionAsync(string workerUrl, JObject grant, int lifetime)
+    {
+        JObject envelope = new()
+        {
+            ["auth_data"] = grant,
+            ["session_id"] = null,
+            ["payload"] = new JObject
+            {
+                ["lifetime"] = lifetime,
+                ["on_close_route"] = "/lease/end",
+                ["on_close_payload"] = new JObject()
+            }
+        };
+        using HttpResponseMessage response = await VastTls.Http.PostAsync($"{workerUrl.TrimEnd('/')}/session/create", Json(envelope), Program.GlobalProgramCancel);
+        if (response.StatusCode is HttpStatusCode.TooManyRequests)
+        {
+            Logs.Debug($"{Tag} Worker at {workerUrl} already holds a session; re-routing.");
+            return null;
+        }
+        JObject body = await ReadJsonAsync(response, "session/create");
+        if (body["session_id"] is null)
+        {
+            throw new SwarmReadableErrorException($"Vast.ai worker did not open a session: {body}");
+        }
+        return body;
+    }
+
+    /// <summary>Calls the worker's /lease route through the session (which also extends the session by one lifetime).</summary>
+    async Task<JObject> LeaseCallAsync(string workerUrl, CloudWorkerInfo worker)
+    {
+        JObject envelope = new()
+        {
+            ["auth_data"] = worker.SessionAuth,
+            ["session_id"] = worker.LeaseId,
+            ["payload"] = new JObject { ["session_id"] = worker.LeaseId }
+        };
+        using HttpResponseMessage response = await VastTls.Http.PostAsync($"{workerUrl.TrimEnd('/')}/lease", Json(envelope), Program.GlobalProgramCancel);
+        return await ReadJsonAsync(response, "lease");
+    }
+
+    /// <summary>Validates a /lease answer and copies it onto the worker info.</summary>
+    static void ApplyLease(CloudWorkerInfo worker, JObject lease)
+    {
+        if (lease["success"]?.Value<bool>() is not true)
+        {
+            throw new SwarmReadableErrorException($"Vast.ai worker refused the lease: {lease["error"] ?? lease}");
+        }
+        int protocol = lease["protocol"]?.Value<int>() ?? 0;
+        string publicUrl = lease["public_url"]?.ToString();
+        string token = lease["token"]?.ToString();
+        if (protocol < RequiredProtocol || string.IsNullOrWhiteSpace(publicUrl) || string.IsNullOrWhiteSpace(token))
+        {
+            throw new SwarmReadableErrorException("The Vast.ai worker image is too old for this version of Cloud Backends. Use an image built from hartsy/swarmui-worker-vast.");
+        }
+        worker.PublicUrl = publicUrl.TrimEnd('/');
+        worker.Token = token;
+        worker.WorkerId = lease["worker_id"]?.ToString();
+        worker.Protocol = protocol;
+    }
+
+    /// <summary>Reads the session's current expiry from the worker without extending it.</summary>
+    async Task<bool> RefreshExpirationAsync(CloudWorkerInfo worker, CancellationToken cancel)
+    {
+        JObject body = new() { ["session_id"] = worker.LeaseId, ["session_auth"] = worker.SessionAuth };
+        using HttpResponseMessage response = await VastTls.Http.PostAsync($"{SessionUrl(worker)}/session/get", Json(body), cancel);
+        if (response.StatusCode is HttpStatusCode.BadRequest or HttpStatusCode.Gone)
+        {
+            return false;
+        }
+        JObject data = await ReadJsonAsync(response, "session/get");
+        worker.LeaseExpiration = data["expiration"]?.Value<double>() ?? worker.LeaseExpiration;
+        worker.LeaseLifetime = data["lifetime"]?.Value<double>() ?? worker.LeaseLifetime;
+        return true;
+    }
+
+    /// <summary>The PyWorker's own base URL, from the session's grant.</summary>
+    static string SessionUrl(CloudWorkerInfo worker)
+    {
+        return (worker.SessionAuth?["url"]?.ToString() ?? throw new SwarmReadableErrorException("Vast.ai session has no worker URL.")).TrimEnd('/');
+    }
+
+    /// <inheritdoc/>
+    public async Task<bool> IsLeaseActiveAsync(CloudWorkerInfo worker, CancellationToken cancel)
+    {
+        try
+        {
+            return await RefreshExpirationAsync(worker, cancel);
+        }
+        catch (HttpRequestException ex)
+        {
+            Logs.Debug($"{Tag} Worker for session {worker.LeaseId} is unreachable ({ex.Message}); treating the lease as ended.");
+            return false;
+        }
+        catch (TaskCanceledException) when (!cancel.IsCancellationRequested)
+        {
+            // A slow answer is not a dead worker.
+            return true;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Each renewal adds a whole lifetime, so it only happens once less than half a lifetime remains.
+    /// That keeps an in-use worker alive while bounding the paid tail after the last use to 1.5 lifetimes.</remarks>
+    public async Task RenewLeaseAsync(CloudWorkerInfo worker, CancellationToken cancel)
+    {
+        double remaining = worker.LeaseExpiration - DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+        if (remaining > worker.LeaseLifetime / 2 + 15)
+        {
+            return;
+        }
+        await LeaseCallAsync(SessionUrl(worker), worker);
+        await RefreshExpirationAsync(worker, cancel);
+        Logs.Debug($"{Tag} Renewed session {worker.LeaseId}.");
+    }
+
+    /// <inheritdoc/>
+    public async Task ReleaseLeaseAsync(CloudWorkerInfo worker)
+    {
+        if (Relays.TryRemove(worker.LeaseId ?? "", out VastTlsRelay relay))
+        {
+            await relay.DisposeAsync();
+        }
+        if (worker.LeaseId is null || worker.SessionAuth is null)
+        {
+            return;
+        }
+        try
+        {
+            JObject body = new() { ["session_id"] = worker.LeaseId, ["session_auth"] = worker.SessionAuth };
+            using HttpResponseMessage response = await VastTls.Http.PostAsync($"{SessionUrl(worker)}/session/end", Json(body), CancellationToken.None);
+            Logs.Debug($"{Tag} Ended session {worker.LeaseId} ({(int)response.StatusCode}).");
+        }
+        catch (Exception ex)
+        {
+            // The session still expires on its own within one lifetime.
+            Logs.Verbose($"{Tag} Ending session {worker.LeaseId} failed: {ex.Message}");
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task<string> GetConnectUrlAsync(CloudWorkerInfo worker)
+    {
+        VastTlsRelay relay = Relays.GetOrAdd(worker.LeaseId, _ => new VastTlsRelay(worker.PublicUrl));
+        return Task.FromResult(relay.LocalUrl);
+    }
+
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        foreach (VastTlsRelay relay in Relays.Values)
+        {
+            _ = relay.DisposeAsync();
+        }
+        Relays.Clear();
+    }
+
+    // ── Validation ────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
     public async Task ValidateAsync(CancellationToken cancel = default)
     {
         if (string.IsNullOrWhiteSpace(endpointName))
         {
             throw new SwarmReadableErrorException("No Vast.ai endpoint name is set. Set 'EndpointId' in the backend settings to your serverless endpoint's name.");
         }
-        // Proves the account key works, and gives a clean 401 message if it does not.
-        await ConsoleApiAsync(HttpMethod.Get, "/api/v0/users/current/", null, cancel);
+        await ConsoleApiAsync(HttpMethod.Get, "/api/v0/users/current/", cancel);
         await ResolveEndpointKeyAsync(cancel);
     }
 
-    public async Task<CloudWorkerInfo> WakeupWorkerAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
+    /// <inheritdoc/>
+    public async Task<JArray> CheckEndpointAsync(LeaseRequest request, int maxWorkers, CancellationToken cancel)
     {
-        await ResolveEndpointKeyAsync(cancel);
-        Logs.Info($"[VastAI] Requesting a worker for endpoint '{endpointName}' (max {maxWaitSeconds}s)...");
-        DateTime deadline = DateTime.UtcNow.AddSeconds(maxWaitSeconds);
-        // request_idx holds our place in the engine's queue. Dropping it on a retry sends us to the back.
-        int requestIdx = 0;
-        string lastStatus = null;
-        while (DateTime.UtcNow < deadline)
+        JArray findings = [];
+        JObject endpoint = await FindEndpointAsync(cancel);
+        double minLoad = endpoint["min_load"]?.Value<double>() ?? 0;
+        int coldWorkers = endpoint["cold_workers"]?.Value<int>() ?? 0;
+        int endpointMax = endpoint["max_workers"]?.Value<int>() ?? 0;
+        double inactivity = endpoint["inactivity_timeout"]?.Value<double>() ?? 0;
+        if (minLoad > 0)
         {
-            cancel.ThrowIfCancellationRequested();
-            JObject route = await RouteAsync(requestIdx, cancel);
-            requestIdx = route["request_idx"]?.Value<int>() ?? requestIdx;
-            string workerUrl = route["url"]?.ToString();
-            // Readiness is the presence of a url, not any status field.
-            if (!string.IsNullOrWhiteSpace(workerUrl))
-            {
-                Logs.Debug($"[VastAI] Routed to worker at {workerUrl}, sending wakeup...");
-                JObject output = await SendToWorkerAsync(route, new JObject { ["action"] = "wakeup" }, cancel);
-                if (output["success"]?.Value<bool>() is false)
-                {
-                    throw new SwarmReadableErrorException($"Vast.ai worker wakeup failed: {output["error"]}");
-                }
-                string publicUrl = output["public_url"]?.ToString();
-                string sessionId = output["session_id"]?.ToString();
-                if (string.IsNullOrWhiteSpace(publicUrl) || string.IsNullOrWhiteSpace(sessionId))
-                {
-                    throw new SwarmReadableErrorException($"Vast.ai worker answered but did not return public_url and session_id. Check that the worker image runs the SwarmUI handler. Output: {output}");
-                }
-                Logs.Info($"[VastAI] Worker ready: {output["worker_id"]} at {publicUrl}");
-                return new CloudWorkerInfo
-                {
-                    PublicUrl = publicUrl,
-                    SessionId = sessionId,
-                    WorkerId = output["worker_id"]?.ToString(),
-                    Version = output["version"]?.ToString()
-                };
-            }
-            string status = route["status"]?.ToString() ?? "waiting";
-            if (status != lastStatus)
-            {
-                Logs.Info($"[VastAI] No worker ready yet (engine status: {status}); waiting...");
-                lastStatus = status;
-            }
-            await Task.Delay(Math.Clamp(pollIntervalMs, 1000, 15000), cancel);
+            findings.Add(Finding("error", $"The endpoint's Min Load is {minLoad}, which keeps a worker running at all times. Set it to 0 so the endpoint can scale to zero."));
         }
-        throw new SwarmReadableErrorException($"No Vast.ai worker became available for endpoint '{endpointName}' within {maxWaitSeconds}s (last engine status: {lastStatus ?? "unknown"}). Check the endpoint's max workers and that its workergroup can find matching offers.");
-    }
-
-    /// <summary>
-    /// Vast bills workers while the serverless engine keeps them up, and the engine scales on its own
-    /// metrics. There is no keepalive job to submit, so this only holds the SwarmUI session open.
-    /// </summary>
-    public Task<bool> StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default)
-    {
-        string workerUrl = worker.PublicUrl;
-        _ = Task.Run(async () =>
+        if (inactivity <= 0)
         {
-            int intervalMs = 30_000;
-            int elapsed = 0;
-            while (elapsed < durationSeconds * 1000 && !cancel.IsCancellationRequested)
-            {
-                try { await Task.Delay(intervalMs, cancel); }
-                catch (OperationCanceledException) { break; }
-                elapsed += intervalMs;
-                try
-                {
-                    await Http.PostJson($"{workerUrl.TrimEnd('/')}/API/GetNewSession", [], null, cancel);
-                    Logs.Verbose($"[VastAI] Keepalive ping OK ({elapsed / 1000}s/{durationSeconds}s)");
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    Logs.Verbose($"[VastAI] Keepalive ping failed: {ex.Message}");
-                }
-            }
-        }, cancel);
-        return Task.FromResult(true);
+            findings.Add(Finding("warning", "The endpoint has no Inactivity Timeout, so it never scales all the way to zero. Set one (e.g. 300 seconds)."));
+        }
+        if (coldWorkers > 0)
+        {
+            findings.Add(Finding("warning", $"The endpoint keeps {coldWorkers} stopped (cold) worker(s), which bill for storage while idle. Set Min Workers to 0 unless you want faster cold starts."));
+        }
+        if (endpointMax > 0 && endpointMax < maxWorkers)
+        {
+            findings.Add(Finding("warning", $"Max Workers is {maxWorkers}, but the endpoint allows only {endpointMax}. Scaling will stop at {endpointMax}."));
+        }
+        return findings;
     }
 
-    public Task StopKeepaliveAsync() => Task.CompletedTask;
-
-    public void Dispose() { }
-
-    // ── Vast.ai serverless routing ────────────────────────────────────────────
-
-    /// <summary>Asks the serverless engine for a worker. Returns the raw grant, which doubles as auth_data.</summary>
-    public async Task<JObject> RouteAsync(int requestIdx, CancellationToken cancel = default, double cost = 100.0)
+    /// <summary>Builds one validation finding.</summary>
+    static JObject Finding(string level, string message)
     {
-        string key = _endpointApiKey ?? apiKey;
+        return new JObject { ["level"] = level, ["message"] = message };
+    }
+
+    // ── Vast.ai routing and console API ───────────────────────────────────────
+
+    /// <summary>Asks the serverless engine for a worker. Returns the signed grant (empty while none is ready).</summary>
+    async Task<JObject> RouteAsync(int requestIdx, CancellationToken cancel)
+    {
+        string key = EndpointApiKey ?? apiKey;
         JObject payload = new()
         {
             ["endpoint"] = endpointName,
-            ["cost"] = cost,
+            ["cost"] = SessionCost,
             ["api_key"] = key,
             ["request_idx"] = requestIdx,
-            // Matches the official vast-sdk client (vastai/serverless/client/endpoint.py Endpoint._route),
-            // which always sends this alongside request_idx - the routing engine's own retry/replay window.
+            // Matches the official client (vastai/serverless/client/endpoint.py Endpoint._route).
             ["replay_timeout"] = 60.0
         };
-        // The official client also puts the key on the query string (on every serverless call, not just
-        // this one - see _make_request in vastai/serverless/client/connection.py). Matched here even
-        // though the header alone authenticates fine, since it costs nothing and removes any doubt.
-        using HttpRequestMessage request = new(HttpMethod.Post, $"{RouteBase}/route/?api_key={Uri.EscapeDataString(key)}")
+        using HttpResponseMessage response = await HttpRetry.SendAsync(Http, () =>
         {
-            Content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json")
-        };
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
-        Logs.Debug($"[VastAI] POST /route/ (endpoint: {endpointName}, request_idx: {requestIdx})");
-        using HttpResponseMessage response = await Http.SendAsync(request, cancel);
-        string text = await response.Content.ReadAsStringAsync(cancel);
-        if (response.StatusCode == HttpStatusCode.Unauthorized)
-        {
-            throw new SwarmReadableErrorException("Vast.ai rejected the API key for this endpoint (401). Check your key in User Settings -> API Keys.");
-        }
-        // The engine asks callers to back off on these rather than treating them as fatal.
+            // The official client also sends the key as a query parameter (client/connection.py _make_request).
+            HttpRequestMessage request = new(HttpMethod.Post, $"{RouteBase}/route/?api_key={Uri.EscapeDataString(key)}") { Content = Json(payload) };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+            return request;
+        }, Tag, cancel);
         if (response.StatusCode is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests || (int)response.StatusCode >= 500)
         {
-            Logs.Verbose($"[VastAI] /route/ transient {(int)response.StatusCode}, will retry.");
             return [];
         }
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new SwarmReadableErrorException($"Vast.ai /route/ failed ({(int)response.StatusCode}): {text}");
-        }
-        return JObject.Parse(text);
+        return await ReadJsonAsync(response, "route");
     }
 
-    /// <summary>
-    /// Posts to the routed worker using Vast's envelope. The grant is forwarded verbatim: its signature
-    /// covers those fields, so rebuilding it by hand risks invalidating it.
-    /// </summary>
-    public async Task<JObject> SendToWorkerAsync(JObject routeGrant, JObject payload, CancellationToken cancel = default)
+    /// <summary>Finds this backend's endpoint in the account's endpoint list.</summary>
+    async Task<JObject> FindEndpointAsync(CancellationToken cancel)
     {
-        string workerUrl = routeGrant["url"]?.ToString() ?? throw new SwarmReadableErrorException("Vast.ai route grant had no worker url.");
-        string url = $"{workerUrl.TrimEnd('/')}/{workerRoute.TrimStart('/')}";
-        JObject envelope = new()
-        {
-            ["auth_data"] = routeGrant,
-            ["session_id"] = null,
-            ["payload"] = payload
-        };
-        using HttpRequestMessage request = new(HttpMethod.Post, url)
-        {
-            Content = new StringContent(envelope.ToString(), Encoding.UTF8, "application/json")
-        };
-        Logs.Verbose($"[VastAI] POST {url}");
-        using HttpResponseMessage response = await Http.SendAsync(request, cancel);
-        string text = await response.Content.ReadAsStringAsync(cancel);
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new SwarmReadableErrorException($"Vast.ai worker call to '{url}' failed ({(int)response.StatusCode}): {text}");
-        }
-        try { return JObject.Parse(text); }
-        catch (Exception)
-        {
-            throw new SwarmReadableErrorException($"Vast.ai worker at '{url}' returned a non-JSON response. Check that the worker route '{workerRoute}' is correct for your worker image.");
-        }
-    }
-
-    // ── Vast.ai console API ───────────────────────────────────────────────────
-
-    /// <summary>
-    /// Looks up the per-endpoint API key that /route/ expects, by endpoint name. Cached after the
-    /// first success. Falls back to the account key if the endpoint carries no key of its own.
-    /// </summary>
-    public async Task ResolveEndpointKeyAsync(CancellationToken cancel = default)
-    {
-        if (_endpointApiKey is not null) { return; }
-        JToken result = await ConsoleApiAsync(HttpMethod.Get, "/api/v0/endptjobs/", null, cancel);
+        JToken result = await ConsoleApiAsync(HttpMethod.Get, "/api/v0/endptjobs/", cancel);
         JArray endpoints = result?["results"] as JArray ?? result as JArray ?? [];
         List<string> names = [];
-        foreach (JToken t in endpoints)
+        foreach (JObject endpoint in endpoints.OfType<JObject>())
         {
-            if (t is not JObject ep) { continue; }
-            string name = ep["endpoint_name"]?.ToString();
-            if (!string.IsNullOrWhiteSpace(name)) { names.Add(name); }
+            string name = endpoint["endpoint_name"]?.ToString();
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                names.Add(name);
+            }
             if (string.Equals(name, endpointName, StringComparison.OrdinalIgnoreCase))
             {
-                _endpointApiKey = ep["api_key"]?.ToString();
-                Logs.Debug($"[VastAI] Matched endpoint '{name}' (id {ep["id"]}), using its endpoint key: {(_endpointApiKey is null ? "none, falling back to account key" : "yes")}");
-                _endpointApiKey ??= apiKey;
-                return;
+                return endpoint;
             }
         }
         throw new SwarmReadableErrorException($"Vast.ai has no serverless endpoint named '{endpointName}' on this account. Available: {(names.Count == 0 ? "(none)" : string.Join(", ", names))}.");
     }
 
-    /// <summary>Calls the Vast.ai console REST API with the account key.</summary>
-    public async Task<JToken> ConsoleApiAsync(HttpMethod method, string path, JObject body, CancellationToken cancel = default)
+    /// <summary>Looks up (once) the per-endpoint key that /route/ expects.</summary>
+    async Task ResolveEndpointKeyAsync(CancellationToken cancel)
     {
-        using HttpRequestMessage request = new(method, $"{ConsoleBase}{path}");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        if (body is not null)
+        if (EndpointApiKey is not null)
         {
-            request.Content = new StringContent(body.ToString(), Encoding.UTF8, "application/json");
+            return;
         }
-        Logs.Debug($"[VastAI] {method} {path}");
-        using HttpResponseMessage response = await Http.SendAsync(request, cancel);
-        string text = await response.Content.ReadAsStringAsync(cancel);
-        if (response.StatusCode == HttpStatusCode.Unauthorized)
+        JObject endpoint = await FindEndpointAsync(cancel);
+        EndpointApiKey = endpoint["api_key"]?.ToString() ?? apiKey;
+    }
+
+    /// <summary>Calls Vast's console REST API with the account key.</summary>
+    async Task<JToken> ConsoleApiAsync(HttpMethod method, string path, CancellationToken cancel)
+    {
+        using HttpResponseMessage response = await HttpRetry.SendAsync(Http, () =>
         {
-            throw new SwarmReadableErrorException("Vast.ai API key was rejected (401). Check your key in User Settings -> API Keys.");
+            HttpRequestMessage request = new(method, $"{ConsoleBase}{path}");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            return request;
+        }, Tag, cancel);
+        string text = await response.Content.ReadAsStringAsync(cancel);
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw new SwarmReadableErrorException("Vast.ai rejected the API key (401/403). Check your key in User Settings, API Keys.");
         }
         if (!response.IsSuccessStatusCode)
         {
-            throw new SwarmReadableErrorException($"Vast.ai API {method} {path} failed ({(int)response.StatusCode}): {text}");
+            throw new SwarmReadableErrorException($"Vast.ai API {path} failed ({(int)response.StatusCode}): {text[..Math.Min(text.Length, 300)]}");
         }
-        if (string.IsNullOrWhiteSpace(text)) { return null; }
-        try { return JToken.Parse(text); }
-        catch (Exception) { return null; }
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+        try
+        {
+            return JToken.Parse(text);
+        }
+        catch (Newtonsoft.Json.JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>JSON request content.</summary>
+    static StringContent Json(JObject body)
+    {
+        return new StringContent(body.ToString(Newtonsoft.Json.Formatting.None), Encoding.UTF8, "application/json");
+    }
+
+    /// <summary>Reads a JSON object response with a readable error for failures.</summary>
+    static async Task<JObject> ReadJsonAsync(HttpResponseMessage response, string what)
+    {
+        string text = await response.Content.ReadAsStringAsync();
+        if (response.StatusCode is HttpStatusCode.Unauthorized)
+        {
+            throw new SwarmReadableErrorException($"Vast.ai refused the {what} request (401). The session or routing grant is no longer valid.");
+        }
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new SwarmReadableErrorException($"Vast.ai {what} failed ({(int)response.StatusCode}): {text[..Math.Min(text.Length, 300)]}");
+        }
+        try
+        {
+            return JObject.Parse(text);
+        }
+        catch (Newtonsoft.Json.JsonException)
+        {
+            throw new SwarmReadableErrorException($"Vast.ai {what} returned something that is not JSON. Check that the endpoint runs the Hartsy Vast worker image.");
+        }
     }
 }
