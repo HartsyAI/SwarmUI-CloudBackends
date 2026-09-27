@@ -121,13 +121,9 @@ public class CloudBackendsExtension : Extension
         // some unrelated backend must never trigger it.
         RegisterPerUserProvisioning();
 
-        // ── PreGenerate auto-routing ──────────────────────────────────────────
-        // Same reasoning: a pod's models belong to a real Swarm backend that core routes to normally.
-        // The IDs here must match CloudBackendTypes' hidden BackendType records (T2IEngine matches
-        // T2IParamTypes.BackendType against each live backend's own HandlerTypeData.ID directly - it
-        // never looks the ID up in the public registry, so the hidden IDs work fine here).
-        RegisterPreGenerateRouting<RunPodServerlessBackend>(CloudBackendTypes.RunPodServerless.ID);
-        RegisterPreGenerateRouting<VastAIBackend>(CloudBackendTypes.VastAI.ID);
+        // No backend-type rewriting: core's own model filter already routes cloud-only models away from local
+        // backends, and forcing the serverless type would exclude the workers' mirrored backends (a different
+        // type) that should take warm generations directly.
 
         // ── Web API ───────────────────────────────────────────────────────────
         CloudBackendsWebAPI.Register();
@@ -237,69 +233,4 @@ public class CloudBackendsExtension : Extension
         }
     }
 
-    static void RegisterPreGenerateRouting<T>(string backendTypeId) where T : CloudBackendBase
-    {
-        try
-        {
-            T2IEngine.PreGenerateEvent += (p) =>
-            {
-                string currentType = p.UserInput.Get(T2IParamTypes.BackendType, "Any");
-                if (!string.IsNullOrEmpty(currentType) && !currentType.Equals("Any", StringComparison.OrdinalIgnoreCase))
-                {
-                    return;
-                }
-                string requestedModel = null;
-                object m = p.UserInput.Get(T2IParamTypes.Model);
-                if (m is T2IModel tm)
-                {
-                    requestedModel = tm.Name;
-                }
-                else if (m is string ms)
-                {
-                    requestedModel = ms;
-                }
-                if (string.IsNullOrWhiteSpace(requestedModel))
-                {
-                    return;
-                }
-                string bareName = requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
-                    ? requestedModel[..^".safetensors".Length] : requestedModel;
-                // Never divert a model the user already has locally onto a paid cloud GPU - the worker's
-                // volume usually holds the same checkpoints, so this would silently bill for every gen.
-                if (Program.MainSDModels.Models.ContainsKey(requestedModel) || Program.MainSDModels.Models.ContainsKey(bareName))
-                {
-                    return;
-                }
-                foreach (T b in Program.Backends.RunningBackendsOfType<T>())
-                {
-                    // Only the requesting user's own children may route their generation - another
-                    // user's child would refuse it anyway (and bills a different account's key).
-                    if (b.OwnerUserId != p.UserInput.SourceSession?.User?.UserID)
-                    {
-                        continue;
-                    }
-                    ConcurrentDictionary<string, Dictionary<string, JObject>> rem = b.RemoteModels;
-                    if (rem is null)
-                    {
-                        continue;
-                    }
-                    string bare = bareName;
-                    bool found = rem.Values.Any(dict =>
-                        dict.ContainsKey(requestedModel) || dict.ContainsKey(bare)
-                        || dict.Keys.Any(k => k.Equals(requestedModel.AfterLast('/'), StringComparison.OrdinalIgnoreCase))
-                        || dict.Keys.Any(k => k.Equals(bare.AfterLast('/'), StringComparison.OrdinalIgnoreCase)));
-                    if (found)
-                    {
-                        Logs.Verbose($"[CloudBackends] Auto-routing '{requestedModel}' to backend type '{backendTypeId}'");
-                        p.UserInput.Set(T2IParamTypes.BackendType, backendTypeId);
-                        return;
-                    }
-                }
-            };
-        }
-        catch (Exception ex)
-        {
-            Logs.Error($"[CloudBackends] Failed to register PreGenerateEvent for '{backendTypeId}': {ex.Message}");
-        }
-    }
 }

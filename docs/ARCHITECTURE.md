@@ -49,8 +49,9 @@ RunPod's load-balancing endpoints were considered and rejected: no session affin
   2. no free backend outside a serverless subtree can serve it (local GPUs and already-rented instances first; core may otherwise pick the cloud backend to load a model on);
   3. no free worker backend can serve it;
   4. `ShouldTakeRequest`: there is room to lease another worker, or no worker is up yet (so the request queues here rather than failing).
+- **Explicitly targeted requests.** Core matches a requested backend type exactly (`T2IEngine`), and the mirrored worker backends are a different type, so a request that targets the serverless type can only reach the cloud backend. It then always accepts and hands the request over itself. The extension never rewrites a request's backend type, because that would shut the mirrored backends out of warm generations.
 - **Handoff** (`ClaimGeneratorAsync`). Claims a free worker backend through `T2IBackendAccess` (under `SlotLock`, so two handoffs never take the same one). Otherwise it starts a lease, and keeps checking existing workers while it starts; if one frees up first, the new lease is withdrawn if the provider has not assigned a worker yet (a RunPod job still `IN_QUEUE`), or kept as a slot if it has.
-- `MaxUsages = MaxWorkers`, because a request holds its usage for the whole handed-off generation; fewer would delay scale-out.
+- `MaxUsages` is well above `MaxWorkers`, because a request holds its usage for the whole handed-off generation. Leasing is limited separately, by slots plus leases starting, so extra usages only let requests queue here while workers start.
 - **Maintenance** (`OnTick`, every 5 s): renews in-use leases (throttled per slot) and checks each lease every 15 s; a lease that has ended is removed (model list kept, child detached, lease released).
 - **Models**: `LoadModel` never leases (the worker loads the model as part of the generation). The model list is adopted from a slot's child when it is removed, merged, and saved per user and endpoint with `SaveGenericData` (names plus a few small fields, never previews). `RemoteModels` feeds the model browser via `ExtraModelProviders`.
 

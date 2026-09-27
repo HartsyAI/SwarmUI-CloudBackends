@@ -148,7 +148,13 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             input.RefusalReasons.Add($"{CloudProviderName ?? "Cloud"} backend #{BackendData?.ID} belongs to another user. Your own is created automatically once your API key is set in User Settings.");
             return false;
         }
-        if (IsAnyBackendType(input) && LocalBackendCanServe(input))
+        if (!IsAnyBackendType(input))
+        {
+            // Explicitly targeted at this type: core can then only route here, never to the workers' mirrored
+            // backends (they are another type), so this backend takes it and hands it over itself.
+            return true;
+        }
+        if (LocalBackendCanServe(input))
         {
             return false;
         }
@@ -202,7 +208,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     continue;
                 }
-                if (model is not null && backend.Models is not null && backend.Models.TryGetValue("Stable-Diffusion", out List<string> names) && !names.Contains(model) && !names.Contains($"{model}.safetensors"))
+                // Only defer to a backend known to have the model; one that cannot say might fail to load it.
+                if (model is not null && (backend.Models is null || !backend.Models.TryGetValue("Stable-Diffusion", out List<string> names) || (!names.Contains(model) && !names.Contains($"{model}.safetensors"))))
                 {
                     continue;
                 }
@@ -267,9 +274,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             return;
         }
         LoadModelCache();
-        // One usage per worker this backend may start. A request holds its usage for its whole generation (the
-        // handoff runs inside it), so fewer than MaxWorkers would delay scale-out behind a running generation.
-        MaxUsages = MaxWorkers;
+        // A request holds a usage here for its whole handed-off generation, so this must not be the bottleneck:
+        // leasing itself is limited by MaxWorkers (slots plus leases starting), not by this.
+        MaxUsages = Math.Max(4, MaxWorkers * 4);
         CanLoadModels = true;
         Status = BackendStatus.RUNNING;
         // A re-enable can Init without a matching Shutdown; never subscribe twice.
