@@ -605,6 +605,26 @@ public static class CloudBackendsWebAPI
     public static async Task<JObject> CloudValidateBackend(Session session,
         [API.APIParameter("ID of the 'Cloud Backends' card (or of one of its serverless backends).")] int backend_id)
     {
+        // Make sure the user's serverless backends for this card exist, as they do not until first use. Creating one
+        // only validates credentials; it never leases a worker.
+        foreach (CloudBackendsBackend parent in Program.Backends.RunningBackendsOfType<CloudBackendsBackend>().Where(p => p.BackendData?.ID == backend_id))
+        {
+            foreach (CloudBackendsBackend.ProviderDef def in CloudBackendsBackend.Providers.Where(d => !d.IsInstance && parent.IsProviderEnabled(d)))
+            {
+                try
+                {
+                    AbstractT2IBackend child = await parent.EnsureChildForUser(session.User, def);
+                    if (child is not null)
+                    {
+                        await CloudBackendsBackend.WaitForChildReady(child);
+                    }
+                }
+                catch (SwarmReadableErrorException ex)
+                {
+                    Logs.Debug($"[CloudBackends] Could not prepare {def.Label} for validation: {ex.Message}");
+                }
+            }
+        }
         List<CloudBackendBase> backends = UserServerless(session, backend_id, "");
         if (backends.Count == 0)
         {

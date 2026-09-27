@@ -70,6 +70,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         int pollMs = Math.Clamp(request.PollIntervalMs, 1000, 5000);
         string lastStatus = null;
         bool withdrawn = false;
+        using CancellationTokenSource waitCancel = CancellationTokenSource.CreateLinkedTokenSource(cancel, Program.GlobalProgramCancel);
         try
         {
             while (true)
@@ -78,7 +79,17 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
                 {
                     throw new SwarmReadableErrorException($"No RunPod worker picked up the lease within {request.StartupTimeoutSec}s. Check the endpoint's max workers, GPU availability, and worker logs.");
                 }
-                JObject stream = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/stream/{jobId}", CancellationToken.None);
+                JObject stream;
+                try
+                {
+                    // Cancellable until a withdraw is requested; after that, polls run to completion so the job's
+                    // status can decide between withdrawing (still queued) and keeping it (already assigned).
+                    stream = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/stream/{jobId}", cancel.IsCancellationRequested ? CancellationToken.None : cancel);
+                }
+                catch (OperationCanceledException) when (cancel.IsCancellationRequested && !Program.GlobalProgramCancel.IsCancellationRequested)
+                {
+                    continue;
+                }
                 string status = stream["status"]?.ToString() ?? "UNKNOWN";
                 if (status != lastStatus)
                 {
@@ -103,7 +114,14 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
                     cancel.ThrowIfCancellationRequested();
                 }
                 // Once IN_PROGRESS a worker is already assigned and billing, so it is kept (see the interface docs).
-                await Task.Delay(pollMs, Program.GlobalProgramCancel);
+                try
+                {
+                    await Task.Delay(pollMs, cancel.IsCancellationRequested ? Program.GlobalProgramCancel : waitCancel.Token);
+                }
+                catch (OperationCanceledException) when (cancel.IsCancellationRequested && !Program.GlobalProgramCancel.IsCancellationRequested)
+                {
+                    // Withdraw requested mid-wait: check the job's status right away.
+                }
             }
         }
         catch (Exception) when (!withdrawn)
