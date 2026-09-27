@@ -52,6 +52,12 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     /// <summary>The lease protocol this extension speaks.</summary>
     public const int RequiredProtocol = 2;
 
+    /// <summary>
+    /// Shortest session lifetime used, in seconds. Renewals happen at most every 15s and only once half a lifetime
+    /// (+15s) remains, so a shorter lifetime could lapse between renewals and cut off a running generation.
+    /// </summary>
+    public const int MinSessionLifetime = 60;
+
     /// <summary>Log prefix.</summary>
     const string Tag = "[VastAI]";
 
@@ -96,7 +102,8 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
                 await Task.Delay(pollMs, cancel);
                 continue;
             }
-            JObject session = await CreateSessionAsync(workerUrl, grant, request.IdleSeconds);
+            int lifetime = Math.Max(request.IdleSeconds, MinSessionLifetime);
+            JObject session = await CreateSessionAsync(workerUrl, grant, lifetime);
             if (session is null)
             {
                 // That worker already holds a session: ask the engine again, which routes elsewhere or recruits.
@@ -108,7 +115,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
             {
                 LeaseId = session["session_id"].ToString(),
                 SessionAuth = grant,
-                LeaseLifetime = request.IdleSeconds
+                LeaseLifetime = lifetime
             };
             try
             {

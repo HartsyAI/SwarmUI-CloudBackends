@@ -261,13 +261,18 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     void PersistActiveInstanceId()
     {
         string id = Provider?.ActiveInstanceId;
-        if (string.IsNullOrWhiteSpace(id) || id == PersistedInstanceId)
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            return;
+        }
+        // Recorded even when unchanged: an ID remembered before the known-instances list existed must still join it.
+        RememberKnownInstance(Owner, GetType().Name, id);
+        if (id == PersistedInstanceId)
         {
             return;
         }
         PersistedInstanceId = id;
         Owner?.SaveGenericData("cloudbackends", PersistName, id);
-        RememberKnownInstance(Owner, GetType().Name, id);
         Logs.Debug($"[{Provider?.ProviderName}] Remembered instance '{id}' for user '{OwnerUserId}' under '{PersistName.ToLowerFast()}'.");
     }
 
@@ -284,6 +289,8 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend has no valid owner user ('{OwnerUserId}').");
             apiKey = GetApiKey(owner);
             PersistedInstanceId = owner.GetGenericData("cloudbackends", PersistName)?.Trim();
+            // Covers installs whose instance was remembered before the known-instances list existed.
+            RememberKnownInstance(owner, GetType().Name, PersistedInstanceId);
             WorkerToken = string.IsNullOrWhiteSpace(ExistingWorkerToken) ? owner.GetGenericData("cloudbackends", $"{PersistName}_token")?.Trim() : ExistingWorkerToken.Trim();
             if (string.IsNullOrWhiteSpace(WorkerToken))
             {

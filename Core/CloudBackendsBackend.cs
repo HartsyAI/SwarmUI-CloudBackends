@@ -98,7 +98,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public string VastAI_EndpointId = "";
         [ConfigComment("Most workers this backend may run at once. When every running worker is busy, another one is started, up to this many.\nAlso limited by the endpoint's own maximum. 1 means never more than one worker.")]
         public int VastAI_MaxWorkers = 1;
-        [ConfigComment("How long a worker may sit with no generation before it shuts down, in seconds.\nLower costs less; higher avoids a cold start between bursts of work.")]
+        [ConfigComment("How long a worker may sit with no generation before it shuts down, in seconds.\nLower costs less; higher avoids a cold start between bursts of work.\nVast.ai workers are kept at least 60 seconds, so a session cannot lapse between renewals.")]
         public int VastAI_IdleSeconds = 120;
         [ConfigComment("How long to wait for a worker to start and answer, in seconds.")]
         public int VastAI_StartupTimeoutSec = 800;

@@ -104,7 +104,7 @@ Then on Vast.ai:
 1. **Template** ([Templates ▸ New](https://cloud.vast.ai/templates/)): your image, launch mode **Docker ENTRYPOINT**, Docker options `-p 7801:7801 -p 8000:8000 -e WORKER_PORT=8000`, and a container disk well above the image's unpacked size (e.g. 40 GB). Vast's 8 GB default is too small, and an undersized disk fails without saying why.
 2. **Endpoint** ([Serverless](https://cloud.vast.ai/serverless/)): **Min Workers 0**, **Min Load 0**, and an **Inactivity Timeout** (e.g. 300). With Min Load above 0 the endpoint never scales to zero; with Min Workers above 0 Vast keeps stopped workers that bill for storage. Set **Max Workers** to at least your card's Max Workers.
 3. **Workergroup** under the endpoint, using the template, with a GPU filter of 16 GB VRAM or more. To change the template later, edit it through **Serverless ▸ Edit workergroup**, because saving from Templates creates a new copy the workergroup does not use.
-4. **Card:** turn on **Vast.ai Serverless**, set **Endpoint ID** to the endpoint's **name**, and set Max Workers and Idle Seconds as above. Press **Validate**.
+4. **Card:** turn on **Vast.ai Serverless**, set **Endpoint ID** to the endpoint's **name**, and set Max Workers and Idle Seconds as above (Vast.ai workers are kept at least 60 seconds). Press **Validate**.
 
 ## RunPod GPU Pods
 
