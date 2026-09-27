@@ -8,6 +8,10 @@ public class WorkerSlot
     /// <summary>The lease and how to reach the worker.</summary>
     public CloudWorkerInfo Worker;
 
+    /// <summary>The provider that created the lease. Always used to renew, check and release it, even after the backend
+    /// has rebuilt its own provider (for example on an API key change), since the lease belongs to this one's account.</summary>
+    public ICloudProvider Provider;
+
     /// <summary>The address this extension (and the child) connects to: the worker's URL, or a local TLS relay to it.</summary>
     public string ConnectUrl;
 

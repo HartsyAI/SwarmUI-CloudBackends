@@ -139,6 +139,14 @@ public class VastSessionTests
     }
 
     [Test]
+    public void OneUnreachableCheckDoesNotEndALease()
+    {
+        Assert.That(VastAIProvider.IsUnreachableForGood(1), Is.False);
+        Assert.That(VastAIProvider.IsUnreachableForGood(VastAIProvider.UnreachableChecksBeforeEnd - 1), Is.False);
+        Assert.That(VastAIProvider.IsUnreachableForGood(VastAIProvider.UnreachableChecksBeforeEnd), Is.True);
+    }
+
+    [Test]
     public void ParsesALeaseAndRefusesOldImages()
     {
         CloudWorkerInfo worker = new();

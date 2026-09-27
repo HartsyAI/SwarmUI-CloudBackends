@@ -204,17 +204,19 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     {
         try
         {
-            return await RefreshExpirationAsync(worker, cancel);
+            bool active = await RefreshExpirationAsync(worker, cancel);
+            worker.FailedLeaseChecks = 0;
+            return active;
         }
-        catch (HttpRequestException ex)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.IO.IOException)
         {
-            Logs.Debug($"{Tag} Worker for session {worker.LeaseId} is unreachable ({ex.Message}); treating the lease as ended.");
-            return false;
-        }
-        catch (TaskCanceledException) when (!cancel.IsCancellationRequested)
-        {
-            // A slow answer is not a dead worker.
-            return true;
+            // The check talks to the worker itself, so a network blip and a dead worker look alike. One failure keeps
+            // the lease (ending it would interrupt a healthy worker's generation and lease a replacement); only a run of
+            // them ends it.
+            worker.FailedLeaseChecks++;
+            bool gone = IsUnreachableForGood(worker.FailedLeaseChecks);
+            Logs.Debug($"{Tag} Could not reach the worker for session {worker.LeaseId} ({ex.Message}); {(gone ? "treating the lease as ended" : $"keeping it (failure {worker.FailedLeaseChecks} of {UnreachableChecksBeforeEnd})")}.");
+            return !gone;
         }
     }
 
@@ -230,6 +232,15 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         await LeaseCallAsync(SessionUrl(worker), worker);
         await RefreshExpirationAsync(worker, cancel);
         Logs.Debug($"{Tag} Renewed session {worker.LeaseId}.");
+    }
+
+    /// <summary>Lease checks in a row that must fail to reach a worker before its lease is treated as ended (about a minute, at one check every 15s).</summary>
+    public const int UnreachableChecksBeforeEnd = 4;
+
+    /// <summary>True once the worker has been unreachable for <see cref="UnreachableChecksBeforeEnd"/> checks in a row.</summary>
+    internal static bool IsUnreachableForGood(int failedChecks)
+    {
+        return failedChecks >= UnreachableChecksBeforeEnd;
     }
 
     /// <summary>

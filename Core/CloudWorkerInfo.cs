@@ -31,4 +31,7 @@ public class CloudWorkerInfo
 
     /// <summary>Lease protocol version the worker reported.</summary>
     public int Protocol;
+
+    /// <summary>Lease checks in a row that could not reach the worker. Reset by any answer.</summary>
+    public int FailedLeaseChecks;
 }
