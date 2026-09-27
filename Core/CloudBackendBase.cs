@@ -737,7 +737,12 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} did not bring up a usable backend within {request.StartupTimeoutSec}s{(lastError is null ? "." : $" (last error: {lastError}).")}");
     }
 
-    /// <summary>Syncs <see cref="RemoteFeatureCombo"/> from a worker's ListBackends response.</summary>
+    /// <summary>
+    /// Replaces <see cref="RemoteFeatureCombo"/> with what a worker's ListBackends response advertises. Every worker of an
+    /// endpoint runs the same image, so the newest report is authoritative: a feature the workers dropped (after an image
+    /// change) stops being advertised, instead of routing requests here that no worker can serve. The set is kept while
+    /// no worker runs, so a sleeping endpoint still advertises what its workers last did.
+    /// </summary>
     void UpdateFeaturesFromWorker(JObject backendData)
     {
         HashSet<string> features = ["text2image"];
@@ -751,6 +756,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         foreach (string f in features)
         {
             RemoteFeatureCombo.TryAdd(f, f);
+        }
+        foreach (string f in RemoteFeatureCombo.Keys.Where(f => !features.Contains(f)))
+        {
+            RemoteFeatureCombo.TryRemove(f, out _);
         }
     }
 

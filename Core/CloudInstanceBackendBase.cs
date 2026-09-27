@@ -213,6 +213,9 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// <summary>How many instance IDs per provider are remembered for orphan detection.</summary>
     const int KnownInstanceLimit = 50;
 
+    /// <summary>Makes each read-modify-write of a remembered-instances list atomic, so two cards finishing at once cannot drop each other's ID.</summary>
+    static readonly object KnownInstancesLock = new();
+
     /// <summary>
     /// Adds an instance ID to the owner's list of instances this extension has created or attached for a provider. Kept
     /// separately from the active ID (which a newer instance replaces), so orphan detection can recognise machines with
@@ -224,14 +227,17 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         {
             return;
         }
-        List<string> known = KnownInstances(owner, backendTypeName);
-        known.Remove(id);
-        known.Add(id);
-        if (known.Count > KnownInstanceLimit)
+        lock (KnownInstancesLock)
         {
-            known.RemoveRange(0, known.Count - KnownInstanceLimit);
+            List<string> known = KnownInstances(owner, backendTypeName);
+            known.Remove(id);
+            known.Add(id);
+            if (known.Count > KnownInstanceLimit)
+            {
+                known.RemoveRange(0, known.Count - KnownInstanceLimit);
+            }
+            owner.SaveGenericData("cloudbackends", $"known_{backendTypeName}", new JArray(known).ToString(Newtonsoft.Json.Formatting.None));
         }
-        owner.SaveGenericData("cloudbackends", $"known_{backendTypeName}", new JArray(known).ToString(Newtonsoft.Json.Formatting.None));
     }
 
     /// <summary>Instance IDs this extension has created or attached for the owner, for one provider's backend type.</summary>
