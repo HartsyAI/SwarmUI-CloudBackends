@@ -160,12 +160,17 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         // At capacity with workers up: the request waits on their backends instead of starting another lease.
         // Before any worker is up, keep accepting so the request queues here rather than failing for lack of a
         // candidate; the acquisition already underway will serve it.
-        bool anyRunning = slots.Any(s => s.RunningGrandchildren.Any());
-        if (anyRunning && slots.Length + PendingAcquires >= MaxWorkers)
-        {
-            return false;
-        }
-        return true;
+        return ShouldTakeRequest(slots.Length, PendingAcquires, MaxWorkers, slots.Any(s => s.RunningGrandchildren.Any()));
+    }
+
+    /// <summary>
+    /// Whether this backend should take a request that no free worker backend can serve. At capacity with workers
+    /// up, the request waits on their backends instead of starting another lease. Before any worker is up it is
+    /// taken anyway, so it queues here rather than failing for lack of a candidate; the lease underway serves it.
+    /// </summary>
+    internal static bool ShouldTakeRequest(int slots, int pendingAcquires, int maxWorkers, bool anyWorkerRunning)
+    {
+        return !(anyWorkerRunning && slots + pendingAcquires >= maxWorkers);
     }
 
     /// <summary>True unless the request explicitly targets a backend type.</summary>
@@ -730,8 +735,14 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         {
             return;
         }
+        owner.SaveGenericData("cloudbackends", ModelCacheKey, SerializeModelCache(RemoteModels));
+    }
+
+    /// <summary>A compact form of a model list: names plus a few small fields, never previews.</summary>
+    internal static string SerializeModelCache(IEnumerable<KeyValuePair<string, Dictionary<string, JObject>>> models)
+    {
         JObject data = [];
-        foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in RemoteModels)
+        foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in models)
         {
             JObject subtype = [];
             foreach (KeyValuePair<string, JObject> model in kv.Value)
@@ -745,7 +756,29 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             }
             data[kv.Key] = subtype;
         }
-        owner.SaveGenericData("cloudbackends", ModelCacheKey, data.ToString(Newtonsoft.Json.Formatting.None));
+        return data.ToString(Newtonsoft.Json.Formatting.None);
+    }
+
+    /// <summary>Rebuilds a model list saved by <see cref="SerializeModelCache"/>, with the placeholder fields the UI expects.</summary>
+    internal static ConcurrentDictionary<string, Dictionary<string, JObject>> ParseModelCache(string raw)
+    {
+        ConcurrentDictionary<string, Dictionary<string, JObject>> loaded = new();
+        foreach (JProperty subtype in JObject.Parse(raw).Properties())
+        {
+            Dictionary<string, JObject> models = [];
+            foreach (JProperty model in ((JObject)subtype.Value).Properties())
+            {
+                JObject meta = (JObject)model.Value;
+                meta["name"] ??= model.Name;
+                meta["title"] ??= model.Name.AfterLast('/');
+                meta["local"] = false;
+                meta["preview_image"] = "imgs/model_placeholder.jpg";
+                meta["is_supported_model_format"] = true;
+                models[model.Name] = meta;
+            }
+            loaded[subtype.Name] = models;
+        }
+        return loaded;
     }
 
     /// <summary>Loads the saved model list, if any. A damaged entry is ignored and the list stays unknown.</summary>
@@ -758,22 +791,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         try
         {
-            ConcurrentDictionary<string, Dictionary<string, JObject>> loaded = new();
-            foreach (JProperty subtype in JObject.Parse(raw).Properties())
-            {
-                Dictionary<string, JObject> models = [];
-                foreach (JProperty model in ((JObject)subtype.Value).Properties())
-                {
-                    JObject meta = (JObject)model.Value;
-                    meta["name"] ??= model.Name;
-                    meta["title"] ??= model.Name.AfterLast('/');
-                    meta["local"] = false;
-                    meta["preview_image"] = "imgs/model_placeholder.jpg";
-                    meta["is_supported_model_format"] = true;
-                    models[model.Name] = meta;
-                }
-                loaded[subtype.Name] = models;
-            }
+            ConcurrentDictionary<string, Dictionary<string, JObject>> loaded = ParseModelCache(raw);
             RemoteModels = loaded;
             Models = new(loaded.ToDictionary(kv => kv.Key, kv => kv.Value.Keys.ToList()));
             Logs.Debug($"[{GetType().Name}] Loaded {loaded.Values.Sum(v => v.Count)} remembered model(s) for endpoint '{BaseConfig.EndpointId}'.");

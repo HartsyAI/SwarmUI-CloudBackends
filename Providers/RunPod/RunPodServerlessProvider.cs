@@ -104,7 +104,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     }
 
     /// <summary>The first streamed output, or null if none has arrived yet.</summary>
-    static JObject FirstOutput(JObject stream)
+    internal static JObject FirstOutput(JObject stream)
     {
         if (stream["stream"] is JArray chunks && chunks.Count > 0)
         {
@@ -114,7 +114,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     }
 
     /// <summary>Validates a lease's first output and turns it into worker info.</summary>
-    CloudWorkerInfo ToWorker(string jobId, JObject output)
+    internal static CloudWorkerInfo ToWorker(string jobId, JObject output)
     {
         if (output["success"]?.Value<bool>() is not true)
         {

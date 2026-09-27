@@ -159,7 +159,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     }
 
     /// <summary>Validates a /lease answer and copies it onto the worker info.</summary>
-    static void ApplyLease(CloudWorkerInfo worker, JObject lease)
+    internal static void ApplyLease(CloudWorkerInfo worker, JObject lease)
     {
         if (lease["success"]?.Value<bool>() is not true)
         {
@@ -223,14 +223,22 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     /// That keeps an in-use worker alive while bounding the paid tail after the last use to 1.5 lifetimes.</remarks>
     public async Task RenewLeaseAsync(CloudWorkerInfo worker, CancellationToken cancel)
     {
-        double remaining = worker.LeaseExpiration - DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
-        if (remaining > worker.LeaseLifetime / 2 + 15)
+        if (!NeedsRenewal(worker.LeaseExpiration, worker.LeaseLifetime, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0))
         {
             return;
         }
         await LeaseCallAsync(SessionUrl(worker), worker);
         await RefreshExpirationAsync(worker, cancel);
         Logs.Debug($"{Tag} Renewed session {worker.LeaseId}.");
+    }
+
+    /// <summary>
+    /// True once less than half a lifetime (plus a 15s margin for clock skew and the renewal's own round trip) is
+    /// left. Renewing any earlier would stack whole lifetimes onto the expiry and keep a worker billing after use.
+    /// </summary>
+    internal static bool NeedsRenewal(double expiration, double lifetime, double now)
+    {
+        return expiration - now <= lifetime / 2 + 15;
     }
 
     /// <inheritdoc/>
