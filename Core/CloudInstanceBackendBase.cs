@@ -206,7 +206,52 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// </summary>
     protected string WorkerToken;
 
+    /// <summary>A token set in the card for an existing machine you created yourself, or null to use (and inject) this backend's own.</summary>
+    protected virtual string ExistingWorkerToken => null;
+
     /// <summary>Remembers the provider's active instance ID in the owner's user data (no-op if unchanged or unknown).</summary>
+    /// <summary>How many instance IDs per provider are remembered for orphan detection.</summary>
+    const int KnownInstanceLimit = 50;
+
+    /// <summary>
+    /// Adds an instance ID to the owner's list of instances this extension has created or attached for a provider. Kept
+    /// separately from the active ID (which a newer instance replaces), so orphan detection can recognise machines with
+    /// any name or label, not only the default one.
+    /// </summary>
+    public static void RememberKnownInstance(User owner, string backendTypeName, string id)
+    {
+        if (owner is null || string.IsNullOrWhiteSpace(id))
+        {
+            return;
+        }
+        List<string> known = KnownInstances(owner, backendTypeName);
+        known.Remove(id);
+        known.Add(id);
+        if (known.Count > KnownInstanceLimit)
+        {
+            known.RemoveRange(0, known.Count - KnownInstanceLimit);
+        }
+        owner.SaveGenericData("cloudbackends", $"known_{backendTypeName}", new JArray(known).ToString(Newtonsoft.Json.Formatting.None));
+    }
+
+    /// <summary>Instance IDs this extension has created or attached for the owner, for one provider's backend type.</summary>
+    public static List<string> KnownInstances(User owner, string backendTypeName)
+    {
+        string raw = owner?.GetGenericData("cloudbackends", $"known_{backendTypeName}");
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return [];
+        }
+        try
+        {
+            return [.. JArray.Parse(raw).Select(t => t.ToString())];
+        }
+        catch (Newtonsoft.Json.JsonException)
+        {
+            return [];
+        }
+    }
+
     void PersistActiveInstanceId()
     {
         string id = Provider?.ActiveInstanceId;
@@ -216,6 +261,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         }
         PersistedInstanceId = id;
         Owner?.SaveGenericData("cloudbackends", PersistName, id);
+        RememberKnownInstance(Owner, GetType().Name, id);
         Logs.Debug($"[{Provider?.ProviderName}] Remembered instance '{id}' for user '{OwnerUserId}' under '{PersistName.ToLowerFast()}'.");
     }
 
@@ -232,7 +278,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend has no valid owner user ('{OwnerUserId}').");
             apiKey = GetApiKey(owner);
             PersistedInstanceId = owner.GetGenericData("cloudbackends", PersistName)?.Trim();
-            WorkerToken = owner.GetGenericData("cloudbackends", $"{PersistName}_token")?.Trim();
+            WorkerToken = string.IsNullOrWhiteSpace(ExistingWorkerToken) ? owner.GetGenericData("cloudbackends", $"{PersistName}_token")?.Trim() : ExistingWorkerToken.Trim();
             if (string.IsNullOrWhiteSpace(WorkerToken))
             {
                 WorkerToken = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(36)).Replace('+', '-').Replace('/', '_').TrimEnd('=');

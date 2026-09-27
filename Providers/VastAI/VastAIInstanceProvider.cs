@@ -303,8 +303,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         {
             body["template_hash_id"] = plan.TemplateHashId;
         }
-        if (!string.IsNullOrWhiteSpace(plan.Image))
+        else if (!string.IsNullOrWhiteSpace(plan.Image))
         {
+            // Only without a template: the template carries its own image, as RunPod's template path does.
             body["image"] = plan.Image;
         }
         if (!string.IsNullOrWhiteSpace(plan.Label))
@@ -462,15 +463,15 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Label prefix of every instance this extension creates, used to recognise its orphans.</summary>
     public const string ManagedLabelPrefix = "swarmui-cloudbackends";
 
-    /// <summary>Running instances on the account that this extension created, as <c>{id, name, status, cost_per_hr}</c>.</summary>
-    public async Task<List<JObject>> ListManagedRunningAsync(CancellationToken cancel = default)
+    /// <summary>Running instances on the account that this extension created (by default label, or by an ID it remembers), as <c>{id, name, status, cost_per_hr}</c>.</summary>
+    public async Task<List<JObject>> ListManagedRunningAsync(ICollection<string> knownIds, CancellationToken cancel = default)
     {
         List<JObject> result = [];
         foreach (JObject instance in (await ListInstancesAsync(cancel)).OfType<JObject>())
         {
             string label = instance["label"]?.ToString() ?? "";
             string status = instance["actual_status"]?.ToString() ?? "";
-            if (label.StartsWith(ManagedLabelPrefix, StringComparison.OrdinalIgnoreCase) && status == "running")
+            if ((label.StartsWith(ManagedLabelPrefix, StringComparison.OrdinalIgnoreCase) || knownIds.Contains(instance["id"]?.ToString() ?? "")) && status == "running")
             {
                 result.Add(new JObject { ["id"] = instance["id"]?.ToString(), ["name"] = label, ["status"] = status, ["cost_per_hr"] = instance["dph_total"] });
             }

@@ -692,7 +692,7 @@ public static class CloudBackendsWebAPI
             try
             {
                 using RunPodPodsProvider provider = new(runpodKey, new RunPodPodPlan());
-                foreach (JObject pod in await provider.ListManagedRunningAsync())
+                foreach (JObject pod in await provider.ListManagedRunningAsync(CloudInstanceBackendBase.KnownInstances(session.User, nameof(RunPodPodsBackend))))
                 {
                     if (!attached.Contains(pod["id"]?.ToString() ?? ""))
                     {
@@ -713,7 +713,7 @@ public static class CloudBackendsWebAPI
             try
             {
                 using VastAIInstanceProvider provider = new(vastKey, new VastAIInstancePlan());
-                foreach (JObject instance in await provider.ListManagedRunningAsync())
+                foreach (JObject instance in await provider.ListManagedRunningAsync(CloudInstanceBackendBase.KnownInstances(session.User, nameof(VastAIInstanceBackend))))
                 {
                     if (!attached.Contains(instance["id"]?.ToString() ?? ""))
                     {
@@ -751,7 +751,7 @@ public static class CloudBackendsWebAPI
                 return Error("You need a RunPod API key and the RunPod GPU Pods permission to do this.", "no_api_key");
             }
             using RunPodPodsProvider pods = new(key, new RunPodPodPlan());
-            if (!(await pods.ListManagedRunningAsync()).Any(p => p["id"]?.ToString() == resource_id))
+            if (!(await pods.ListManagedRunningAsync(CloudInstanceBackendBase.KnownInstances(session.User, nameof(RunPodPodsBackend)))).Any(p => p["id"]?.ToString() == resource_id))
             {
                 return Error($"No running pod '{resource_id}' created by Cloud Backends was found on your RunPod account.", "orphan_not_found");
             }
@@ -766,7 +766,7 @@ public static class CloudBackendsWebAPI
                 return Error("You need a Vast.ai API key and the Vast.ai Instances permission to do this.", "no_api_key");
             }
             using VastAIInstanceProvider instances = new(key, new VastAIInstancePlan());
-            if (!(await instances.ListManagedRunningAsync()).Any(i => i["id"]?.ToString() == resource_id))
+            if (!(await instances.ListManagedRunningAsync(CloudInstanceBackendBase.KnownInstances(session.User, nameof(VastAIInstanceBackend)))).Any(i => i["id"]?.ToString() == resource_id))
             {
                 return Error($"No running instance '{resource_id}' created by Cloud Backends was found on your Vast.ai account.", "orphan_not_found");
             }

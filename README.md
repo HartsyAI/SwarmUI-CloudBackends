@@ -115,7 +115,7 @@ Leave **Pod ID** blank to have the card create a pod, or set it to use an existi
 - **Image** defaults to the Hartsy RunPod worker, pinned to a release. The card gives the pod an access token automatically, so nobody else can use it.
 - **Start** creates or resumes the pod (you confirm the price first); **Stop** stops it. **Terminate On Shutdown** destroys the pod instead of stopping it, which only makes sense when a network volume holds everything worth keeping.
 - **Max Runtime Minutes** and **Max Spend USD** stop the pod automatically if you forget.
-- A pod you created yourself must run the Hartsy worker image with `SWARMUI_WORKER_TOKEN` set to the token the card uses; simplest is to let the card create the pod.
+- To use a pod you created yourself, it must run the Hartsy worker image; put its `SWARMUI_WORKER_TOKEN` in **Worker Token**. Letting the card create the pod is simpler: it then manages the token for you.
 
 ## Vast.ai Instances
 
@@ -127,12 +127,14 @@ The same as pods, with Vast.ai's differences:
 
 - Vast.ai has no proxy domain; the instance is reached at its public IP over **HTTPS**, using the certificate Vast.ai issues to every instance. The card checks it against Vast.ai's own root certificate.
 - Attach an existing network volume with **Network Volume ID**. Creating a new named volume is done on Vast.ai's site.
+- To use an instance you created yourself, it must run the Hartsy Vast worker image; put its `SWARMUI_WORKER_TOKEN` in **Worker Token**.
+- When you pick a **Template**, the template's image is used and the Image setting is ignored.
 
 ## Keeping costs under control
 
 - Serverless workers shut down after **Idle Seconds**; nothing keeps one running unless you are generating.
 - If SwarmUI stops unexpectedly, RunPod workers still shut themselves down when idle, and Vast.ai sessions expire on their own.
-- The card shows a warning when a pod or instance created by Cloud Backends is running but not attached to any card, for example after SwarmUI stopped uncleanly. Stop it from there.
+- The card shows a warning when a pod or instance created by Cloud Backends (under any name) is running but not attached to any card, for example after SwarmUI stopped uncleanly. Stop it from there.
 - The **Workers** list in each serverless section shows every running worker, with a **Stop** button.
 - **Validate** catches endpoint settings that would keep workers running or billing (Vast.ai Min Load, missing inactivity timeout, execution timeouts).
 

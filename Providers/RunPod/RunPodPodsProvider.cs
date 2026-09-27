@@ -661,8 +661,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Name prefix of every pod this extension creates, used to recognise its orphans.</summary>
     public const string ManagedNamePrefix = "swarmui-cloudbackends";
 
-    /// <summary>Running pods on the account that this extension created, as <c>{id, name, status, cost_per_hr}</c>.</summary>
-    public async Task<List<JObject>> ListManagedRunningAsync(CancellationToken cancel = default)
+    /// <summary>Running pods on the account that this extension created (by default name, or by an ID it remembers), as <c>{id, name, status, cost_per_hr}</c>.</summary>
+    public async Task<List<JObject>> ListManagedRunningAsync(ICollection<string> knownIds, CancellationToken cancel = default)
     {
         List<JObject> result = [];
         foreach (JObject pod in (await ListPodsAsync(cancel)).OfType<JObject>())
@@ -670,7 +670,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             string name = pod["name"]?.ToString() ?? "";
             // REST API v2 field names, the same ones StatusFromPod and ListAccountOptionsAsync read.
             string status = pod["status"]?.ToString() ?? "";
-            if (name.StartsWith(ManagedNamePrefix, StringComparison.OrdinalIgnoreCase) && status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
+            if ((name.StartsWith(ManagedNamePrefix, StringComparison.OrdinalIgnoreCase) || knownIds.Contains(pod["id"]?.ToString() ?? "")) && status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
             {
                 result.Add(new JObject { ["id"] = pod["id"], ["name"] = name, ["status"] = status, ["cost_per_hr"] = pod["cost"] });
             }

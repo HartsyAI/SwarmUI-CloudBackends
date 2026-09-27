@@ -80,6 +80,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public string RunPodPods_DataCenterId = "";
         [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
         public string RunPodPods_PodEnv = "";
+        [ConfigComment("Only for a pod you created yourself (set in Pod ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let Cloud Backends create the pod with a token of its own. Stored in the backend settings, so admins can see it.")]
+        public string RunPodPods_WorkerToken = "";
         [ConfigComment("How long to wait for the pod to boot and for SwarmUI on it to answer, in seconds.")]
         public int RunPodPods_StartupTimeoutSec = 900;
         [ConfigComment("How often to poll RunPod while waiting for the pod to start, in milliseconds.")]
@@ -134,6 +136,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public string VastAIInstance_VolumeMountPath = "/workspace";
         [ConfigComment("Extra environment variables for a created instance, as KEY=VALUE, one per line.\nThe SwarmUI port mapping is added automatically - no need to include it here.")]
         public string VastAIInstance_Env = "";
+        [ConfigComment("Only for an instance you created yourself (set in Instance ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let Cloud Backends create the instance with a token of its own. Stored in the backend settings, so admins can see it.")]
+        public string VastAIInstance_WorkerToken = "";
         [ConfigComment("How long to wait for the instance to boot and for SwarmUI on it to answer, in seconds.")]
         public int VastAIInstance_StartupTimeoutSec = 900;
         [ConfigComment("How often to poll Vast.ai while waiting for the instance to start, in milliseconds.")]
