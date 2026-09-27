@@ -39,7 +39,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     public bool IsUsingApiKey(string apiKey) => apiKey == ProviderApiKey;
 
     /// <summary>The active provider, created in Init (and rebuilt on API key rotation).</summary>
-    public ICloudProvider Provider { get; private set; }
+    public ICloudProvider Provider;
 
     /// <summary>Shared client for this extension's own calls to worker gateways (TLS to Vast goes through the relay).</summary>
     public static readonly HttpClient HttpClient = NetworkBackendUtils.MakeHttpClient();

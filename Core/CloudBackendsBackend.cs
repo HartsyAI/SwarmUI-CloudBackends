@@ -315,7 +315,10 @@ public class CloudBackendsBackend : AbstractT2IBackend
             ChildMap[key] = data.ID;
             return data.AbstractBackend as AbstractT2IBackend;
         }
-        finally { spawnLock.Release(); }
+        finally
+        {
+            spawnLock.Release();
+        }
     }
 
     /// <summary>
@@ -347,8 +350,14 @@ public class CloudBackendsBackend : AbstractT2IBackend
     async Task RemoveChild(int id, string mapKey)
     {
         ChildMap.TryRemove(mapKey, out _);
-        try { await Handler.DeleteById(id); }
-        catch (Exception ex) { Logs.Debug($"[CloudBackends] Removing child backend #{id} failed: {ex.Message}"); }
+        try
+        {
+            await Handler.DeleteById(id);
+        }
+        catch (Exception ex)
+        {
+            Logs.Debug($"[CloudBackends] Removing child backend #{id} failed: {ex.Message}");
+        }
     }
 
     async Task TearDownChildren()
@@ -356,8 +365,14 @@ public class CloudBackendsBackend : AbstractT2IBackend
         foreach (KeyValuePair<string, int> pair in ChildMap)
         {
             ChildMap.TryRemove(pair.Key, out _);
-            try { await Handler.DeleteById(pair.Value); }
-            catch (Exception ex) { Logs.Debug($"[CloudBackends] Removing child backend #{pair.Value} failed: {ex.Message}"); }
+            try
+            {
+                await Handler.DeleteById(pair.Value);
+            }
+            catch (Exception ex)
+            {
+                Logs.Debug($"[CloudBackends] Removing child backend #{pair.Value} failed: {ex.Message}");
+            }
         }
     }
 

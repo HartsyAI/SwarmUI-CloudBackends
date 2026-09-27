@@ -33,6 +33,7 @@ public class CloudBackendsExtension : Extension
     // ── Permissions ───────────────────────────────────────────────────────────
     // One permission per provider so admins can grant access selectively.
 
+    /// <summary>Permission group for everything this extension adds.</summary>
     public static readonly PermInfoGroup CloudPermGroup = new("CloudBackends", "Permissions related to cloud GPU backends.");
 
     public static readonly PermInfo PermUseRunPodServerless = Permissions.Register(new PermInfo(
@@ -170,7 +171,10 @@ public class CloudBackendsExtension : Extension
                             CloudBackendsBackend.WaitForChildReady(child).GetAwaiter().GetResult();
                             ready = true;
                         }
-                        catch (Exception ex) { lastFail = ex; }
+                        catch (Exception ex)
+                        {
+                            lastFail = ex;
+                        }
                     }
                     if (!ready && lastFail is not null)
                     {
@@ -205,7 +209,10 @@ public class CloudBackendsExtension : Extension
                     InfoHtml: new HtmlString(infoHtml)));
             }
         }
-        catch (Exception ex) { Logs.Error($"[CloudBackends] Failed to register API key '{keyType}': {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Failed to register API key '{keyType}': {ex.Message}");
+        }
     }
 
     static void RegisterModelProvider<T>(string backendTypeId) where T : CloudBackendBase
@@ -224,7 +231,10 @@ public class CloudBackendsExtension : Extension
                 };
             }
         }
-        catch (Exception ex) { Logs.Error($"[CloudBackends] Failed to register model provider for '{backendTypeId}': {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Failed to register model provider for '{backendTypeId}': {ex.Message}");
+        }
     }
 
     static void RegisterPreGenerateRouting<T>(string backendTypeId) where T : CloudBackendBase
@@ -240,21 +250,39 @@ public class CloudBackendsExtension : Extension
                 }
                 string requestedModel = null;
                 object m = p.UserInput.Get(T2IParamTypes.Model);
-                if (m is T2IModel tm) { requestedModel = tm.Name; }
-                else if (m is string ms) { requestedModel = ms; }
-                if (string.IsNullOrWhiteSpace(requestedModel)) { return; }
+                if (m is T2IModel tm)
+                {
+                    requestedModel = tm.Name;
+                }
+                else if (m is string ms)
+                {
+                    requestedModel = ms;
+                }
+                if (string.IsNullOrWhiteSpace(requestedModel))
+                {
+                    return;
+                }
                 string bareName = requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
                     ? requestedModel[..^".safetensors".Length] : requestedModel;
                 // Never divert a model the user already has locally onto a paid cloud GPU - the worker's
                 // volume usually holds the same checkpoints, so this would silently bill for every gen.
-                if (Program.MainSDModels.Models.ContainsKey(requestedModel) || Program.MainSDModels.Models.ContainsKey(bareName)) { return; }
+                if (Program.MainSDModels.Models.ContainsKey(requestedModel) || Program.MainSDModels.Models.ContainsKey(bareName))
+                {
+                    return;
+                }
                 foreach (T b in Program.Backends.RunningBackendsOfType<T>())
                 {
                     // Only the requesting user's own children may route their generation - another
                     // user's child would refuse it anyway (and bills a different account's key).
-                    if (b.OwnerUserId != p.UserInput.SourceSession?.User?.UserID) { continue; }
+                    if (b.OwnerUserId != p.UserInput.SourceSession?.User?.UserID)
+                    {
+                        continue;
+                    }
                     ConcurrentDictionary<string, Dictionary<string, JObject>> rem = b.RemoteModels;
-                    if (rem is null) { continue; }
+                    if (rem is null)
+                    {
+                        continue;
+                    }
                     string bare = bareName;
                     bool found = rem.Values.Any(dict =>
                         dict.ContainsKey(requestedModel) || dict.ContainsKey(bare)
@@ -269,6 +297,9 @@ public class CloudBackendsExtension : Extension
                 }
             };
         }
-        catch (Exception ex) { Logs.Error($"[CloudBackends] Failed to register PreGenerateEvent for '{backendTypeId}': {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Failed to register PreGenerateEvent for '{backendTypeId}': {ex.Message}");
+        }
     }
 }

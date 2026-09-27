@@ -44,8 +44,15 @@ public static class CloudBackendsWebAPI
     {
         // Only a permission refusal means "not yours" - anything else is a real fault and must not be
         // silently reported to the user as "no cloud backends are running".
-        try { backend.CheckPermission(session); return true; }
-        catch (SwarmReadableErrorException) { return false; }
+        try
+        {
+            backend.CheckPermission(session);
+            return true;
+        }
+        catch (SwarmReadableErrorException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -196,7 +203,10 @@ public static class CloudBackendsWebAPI
                         await CloudBackendsBackend.WaitForChildReady(child);
                     }
                 }
-                catch (SwarmReadableErrorException) { }
+                catch (SwarmReadableErrorException)
+                {
+                    // Intentionally empty.
+                }
             }
         }
         CloudBackendBase[] backends = [.. Program.Backends.RunningBackendsOfType<CloudBackendBase>()

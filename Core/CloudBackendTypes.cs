@@ -25,19 +25,19 @@ public static class CloudBackendTypes
     public const string DefaultVastImage = "hartsy/swarmui-worker-vast:1.0.0-hartsyinference";
 
     /// <summary>Hidden type record for the RunPod Serverless child backend.</summary>
-    public static BackendHandler.BackendType RunPodServerless { get; private set; }
+    public static BackendHandler.BackendType RunPodServerless;
 
     /// <summary>Hidden type record for the RunPod GPU Pods child backend.</summary>
-    public static BackendHandler.BackendType RunPodPods { get; private set; }
+    public static BackendHandler.BackendType RunPodPods;
 
     /// <summary>Hidden type record for the Vast.ai Serverless child backend.</summary>
-    public static BackendHandler.BackendType VastAI { get; private set; }
+    public static BackendHandler.BackendType VastAI;
 
     /// <summary>Hidden type record for the Vast.ai Instances child backend.</summary>
-    public static BackendHandler.BackendType VastAIInstance { get; private set; }
+    public static BackendHandler.BackendType VastAIInstance;
 
     /// <summary>Type record for the owner-gated swarm backend attached to a started cloud instance (see <see cref="OwnerBoundSwarmBackend"/>).</summary>
-    public static BackendHandler.BackendType OwnerBoundSwarm { get; private set; }
+    public static BackendHandler.BackendType OwnerBoundSwarm;
 
     public static void Init()
     {

@@ -59,7 +59,13 @@ internal static class CloudChildBackend
         {
             return;
         }
-        try { await handler.DeleteById(child.ID); }
-        catch (Exception ex) { Logs.Debug($"[{providerName}] Removing child backend #{child.ID} failed: {ex.Message}"); }
+        try
+        {
+            await handler.DeleteById(child.ID);
+        }
+        catch (Exception ex)
+        {
+            Logs.Debug($"[{providerName}] Removing child backend #{child.ID} failed: {ex.Message}");
+        }
     }
 }

@@ -9,25 +9,26 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 public class CloudInstanceStatus
 {
     /// <summary>Provider-side identifier, for example a RunPod pod ID or Vast.ai contract ID.</summary>
-    public string InstanceId { get; set; }
+    public string InstanceId;
 
     /// <summary>Provider-reported state string, display only (RunPod: RUNNING/EXITED/...; Vast: running/exited/...).</summary>
-    public string Status { get; set; }
+    public string Status;
 
     /// <summary>GPU model name or ID as the provider reports it.</summary>
-    public string GpuName { get; set; }
+    public string GpuName;
 
-    public int GpuCount { get; set; }
+    /// <summary>Number of GPUs on the instance.</summary>
+    public int GpuCount;
 
     /// <summary>Hourly USD rate. 0 when not running or unknown.</summary>
-    public double CostPerHour { get; set; }
+    public double CostPerHour;
 
     /// <summary>Seconds since the instance last started. Always seconds, whatever unit the provider reports in.</summary>
-    public int UptimeSeconds { get; set; }
+    public int UptimeSeconds;
 
     /// <summary>Actions the provider currently permits (RunPod publishes these; empty where the provider has no such list).</summary>
     public string[] AllowedActions { get; set; } = [];
 
     /// <summary>Base URL where the instance's SwarmUI is (or will be) reachable, or null until known.</summary>
-    public string PublicUrl { get; set; }
+    public string PublicUrl;
 }

@@ -1,3 +1,4 @@
+using FreneticUtilities.FreneticExtensions;
 using FreneticUtilities.FreneticDataSyntax;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
@@ -86,13 +87,13 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     protected virtual void CheckRequiredConfig() { }
 
     /// <summary>The live provider, once created in Init.</summary>
-    public ICloudInstanceProvider Provider { get; private set; }
+    public ICloudInstanceProvider Provider;
 
     /// <summary>The running instance, once started.</summary>
-    public CloudInstanceInfo CurrentInstance { get; private set; }
+    public CloudInstanceInfo CurrentInstance;
 
     /// <summary>The child SwarmSwarmBackend attached to the instance, which does the actual work.</summary>
-    public BackendHandler.BackendData ChildBackend { get; private set; }
+    public BackendHandler.BackendData ChildBackend;
 
     /// <summary>Guards start and stop so two requests cannot race the instance lifecycle.</summary>
     public SemaphoreSlim InstanceLock = new(1, 1);
@@ -105,7 +106,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     // its own periodic housekeeping; throttled internally since the tick fires roughly once a second.
 
     /// <summary>When the current instance was confirmed up. Null while no instance is running.</summary>
-    public DateTime? InstanceStartedAt { get; private set; }
+    public DateTime? InstanceStartedAt;
 
     /// <summary>Guards against the failsafe re-triggering while an async stop from a prior trip is still in flight.</summary>
     volatile bool FailsafeTripped = false;
@@ -115,17 +116,29 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
 
     void FailsafeTick()
     {
-        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped) { return; }
-        if (InstanceConfig.MaxRuntimeMinutes <= 0 && InstanceConfig.MaxSpendUsd <= 0) { return; }
+        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped)
+        {
+            return;
+        }
+        if (InstanceConfig.MaxRuntimeMinutes <= 0 && InstanceConfig.MaxSpendUsd <= 0)
+        {
+            return;
+        }
         long now = Environment.TickCount64;
-        if (now < NextFailsafeCheckTicks) { return; }
+        if (now < NextFailsafeCheckTicks)
+        {
+            return;
+        }
         NextFailsafeCheckTicks = now + 30_000; // no need to check more than roughly twice a minute
         _ = Utilities.RunCheckedTask(CheckFailsafeAsync, $"{GetType().Name} #{BackendData?.ID} failsafe check");
     }
 
     async Task CheckFailsafeAsync()
     {
-        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped) { return; }
+        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped)
+        {
+            return;
+        }
         TimeSpan runtime = DateTime.UtcNow - InstanceStartedAt.Value;
         string reason = null;
         if (InstanceConfig.MaxRuntimeMinutes > 0 && runtime.TotalMinutes >= InstanceConfig.MaxRuntimeMinutes)
@@ -147,9 +160,15 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
                 }
             }
             // A failed rate lookup must not block the run - only the runtime cap is guaranteed regardless.
-            catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Failsafe spend check failed: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                Logs.Verbose($"[{Provider?.ProviderName}] Failsafe spend check failed: {ex.Message}");
+            }
         }
-        if (reason is null) { return; }
+        if (reason is null)
+        {
+            return;
+        }
         FailsafeTripped = true;
         try
         {
@@ -157,7 +176,10 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             AddLoadStatus($"Auto-stopped: {reason}.");
             await StopInstanceAsync();
         }
-        finally { FailsafeTripped = false; }
+        finally
+        {
+            FailsafeTripped = false;
+        }
     }
 
     // ── Per-user instance persistence ─────────────────────────────────────────
@@ -176,7 +198,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// to their provider as a reattach hint (used only after live verification, never trusted blindly),
     /// so a restart reattaches the owner's existing billed instance instead of creating a second one.
     /// </summary>
-    protected string PersistedInstanceId { get; private set; }
+    protected string PersistedInstanceId;
 
     /// <summary>
     /// The gateway token for this owner's instance, created once and remembered alongside the instance ID so a
@@ -194,7 +216,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         }
         PersistedInstanceId = id;
         Owner?.SaveGenericData("cloudbackends", PersistName, id);
-        Logs.Debug($"[{Provider?.ProviderName}] Remembered instance '{id}' for user '{OwnerUserId}' under '{PersistName.ToLowerInvariant()}'.");
+        Logs.Debug($"[{Provider?.ProviderName}] Remembered instance '{id}' for user '{OwnerUserId}' under '{PersistName.ToLowerFast()}'.");
     }
 
     public override async Task Init()
@@ -299,7 +321,10 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             InstanceStartedAt = DateTime.UtcNow;
             AddLoadStatus($"{Provider.ProviderName} instance ready.");
         }
-        finally { InstanceLock.Release(); }
+        finally
+        {
+            InstanceLock.Release();
+        }
     }
 
     /// <summary>Hands the instance URL to an owner-bound swarm child, which does all the real work.</summary>
@@ -343,13 +368,22 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             if (Provider is not null && CurrentInstance is not null)
             {
                 // Releasing matters more than tidiness: a running instance bills until it is stopped.
-                try { await Provider.ReleaseInstanceAsync(); }
-                catch (Exception ex) { Logs.Error($"[{Provider.ProviderName}] Failed to release instance '{CurrentInstance.InstanceId}', it may still be billing: {ex.ReadableString()}"); }
+                try
+                {
+                    await Provider.ReleaseInstanceAsync();
+                }
+                catch (Exception ex)
+                {
+                    Logs.Error($"[{Provider.ProviderName}] Failed to release instance '{CurrentInstance.InstanceId}', it may still be billing: {ex.ReadableString()}");
+                }
             }
             CurrentInstance = null;
             InstanceStartedAt = null;
         }
-        finally { InstanceLock.Release(); }
+        finally
+        {
+            InstanceLock.Release();
+        }
     }
 
     public override async Task Shutdown()
