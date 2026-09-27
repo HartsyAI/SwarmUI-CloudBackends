@@ -338,7 +338,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// <inheritdoc/>
     /// <remarks>A rented instance bills for wall-clock time until it is stopped, so generation activity
     /// changes nothing about its lifetime. Only serverless has anything to do here.</remarks>
-    public Task OnChildGenerationStartingAsync() => Task.CompletedTask;
+    public Task OnChildGenerationStartingAsync(SwarmSwarmBackend control) => Task.CompletedTask;
 
     /// <summary>The address the child connects to for an instance URL. Vast.ai overrides this with a TLS relay.</summary>
     protected virtual string GetChildAddress(string publicUrl)

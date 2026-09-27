@@ -177,23 +177,29 @@ public static class CloudBackendsWebAPI
         }
     }
 
-    [API.APIDescription("Triggers a model refresh from the remote workers of all running serverless cloud backends the user may access (rented-instance backends mirror models through core's own Swarm backend instead).",
+    [API.APIDescription("Discovers the models of the user's serverless endpoints: uses a running worker, or leases one (billed until it goes idle). Scope it to one card and provider with backend_id and provider; with neither, every serverless endpoint of the user is refreshed, each leasing its own worker. Rented-instance backends mirror models through core's own Swarm backend instead.",
         """
             "refreshed": 2, // backends successfully refreshed
             "failed": 0, // backends that errored
             "errors": [{"backend_id": 1, "error": "reason"}],
             "message": "Refreshed 2 cloud backend(s), 0 failed."
         """)]
-    public static async Task<JObject> CloudRefreshModels(Session session)
+    public static async Task<JObject> CloudRefreshModels(Session session,
+        [API.APIParameter("ID of the 'Cloud Backends' card to discover for. 0 for every card.")] int backend_id = 0,
+        [API.APIParameter("Settings prefix of the one provider to discover for: 'RunPodServerless_' or 'VastAI_'. Empty for every serverless provider.")] string provider = "")
     {
+        bool InScope(CloudBackendsBackend.ProviderDef def)
+        {
+            return string.IsNullOrWhiteSpace(provider) || def.Prefix.Equals(provider, StringComparison.OrdinalIgnoreCase);
+        }
         // An explicit refresh is a deliberate user action, so it may spawn the user's serverless
         // children first (each on the user's own key) - then refresh only the user's own children.
         // Each child must finish Init before the RUNNING filter below, or a first-ever refresh
         // would see them all as still-loading and wrongly report "none available"; a child that
         // fails Init is tolerated here and surfaces its real reason via the ERRORED fallback below.
-        foreach (CloudBackendsBackend parent in Program.Backends.RunningBackendsOfType<CloudBackendsBackend>())
+        foreach (CloudBackendsBackend parent in Program.Backends.RunningBackendsOfType<CloudBackendsBackend>().Where(p => backend_id == 0 || p.BackendData?.ID == backend_id))
         {
-            foreach (CloudBackendsBackend.ProviderDef def in CloudBackendsBackend.Providers.Where(d => !d.IsInstance))
+            foreach (CloudBackendsBackend.ProviderDef def in CloudBackendsBackend.Providers.Where(d => !d.IsInstance && InScope(d)))
             {
                 try
                 {
@@ -209,8 +215,8 @@ public static class CloudBackendsWebAPI
                 }
             }
         }
-        CloudBackendBase[] backends = [.. Program.Backends.RunningBackendsOfType<CloudBackendBase>()
-            .Where(b => b.OwnerUserId == session.User.UserID && HasBackendPermission(b, session))];
+        CloudBackendBase[] backends = [.. (backend_id == 0 ? Program.Backends.RunningBackendsOfType<CloudBackendBase>().Where(b => b.OwnerUserId == session.User.UserID && HasBackendPermission(b, session)) : UserServerless(session, backend_id, provider))
+            .Where(b => CloudBackendsBackend.Providers.Any(d => !d.IsInstance && InScope(d) && d.Type().ID == b.HandlerTypeData.ID))];
         if (backends.Length is 0)
         {
             // A child may exist but have failed Init (bad key, bad endpoint) - its real reason is far

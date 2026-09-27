@@ -10,6 +10,16 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.RunPod;
 
+/// <summary>A RunPod API error, with the HTTP status so callers can tell a permanent failure from a transient one.</summary>
+public class RunPodApiException(int status, string message) : SwarmReadableErrorException(message)
+{
+    /// <summary>HTTP status RunPod answered with.</summary>
+    public readonly int Status = status;
+
+    /// <summary>True for answers that will not change on retry: bad credentials, or an endpoint or job that no longer exists.</summary>
+    public bool IsPermanent => Status is 401 or 403 or 404;
+}
+
 /// <summary>
 /// <see cref="ICloudProvider"/> for RunPod Serverless (queue) endpoints running the Hartsy RunPod worker image
 /// (github.com/HartsyAI/RunPod-Worker-SwarmUI, version 2 or later).
@@ -160,9 +170,16 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             JObject job = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{worker.LeaseId}", cancel);
             return job["status"]?.ToString() is "IN_PROGRESS" or "IN_QUEUE";
         }
+        catch (RunPodApiException ex) when (ex.IsPermanent)
+        {
+            // A revoked key or a deleted endpoint or job will never answer again: drop the lease, so the slot stops
+            // counting toward Max Workers and the next lease rebuilds the provider with the owner's current key.
+            Logs.Warning($"{Tag} Lease {worker.LeaseId} can no longer be checked ({ex.Status}: {ex.Message}); treating it as ended.");
+            return false;
+        }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // A status check failing is not evidence the worker is gone. The generations themselves will tell.
+            // A transient failure is not evidence the worker is gone. The next check, or the generations, will tell.
             Logs.Debug($"{Tag} Lease status check failed for {worker.LeaseId}: {ex.Message}");
             return true;
         }
@@ -280,21 +297,22 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     async Task<JObject> ReadJsonAsync(HttpResponseMessage response, string what, CancellationToken cancel)
     {
         string text = await response.Content.ReadAsStringAsync(cancel);
+        int status = (int)response.StatusCode;
         if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
         {
-            throw new SwarmReadableErrorException("RunPod rejected the API key (401/403). Check your key in User Settings, API Keys.");
+            throw new RunPodApiException(status, "RunPod rejected the API key (401/403). Check your key in User Settings, API Keys.");
         }
         if (response.StatusCode is HttpStatusCode.NotFound)
         {
-            throw new SwarmReadableErrorException($"RunPod endpoint '{endpointId}' was not found. Check the Endpoint ID setting.");
+            throw new RunPodApiException(status, $"RunPod endpoint '{endpointId}' (or the job asked about) was not found. Check the Endpoint ID setting.");
         }
         if (response.StatusCode is HttpStatusCode.TooManyRequests)
         {
-            throw new SwarmReadableErrorException("RunPod is rate limiting this account. Wait a minute and try again.");
+            throw new RunPodApiException(status, "RunPod is rate limiting this account. Wait a minute and try again.");
         }
         if (!response.IsSuccessStatusCode)
         {
-            throw new SwarmReadableErrorException($"RunPod API {what} failed ({(int)response.StatusCode}): {text[..Math.Min(text.Length, 300)]}");
+            throw new RunPodApiException(status, $"RunPod API {what} failed ({status}): {text[..Math.Min(text.Length, 300)]}");
         }
         try
         {

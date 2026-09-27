@@ -58,8 +58,20 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// <summary>Guards changes to <see cref="Slots"/> and the pick-and-claim of a mirrored backend.</summary>
     public readonly SemaphoreSlim SlotLock = new(1, 1);
 
-    /// <summary>Leases being acquired right now.</summary>
+    /// <summary>Leases being acquired right now. Changed only under <see cref="ReserveLock"/>.</summary>
     int PendingAcquires = 0;
+
+    /// <summary>Makes the capacity check and the reservation of a new lease one step, so two callers can never both take the last place.</summary>
+    readonly object ReserveLock = new();
+
+    /// <summary>Set when shutdown begins. Leases that complete afterwards release themselves instead of attaching.</summary>
+    volatile bool ShuttingDown = false;
+
+    /// <summary>Cancelled when shutdown begins, withdrawing leases the provider has not assigned a worker to yet.</summary>
+    CancellationTokenSource Lifetime = new();
+
+    /// <summary>Serializes model discovery, so concurrent requests share one worker instead of each leasing their own.</summary>
+    readonly SemaphoreSlim DiscoveryLock = new(1, 1);
 
     /// <summary>True while a maintenance tick is running, so ticks never overlap.</summary>
     int TickRunning = 0;
@@ -273,6 +285,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             Status = BackendStatus.ERRORED;
             return;
         }
+        ShuttingDown = false;
+        Lifetime.Dispose();
+        Lifetime = new CancellationTokenSource();
         LoadModelCache();
         // A request holds a usage here for its whole handed-off generation, so this must not be the bottleneck:
         // leasing itself is limited by MaxWorkers (slots plus leases starting), not by this.
@@ -288,8 +303,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 
     public override async Task Shutdown()
     {
+        ShuttingDown = true;
         Program.TickEvent -= OnTick;
         Logs.Info($"[{Provider?.ProviderName ?? GetType().Name}] Backend {BackendData?.ID} shutting down, releasing {Slots.Length} worker(s)...");
+        // Withdraw leases still queued, and give ones already assigned a worker a moment to release themselves
+        // (AcquireSlotAsync does that when it sees ShuttingDown) while the provider still exists.
+        Lifetime.Cancel();
+        for (int i = 0; i < 120 && PendingAcquires > 0; i++)
+        {
+            await Task.Delay(500);
+        }
         foreach (WorkerSlot slot in Slots)
         {
             await RemoveSlotAsync(slot, "backend shutting down");
@@ -329,14 +352,33 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     // ── Leasing workers ───────────────────────────────────────────────────────
 
     /// <summary>
-    /// Leases one worker, waits for its SwarmUI backends, attaches the child, and adds the slot. If
-    /// <paramref name="cancel"/> fires before the provider assigns a worker, the lease is withdrawn; after that the
-    /// worker is kept as a slot, since it is already paid for.
+    /// Reserves room for one more lease if <see cref="MaxWorkers"/> allows it. Every call that returns true must be
+    /// followed by exactly one <see cref="AcquireSlotAsync"/>, which releases the reservation when it finishes.
+    /// </summary>
+    internal bool TryReserveLease()
+    {
+        lock (ReserveLock)
+        {
+            if (ShuttingDown || Slots.Length + PendingAcquires >= MaxWorkers)
+            {
+                return false;
+            }
+            PendingAcquires++;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Leases one worker (after <see cref="TryReserveLease"/>), waits for its SwarmUI backends, attaches the child, and
+    /// adds the slot. If <paramref name="cancel"/> fires, or shutdown begins, before the provider assigns a worker, the
+    /// lease is withdrawn; after that the worker is kept as a slot, since it is already paid for, unless the backend is
+    /// shutting down, in which case it is released.
     /// </summary>
     public async Task<WorkerSlot> AcquireSlotAsync(CancellationToken cancel)
     {
-        Interlocked.Increment(ref PendingAcquires);
         CloudWorkerInfo worker = null;
+        ICloudProvider provider = null;
+        using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(cancel, Lifetime.Token);
         try
         {
             await SlotLock.WaitAsync(Program.GlobalProgramCancel);
@@ -348,32 +390,48 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             {
                 SlotLock.Release();
             }
-            ICloudProvider provider = Provider ?? throw new SwarmReadableErrorException("This cloud backend is shutting down.");
-            worker = await provider.AcquireWorkerAsync(MakeLeaseRequest(), cancel);
+            provider = Provider ?? throw new SwarmReadableErrorException("This cloud backend is shutting down.");
+            worker = await provider.AcquireWorkerAsync(MakeLeaseRequest(), linked.Token);
             WorkerSlot slot = new() { Worker = worker, ConnectUrl = await provider.GetConnectUrlAsync(worker) };
-            await WaitForWorkerBackendsLoadedAsync(slot);
+            await WaitForWorkerBackendsLoadedAsync(slot, provider);
             slot.Child = CloudChildBackend.Attach(this, slot.ConnectUrl, $"[{provider.ProviderName} worker {worker.WorkerId}] Cloud Serverless", BaseConfig.StartupTimeoutSec, $"Bearer {worker.Token}");
             slot.NextLeaseCheckTick = Environment.TickCount64 + 15_000;
-            await SlotLock.WaitAsync(Program.GlobalProgramCancel);
+            bool added = false;
+            await SlotLock.WaitAsync(CancellationToken.None);
             try
             {
-                Slots = [.. Slots, slot];
+                // Checked under the same lock Shutdown's removal uses, so a worker is either added before shutdown
+                // releases every slot, or never added at all.
+                if (!ShuttingDown)
+                {
+                    Slots = [.. Slots, slot];
+                    added = true;
+                }
             }
             finally
             {
                 SlotLock.Release();
+            }
+            if (!added)
+            {
+                await CloudChildBackend.DetachAsync(Handler, slot.Child, provider.ProviderName);
+                throw new SwarmReadableErrorException("This cloud backend shut down while a worker was starting; the worker was released.");
             }
             Logs.Info($"[{provider.ProviderName}] Worker {worker.WorkerId} leased and attached as backend #{slot.Child.ID} ({Slots.Length} worker(s) now).");
             return slot;
         }
         catch (Exception) when (worker is not null)
         {
-            await (Provider?.ReleaseLeaseAsync(worker) ?? Task.CompletedTask);
+            // The provider this lease came from, even if the backend has since dropped or replaced its own.
+            await provider.ReleaseLeaseAsync(worker);
             throw;
         }
         finally
         {
-            Interlocked.Decrement(ref PendingAcquires);
+            lock (ReserveLock)
+            {
+                PendingAcquires--;
+            }
         }
     }
 
@@ -397,7 +455,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     return access;
                 }
-                if (acquiring is null && Slots.Length + PendingAcquires < MaxWorkers)
+                if (acquiring is null && TryReserveLease())
                 {
                     acquiring = AcquireSlotAsync(withdraw.Token);
                 }
@@ -556,18 +614,17 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     }
 
     /// <inheritdoc/>
-    /// <remarks>Renews in-use leases immediately rather than on the next tick. Never leases anything.</remarks>
-    public async Task OnChildGenerationStartingAsync()
+    /// <remarks>Renews the lease of the one worker starting the generation, right away rather than on the next tick.
+    /// Renewing other workers here would keep idle ones alive (and billing) on another worker's traffic. Never leases anything.</remarks>
+    public async Task OnChildGenerationStartingAsync(SwarmSwarmBackend control)
     {
         ICloudProvider provider = Provider;
-        if (provider is null)
+        WorkerSlot slot = Slots.FirstOrDefault(s => ReferenceEquals(s.Child?.AbstractBackend, control));
+        if (provider is null || slot is null)
         {
             return;
         }
-        foreach (WorkerSlot slot in Slots)
-        {
-            await RenewQuietlyAsync(provider, slot);
-        }
+        await RenewQuietlyAsync(provider, slot);
     }
 
     // ── Talking to a worker ───────────────────────────────────────────────────
@@ -626,7 +683,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// Waits until the worker's SwarmUI has at least one backend running and none still loading. A worker that
     /// answers but has no backend at all is a broken image, reported promptly rather than after the full timeout.
     /// </summary>
-    async Task WaitForWorkerBackendsLoadedAsync(WorkerSlot slot)
+    async Task WaitForWorkerBackendsLoadedAsync(WorkerSlot slot, ICloudProvider provider)
     {
         LeaseRequest request = MakeLeaseRequest();
         DateTime start = DateTime.UtcNow;
@@ -634,6 +691,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         string lastError = null;
         while ((DateTime.UtcNow - start).TotalSeconds < request.StartupTimeoutSec)
         {
+            if (ShuttingDown)
+            {
+                throw new SwarmReadableErrorException("This cloud backend shut down while a worker was starting; the worker was released.");
+            }
             try
             {
                 JObject data = await CallWorkerAPI(slot, "ListBackends", new JObject { ["nonreal"] = true, ["full_data"] = true }, 30);
@@ -660,7 +721,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 // A freshly assigned worker's proxy often answers nothing for a few seconds.
                 lastError = ex.Message;
             }
-            await RenewQuietlyAsync(Provider, slot);
+            await RenewQuietlyAsync(provider, slot);
             await Task.Delay(request.PollIntervalMs, Program.GlobalProgramCancel);
         }
         throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} did not bring up a usable backend within {request.StartupTimeoutSec}s{(lastError is null ? "." : $" (last error: {lastError}).")}");
@@ -824,7 +885,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// </summary>
     public async Task RefreshModelsFromWorkerAsync()
     {
-        WorkerSlot slot = Slots.FirstOrDefault() ?? await AcquireSlotAsync(CancellationToken.None);
+        WorkerSlot slot = await GetDiscoverySlotAsync();
         ConcurrentDictionary<string, Dictionary<string, JObject>> listing = new();
         foreach (string subtype in Program.T2IModelSets.Keys)
         {
@@ -859,6 +920,43 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         CommitModels(listing);
         Logs.Info($"[{CloudProviderName}] Discovered {listing.Values.Sum(m => m.Count)} model(s) on endpoint '{BaseConfig.EndpointId}'.");
+    }
+
+    /// <summary>
+    /// A worker to read the model list from: a running one if any, else a new lease if <see cref="MaxWorkers"/>
+    /// allows, else the one already starting. Discoveries run one at a time, so concurrent ones share a worker.
+    /// </summary>
+    async Task<WorkerSlot> GetDiscoverySlotAsync()
+    {
+        await DiscoveryLock.WaitAsync(Program.GlobalProgramCancel);
+        try
+        {
+            LeaseRequest request = MakeLeaseRequest();
+            DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec + 60);
+            while (DateTime.UtcNow < deadline)
+            {
+                WorkerSlot existing = Slots.FirstOrDefault();
+                if (existing is not null)
+                {
+                    return existing;
+                }
+                if (TryReserveLease())
+                {
+                    return await AcquireSlotAsync(CancellationToken.None);
+                }
+                if (ShuttingDown)
+                {
+                    throw new SwarmReadableErrorException("This cloud backend is shutting down.");
+                }
+                // At capacity with a worker already starting for a generation: use that one when it is up.
+                await Task.Delay(request.PollIntervalMs, Program.GlobalProgramCancel);
+            }
+            throw new SwarmReadableErrorException($"{CloudProviderName} had no worker for model discovery within {request.StartupTimeoutSec}s.");
+        }
+        finally
+        {
+            DiscoveryLock.Release();
+        }
     }
 
     // ── Status ────────────────────────────────────────────────────────────────

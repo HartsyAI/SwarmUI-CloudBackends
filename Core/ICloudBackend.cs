@@ -32,5 +32,6 @@ public interface ICloudBackend
     /// for as long as work actually lasts; instances bill by the hour and do not care. Must never wake or rent
     /// anything: it runs on a path the user did not explicitly ask to spend money on.
     /// </summary>
-    Task OnChildGenerationStartingAsync();
+    /// <param name="control">The attached control swarm backend (the top of the subtree) whose worker is about to generate.</param>
+    Task OnChildGenerationStartingAsync(SwarmUI.Backends.SwarmSwarmBackend control);
 }

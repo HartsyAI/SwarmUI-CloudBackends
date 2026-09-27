@@ -474,7 +474,7 @@ class CloudBackendsHelper {
             }
             discoverButton.disabled = true;
             statusLine.innerText = 'Discovering models (a cold start can take a few minutes)...';
-            genericRequest('CloudRefreshModels', {}, data => {
+            genericRequest('CloudRefreshModels', { 'backend_id': backendId, 'provider': provider.prefix }, data => {
                 discoverButton.disabled = false;
                 statusLine.innerText = data.message || 'Models discovered.';
                 refresh();

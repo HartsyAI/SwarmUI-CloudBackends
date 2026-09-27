@@ -226,3 +226,19 @@ public class HttpRetryTests
         Assert.That(HttpRetry.RetryAfter(none), Is.Null);
     }
 }
+
+/// <summary>Which RunPod failures end a lease check, and which keep the worker.</summary>
+[TestFixture]
+public class RunPodErrorTests
+{
+    [Test]
+    public void OnlyCredentialAndMissingResourceErrorsArePermanent()
+    {
+        Assert.That(new RunPodApiException(401, "x").IsPermanent, Is.True);
+        Assert.That(new RunPodApiException(403, "x").IsPermanent, Is.True);
+        Assert.That(new RunPodApiException(404, "x").IsPermanent, Is.True);
+        Assert.That(new RunPodApiException(429, "x").IsPermanent, Is.False);
+        Assert.That(new RunPodApiException(500, "x").IsPermanent, Is.False);
+        Assert.That(new RunPodApiException(503, "x").IsPermanent, Is.False);
+    }
+}
