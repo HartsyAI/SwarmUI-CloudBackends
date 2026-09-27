@@ -665,11 +665,11 @@ public static class CloudBackendsWebAPI
         return Task.FromResult(new JObject { ["success"] = true, ["cleared"] = backends.Count });
     }
 
-    /// <summary>IDs of instances the user's own instance backends currently have attached (so they are not orphans).</summary>
+    /// <summary>IDs of instances the user's own instance backends have attached, or are starting right now (so they are not orphans).</summary>
     static HashSet<string> AttachedInstanceIds(Session session)
     {
         return [.. Program.Backends.RunningBackendsOfType<CloudInstanceBackendBase>()
-            .Where(b => b.OwnerUserId == session.User.UserID && b.ChildBackend is not null && !string.IsNullOrWhiteSpace(b.Provider?.ActiveInstanceId))
+            .Where(b => b.OwnerUserId == session.User.UserID && (b.ChildBackend is not null || b.Starting) && !string.IsNullOrWhiteSpace(b.Provider?.ActiveInstanceId))
             .Select(b => b.Provider.ActiveInstanceId)];
     }
 
@@ -701,8 +701,9 @@ public static class CloudBackendsWebAPI
                     }
                 }
             }
-            catch (SwarmReadableErrorException ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // One provider being unreachable must not hide the other's billing orphans.
                 errors.Add(new JObject { ["provider"] = "runpod", ["error"] = ex.Message });
             }
         }
@@ -721,8 +722,9 @@ public static class CloudBackendsWebAPI
                     }
                 }
             }
-            catch (SwarmReadableErrorException ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                // One provider being unreachable must not hide the other's billing orphans.
                 errors.Add(new JObject { ["provider"] = "vastai", ["error"] = ex.Message });
             }
         }

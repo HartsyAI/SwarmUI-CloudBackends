@@ -294,9 +294,13 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// Starts the cloud instance if it is not already running, and attaches the owner-bound swarm
     /// child to it. Safe to call repeatedly.
     /// </summary>
+    /// <summary>True while a start is in progress: the provider may already know the instance's ID, but the child is not attached yet.</summary>
+    public volatile bool Starting = false;
+
     public async Task StartInstanceAsync()
     {
         await InstanceLock.WaitAsync(Program.GlobalProgramCancel);
+        Starting = true;
         try
         {
             if (ChildBackend is not null && CurrentInstance is not null)
@@ -323,6 +327,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         }
         finally
         {
+            Starting = false;
             InstanceLock.Release();
         }
     }

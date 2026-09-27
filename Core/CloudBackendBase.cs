@@ -699,9 +699,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         string lastError = null;
         while ((DateTime.UtcNow - start).TotalSeconds < request.StartupTimeoutSec)
         {
-            if (ShuttingDown)
+            if (ShuttingDown || !ReferenceEquals(Provider, provider))
             {
-                throw new SwarmReadableErrorException("This cloud backend shut down while a worker was starting; the worker was released.");
+                // Shut down, or the owner's API key changed and the provider this lease came from was replaced (for
+                // Vast.ai that also closed its TLS relay). Stop waiting; the caller releases the lease on its account.
+                throw new SwarmReadableErrorException("This cloud backend shut down, or its API key changed, while a worker was starting; the worker was released.");
             }
             try
             {
