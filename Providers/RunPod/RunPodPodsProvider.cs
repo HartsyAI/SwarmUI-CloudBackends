@@ -668,10 +668,11 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         foreach (JObject pod in (await ListPodsAsync(cancel)).OfType<JObject>())
         {
             string name = pod["name"]?.ToString() ?? "";
-            string status = pod["desiredStatus"]?.ToString() ?? "";
-            if (name.StartsWith(ManagedNamePrefix, StringComparison.OrdinalIgnoreCase) && status == "RUNNING")
+            // REST API v2 field names, the same ones StatusFromPod and ListAccountOptionsAsync read.
+            string status = pod["status"]?.ToString() ?? "";
+            if (name.StartsWith(ManagedNamePrefix, StringComparison.OrdinalIgnoreCase) && status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
             {
-                result.Add(new JObject { ["id"] = pod["id"], ["name"] = name, ["status"] = status, ["cost_per_hr"] = pod["costPerHr"] });
+                result.Add(new JObject { ["id"] = pod["id"], ["name"] = name, ["status"] = status, ["cost_per_hr"] = pod["cost"] });
             }
         }
         return result;
