@@ -115,6 +115,41 @@ public class RunPodLeaseTests
         Assert.That(worker.LeaseId, Is.EqualTo("job1"));
     }
 
+    /// <summary>The version 1 worker's exact answer to the lease action (rp_handler.py on RunPod-Worker-SwarmUI 1.x).</summary>
+    static JObject Version1Refusal() => new()
+    {
+        ["success"] = false,
+        ["error"] = "Unknown action: lease",
+        ["available_actions"] = new JArray("wakeup", "ready", "health", "keepalive", "shutdown")
+    };
+
+    [Test]
+    public void RecognizesTheVersion1WorkerAnsweringALease()
+    {
+        Assert.That(RunPodServerlessProvider.IsVersion1Refusal(Version1Refusal()), Is.True);
+        // Aggregated plain-job output is one object; aggregated streaming output an array of chunks.
+        Assert.That(RunPodServerlessProvider.IsVersion1Refusal(RunPodServerlessProvider.EndedOutput(new JObject { ["status"] = "COMPLETED", ["output"] = Version1Refusal() })), Is.True);
+        Assert.That(RunPodServerlessProvider.IsVersion1Refusal(RunPodServerlessProvider.EndedOutput(new JObject { ["status"] = "COMPLETED", ["output"] = new JArray(Version1Refusal()) })), Is.True);
+        // A version 2 refusal, or an unknown action from some other image, is not the version 1 worker.
+        Assert.That(RunPodServerlessProvider.IsVersion1Refusal(new JObject { ["success"] = false, ["error"] = "busy", ["error_id"] = "lease_busy" }), Is.False);
+        Assert.That(RunPodServerlessProvider.IsVersion1Refusal(new JObject { ["success"] = false, ["error"] = "Unknown action: lease", ["available_actions"] = new JArray("run") }), Is.False);
+        Assert.That(RunPodServerlessProvider.IsVersion1Refusal(Lease()), Is.False);
+        Assert.That(RunPodServerlessProvider.IsVersion1Refusal(null), Is.False);
+    }
+
+    [Test]
+    public void KeepsAVersion1WorkerAliveLikeCloudBackends1()
+    {
+        DateTime now = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        // 120s windows: top up only once less than 60s is left.
+        Assert.That(RunPodServerlessProvider.KeepaliveDue(now.AddSeconds(61), 120, now), Is.False);
+        Assert.That(RunPodServerlessProvider.KeepaliveDue(now.AddSeconds(59), 120, now), Is.True);
+        Assert.That(RunPodServerlessProvider.KeepaliveDue(now.AddSeconds(-5), 120, now), Is.True);
+        // Queued keepalives run back to back, so a top-up adds a window after the queued ones; a lapsed one starts now.
+        Assert.That(RunPodServerlessProvider.ExtendKeepalive(now.AddSeconds(50), 120, now), Is.EqualTo(now.AddSeconds(170)));
+        Assert.That(RunPodServerlessProvider.ExtendKeepalive(now.AddSeconds(-5), 120, now), Is.EqualTo(now.AddSeconds(120)));
+    }
+
     [Test]
     public void RefusesOldWorkerImagesAndRefusals()
     {

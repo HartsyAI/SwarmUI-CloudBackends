@@ -106,8 +106,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// <summary>Returns the subclass's settings cast to <see cref="BaseSettings"/>.</summary>
     public abstract BaseSettings BaseConfig { get; }
 
-    /// <summary><see cref="BaseSettings.MaxWorkers"/>, within sane bounds.</summary>
-    public int MaxWorkers => Math.Clamp(BaseConfig.MaxWorkers, 1, 64);
+    /// <summary><see cref="BaseSettings.MaxWorkers"/>, within sane bounds and the provider's own limit.</summary>
+    public int MaxWorkers => Math.Clamp(Math.Min(BaseConfig.MaxWorkers, Provider?.WorkerLimit() ?? int.MaxValue), 1, 64);
 
     /// <summary>What a new lease asks for, from the current settings.</summary>
     public LeaseRequest MakeLeaseRequest()
@@ -394,7 +394,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             worker = await provider.AcquireWorkerAsync(MakeLeaseRequest(), linked.Token);
             WorkerSlot slot = new() { Worker = worker, Provider = provider, ConnectUrl = await provider.GetConnectUrlAsync(worker) };
             await WaitForWorkerBackendsLoadedAsync(slot, provider);
-            slot.Child = CloudChildBackend.Attach(this, slot.ConnectUrl, $"[{provider.ProviderName} worker {worker.WorkerId}] Cloud Serverless", BaseConfig.StartupTimeoutSec, $"Bearer {worker.Token}");
+            slot.Child = CloudChildBackend.Attach(this, slot.ConnectUrl, $"[{provider.ProviderName} worker {worker.WorkerId}] Cloud Serverless", BaseConfig.StartupTimeoutSec, worker.Token is null ? null : $"Bearer {worker.Token}");
             slot.NextLeaseCheckTick = Environment.TickCount64 + 15_000;
             bool added = false;
             await SlotLock.WaitAsync(CancellationToken.None);
@@ -658,7 +658,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         string url = $"{slot.ConnectUrl}/API/{apiPath}";
         using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds)));
-        JObject result = await HttpClient.PostJson(url, body, req => req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", worker.Token), cancel.Token);
+        JObject result = await HttpClient.PostJson(url, body, worker.Token is null ? null : req => req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", worker.Token), cancel.Token);
         if (result.TryGetValue("error_id", out JToken errorId))
         {
             if (errorId.ToString() == "invalid_session_id" && !retriedSession)

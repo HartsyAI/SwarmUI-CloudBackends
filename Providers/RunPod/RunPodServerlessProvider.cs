@@ -29,6 +29,9 @@ public class RunPodApiException(int status, string message) : SwarmReadableError
 /// holding its worker, until the worker has been idle and ends it. A running lease occupies its worker, so a
 /// second queued lease is real queue pressure and RunPod's autoscaler adds a worker for it.
 /// See https://docs.runpod.io/serverless/workers/handler-functions for the streaming contract.
+///
+/// Endpoints still running the version 1 image (kalebbroo/swarmui-runpod) answer the lease with "Unknown action".
+/// Those are held the way Cloud Backends 1.x held them, a wakeup job then keepalive jobs, with one worker at most.
 /// </summary>
 public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloudProvider
 {
@@ -40,6 +43,19 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
 
     /// <summary>Log prefix.</summary>
     const string Tag = "[RunPodServerless]";
+
+    /// <summary>True once the endpoint turned out to run the version 1 worker image.</summary>
+    volatile bool Version1;
+
+    /// <summary>Guards <see cref="Version1Held"/>.</summary>
+    readonly object Version1Lock = new();
+
+    /// <summary>The one version 1 worker held (or being woken), if any.</summary>
+    CloudWorkerInfo Version1Held;
+
+    /// <inheritdoc/>
+    /// <remarks>Version 1 keepalive jobs are not tied to a worker, so that image is limited to one worker.</remarks>
+    public int WorkerLimit() => Version1 ? 1 : int.MaxValue;
 
     /// <inheritdoc/>
     public string ProviderName => "RunPod Serverless";
@@ -57,6 +73,10 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     /// <inheritdoc/>
     public async Task<CloudWorkerInfo> AcquireWorkerAsync(LeaseRequest request, CancellationToken cancel)
     {
+        if (Version1)
+        {
+            return await AcquireVersion1WorkerAsync(request, cancel);
+        }
         JObject input = new()
         {
             ["action"] = "lease",
@@ -97,13 +117,22 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
                     lastStatus = status;
                 }
                 JObject first = FirstOutput(stream);
+                if (first is not null && IsVersion1Refusal(first))
+                {
+                    break;
+                }
                 if (first is not null)
                 {
                     return ToWorker(jobId, first);
                 }
                 if (status is "COMPLETED" or "FAILED" or "CANCELLED" or "TIMED_OUT")
                 {
-                    throw await DescribeEndedJobAsync(jobId, status);
+                    JObject ended = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{jobId}", CancellationToken.None);
+                    if (IsVersion1Refusal(EndedOutput(ended)))
+                    {
+                        break;
+                    }
+                    throw DescribeEndedJob(jobId, status, ended);
                 }
                 if (cancel.IsCancellationRequested && status is "IN_QUEUE")
                 {
@@ -132,6 +161,8 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             await CancelJobAsync(jobId);
             throw;
         }
+        // Only reached when the worker answered as the version 1 image.
+        return await AcquireVersion1WorkerAsync(request, cancel);
     }
 
     /// <summary>The first streamed output, or null if none has arrived yet.</summary>
@@ -169,13 +200,28 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         };
     }
 
-    /// <summary>Builds a readable error for a lease job that ended before streaming a worker.</summary>
-    async Task<Exception> DescribeEndedJobAsync(string jobId, string status)
+    /// <summary>A finished job's output object. Aggregated streaming jobs report an array of chunks; plain jobs one object.</summary>
+    internal static JObject EndedOutput(JObject job)
     {
-        JObject job = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{jobId}", CancellationToken.None);
-        // Aggregated streaming jobs report output as an array of chunks; plain jobs as one object.
-        JToken output = job["output"];
-        string error = job["error"]?.ToString() ?? (output as JObject)?["error"]?.ToString() ?? ((output as JArray)?.FirstOrDefault() as JObject)?["error"]?.ToString();
+        JToken output = job?["output"];
+        return output as JObject ?? (output as JArray)?.FirstOrDefault() as JObject;
+    }
+
+    /// <summary>True for the version 1 worker's answer to an action it does not know, which lists its own actions.</summary>
+    internal static bool IsVersion1Refusal(JObject output)
+    {
+        if (output is null || output["success"]?.Value<bool>() is not false || output["available_actions"] is not JArray actions)
+        {
+            return false;
+        }
+        string error = output["error"]?.ToString() ?? "";
+        return error.StartsWith("Unknown action", StringComparison.OrdinalIgnoreCase) && actions.Any(a => a.ToString() == "wakeup") && actions.Any(a => a.ToString() == "keepalive");
+    }
+
+    /// <summary>Builds a readable error for a lease job that ended before streaming a worker.</summary>
+    static Exception DescribeEndedJob(string jobId, string status, JObject job)
+    {
+        string error = job["error"]?.ToString() ?? EndedOutput(job)?["error"]?.ToString();
         if (error is not null && error.Contains("Unknown action", StringComparison.OrdinalIgnoreCase))
         {
             return new SwarmReadableErrorException("The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at kalebbroo/swarmui-worker-runpod 2.0.0 or later.");
@@ -183,9 +229,160 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         return new SwarmReadableErrorException($"RunPod lease job {jobId} ended ({status}) before a worker was ready{(error is null ? "." : $": {error}")}");
     }
 
+    // ── Version 1 workers ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Holds a version 1 worker the way Cloud Backends 1.x did: a wakeup job returns the worker's address once its
+    /// SwarmUI is up, then keepalive jobs keep it running. That image has no gateway, so there is no token.
+    /// </summary>
+    async Task<CloudWorkerInfo> AcquireVersion1WorkerAsync(LeaseRequest request, CancellationToken cancel)
+    {
+        if (!Version1)
+        {
+            Version1 = true;
+            Logs.Warning($"{Tag} Endpoint {endpointId} runs the version 1 worker image. Using it in single-worker compatibility mode; point the endpoint at kalebbroo/swarmui-worker-runpod to scale out and get per-lease access tokens.");
+        }
+        CloudWorkerInfo worker = new() { Protocol = 1, KeepaliveSeconds = Math.Max(60, request.IdleSeconds) };
+        lock (Version1Lock)
+        {
+            if (Version1Held is not null)
+            {
+                throw new SwarmReadableErrorException("This RunPod endpoint runs the version 1 worker image, which supports one worker at a time, and that worker is already in use.");
+            }
+            Version1Held = worker;
+        }
+        try
+        {
+            worker.LeaseId = await SubmitJobAsync(new JObject { ["action"] = "wakeup" }, CancellationToken.None);
+            Logs.Info($"{Tag} Wakeup job {worker.LeaseId} submitted for endpoint {endpointId} (version 1 worker).");
+            JObject output = await WaitForWakeupAsync(worker.LeaseId, request, cancel);
+            if (output["error_id"]?.ToString() == "unknown_action")
+            {
+                // The endpoint has since moved to the version 2 image: go back to leases.
+                Version1 = false;
+                throw new SwarmReadableErrorException("The RunPod endpoint's worker image changed to version 2 while in use. Generate again to lease a worker from it.");
+            }
+            if (output["success"]?.Value<bool>() is not true)
+            {
+                throw new SwarmReadableErrorException($"The RunPod worker's wakeup failed: {output["error"] ?? output}");
+            }
+            string publicUrl = output["public_url"]?.ToString();
+            if (string.IsNullOrWhiteSpace(publicUrl))
+            {
+                throw new SwarmReadableErrorException($"The RunPod worker's wakeup did not return its address. Output: {output}");
+            }
+            worker.PublicUrl = publicUrl.TrimEnd('/');
+            worker.WorkerId = output["worker_id"]?.ToString();
+            worker.SessionId = output["session_id"]?.ToString();
+            // A finished wakeup leaves the worker without a job, and RunPod stops idle workers within seconds.
+            bool alive = await SubmitKeepaliveAsync(worker);
+            // Without a keepalive, only trust the worker briefly, as 1.x did.
+            worker.KeepaliveExpiry = DateTime.UtcNow.AddSeconds(alive ? worker.KeepaliveSeconds : 60);
+            Logs.Info($"{Tag} Version 1 worker {worker.WorkerId} ready at {worker.PublicUrl}.");
+            return worker;
+        }
+        catch (Exception)
+        {
+            await CancelJobAsync(worker.LeaseId);
+            await ReleaseVersion1Async(worker);
+            throw;
+        }
+    }
+
+    /// <summary>Waits for a wakeup job to finish, withdrawing it if cancelled while still queued.</summary>
+    async Task<JObject> WaitForWakeupAsync(string jobId, LeaseRequest request, CancellationToken cancel)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec);
+        int pollMs = Math.Clamp(request.PollIntervalMs, 1000, 5000);
+        using CancellationTokenSource waitCancel = CancellationTokenSource.CreateLinkedTokenSource(cancel, Program.GlobalProgramCancel);
+        while (true)
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new SwarmReadableErrorException($"No RunPod worker answered the wakeup within {request.StartupTimeoutSec}s. Check the endpoint's max workers, GPU availability, and worker logs.");
+            }
+            JObject job = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{jobId}", CancellationToken.None);
+            string status = job["status"]?.ToString() ?? "UNKNOWN";
+            if (status == "COMPLETED")
+            {
+                return EndedOutput(job) ?? throw new SwarmReadableErrorException($"RunPod wakeup job {jobId} completed without output.");
+            }
+            if (status is "FAILED" or "CANCELLED" or "TIMED_OUT")
+            {
+                throw DescribeEndedJob(jobId, status, job);
+            }
+            if (cancel.IsCancellationRequested && status == "IN_QUEUE" && await CancelJobAsync(jobId))
+            {
+                // Nobody needs the worker and none has been assigned; once one is, it is kept, as for leases.
+                cancel.ThrowIfCancellationRequested();
+            }
+            try
+            {
+                await Task.Delay(pollMs, cancel.IsCancellationRequested ? Program.GlobalProgramCancel : waitCancel.Token);
+            }
+            catch (OperationCanceledException) when (cancel.IsCancellationRequested && !Program.GlobalProgramCancel.IsCancellationRequested)
+            {
+                // Withdraw requested mid-wait: check the job's status right away.
+            }
+        }
+    }
+
+    /// <summary>Submits one keepalive job for a version 1 worker. Returns false, logging why, if it could not.</summary>
+    async Task<bool> SubmitKeepaliveAsync(CloudWorkerInfo worker)
+    {
+        try
+        {
+            string jobId = await SubmitJobAsync(new JObject { ["action"] = "keepalive", ["duration"] = worker.KeepaliveSeconds, ["interval"] = 30 }, CancellationToken.None);
+            worker.KeepaliveJobs[jobId] = 0;
+            Logs.Debug($"{Tag} Keepalive job {jobId} submitted for worker {worker.WorkerId} ({worker.KeepaliveSeconds}s).");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logs.Warning($"{Tag} Could not submit a keepalive job for worker {worker.WorkerId}; it may stop early: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>True once a version 1 worker's queued keepalives are less than half a window from running out.</summary>
+    internal static bool KeepaliveDue(DateTime expiry, int keepaliveSeconds, DateTime now)
+    {
+        return (expiry - now).TotalSeconds < keepaliveSeconds / 2.0;
+    }
+
+    /// <summary>A version 1 worker's expiry after one more keepalive. Queued keepalives run one after another, so each adds a full window.</summary>
+    internal static DateTime ExtendKeepalive(DateTime expiry, int keepaliveSeconds, DateTime now)
+    {
+        return (expiry > now ? expiry : now).AddSeconds(keepaliveSeconds);
+    }
+
+    /// <summary>Cancels a version 1 worker's keepalives, which stops it, and frees its one-worker place.</summary>
+    async Task ReleaseVersion1Async(CloudWorkerInfo worker)
+    {
+        foreach (string jobId in worker.KeepaliveJobs.Keys.ToArray())
+        {
+            if (worker.KeepaliveJobs.TryRemove(jobId, out _))
+            {
+                await CancelJobAsync(jobId);
+            }
+        }
+        lock (Version1Lock)
+        {
+            if (ReferenceEquals(Version1Held, worker))
+            {
+                Version1Held = null;
+            }
+        }
+    }
+
     /// <inheritdoc/>
     public async Task<bool> IsLeaseActiveAsync(CloudWorkerInfo worker, CancellationToken cancel)
     {
+        if (worker.Protocol == 1)
+        {
+            // As in 1.x: the worker is trusted until its queued keepalives run out.
+            return DateTime.UtcNow < worker.KeepaliveExpiry;
+        }
         try
         {
             JObject job = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{worker.LeaseId}", cancel);
@@ -207,16 +404,38 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     }
 
     /// <inheritdoc/>
-    /// <remarks>The worker ends its own lease when idle, so there is nothing to renew.</remarks>
-    public Task RenewLeaseAsync(CloudWorkerInfo worker, CancellationToken cancel)
+    /// <remarks>
+    /// The worker ends its own lease when idle, so there is nothing to renew. A version 1 worker gets one more keepalive
+    /// when less than half a window is left. Never by cancelling the running one: RunPod stops the worker running a cancelled job.
+    /// </remarks>
+    public async Task RenewLeaseAsync(CloudWorkerInfo worker, CancellationToken cancel)
     {
-        return Task.CompletedTask;
+        if (worker.Protocol != 1)
+        {
+            return;
+        }
+        await worker.RenewLock.WaitAsync(cancel);
+        try
+        {
+            if (KeepaliveDue(worker.KeepaliveExpiry, worker.KeepaliveSeconds, DateTime.UtcNow) && await SubmitKeepaliveAsync(worker))
+            {
+                worker.KeepaliveExpiry = ExtendKeepalive(worker.KeepaliveExpiry, worker.KeepaliveSeconds, DateTime.UtcNow);
+            }
+        }
+        finally
+        {
+            worker.RenewLock.Release();
+        }
     }
 
     /// <inheritdoc/>
     /// <remarks>Cancelling a running RunPod job stops the worker running it, which is exactly what releasing means here.</remarks>
     public Task ReleaseLeaseAsync(CloudWorkerInfo worker)
     {
+        if (worker.Protocol == 1)
+        {
+            return ReleaseVersion1Async(worker);
+        }
         return CancelJobAsync(worker.LeaseId);
     }
 
@@ -249,11 +468,16 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         {
             findings.Add(Finding("warning", $"Max Workers is {maxWorkers}, but the endpoint allows only {workersMax}. Scaling will stop at {workersMax}."));
         }
-        if (image.Length > 0 && !image.Contains("swarmui-worker-runpod", StringComparison.OrdinalIgnoreCase))
+        bool version1Image = image.Contains("swarmui-runpod", StringComparison.OrdinalIgnoreCase);
+        if (version1Image)
+        {
+            findings.Add(Finding("warning", $"The endpoint runs the version 1 worker image '{image}'. It works in single-worker compatibility mode (Max Workers is held to 1, and the worker has no access token). Point the endpoint at kalebbroo/swarmui-worker-runpod to scale out and secure it."));
+        }
+        else if (image.Length > 0 && !image.Contains("swarmui-worker-runpod", StringComparison.OrdinalIgnoreCase))
         {
             findings.Add(Finding("warning", $"The endpoint runs '{image}', not the Hartsy RunPod worker (kalebbroo/swarmui-worker-runpod). Other images will not answer lease requests."));
         }
-        if (image.EndsWith(":latest", StringComparison.OrdinalIgnoreCase) || (image.Length > 0 && !image.Contains(':')))
+        if (!version1Image && (image.EndsWith(":latest", StringComparison.OrdinalIgnoreCase) || (image.Length > 0 && !image.Contains(':'))))
         {
             findings.Add(Finding("warning", $"The endpoint's image '{image}' is not pinned to a version. Pin a release tag so workers do not change underneath you."));
         }

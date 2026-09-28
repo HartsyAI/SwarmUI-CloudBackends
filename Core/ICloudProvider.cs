@@ -31,6 +31,9 @@ public class LeaseRequest
 /// </summary>
 public interface ICloudProvider : IDisposable
 {
+    /// <summary>Most workers this provider can hold at once, whatever Max Workers says.</summary>
+    int WorkerLimit() => int.MaxValue;
+
     /// <summary>Human-readable provider name shown in logs and status responses.</summary>
     string ProviderName { get; }
 

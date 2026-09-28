@@ -86,6 +86,8 @@ Either way the list is remembered per user and endpoint, across restarts. Use th
 
 4. Press **Validate** in the section. It checks the endpoint's settings against the card (execution timeout, max workers, image version) and tells you what to fix. It costs nothing.
 
+**Already running the version 1 image (`kalebbroo/swarmui-runpod`)?** It keeps working, in single-worker compatibility mode: one worker at a time, kept alive with keepalive jobs as before, and without an access token on the worker. Move the endpoint to `kalebbroo/swarmui-worker-runpod` when you want scaling and a secured worker; your network volume works with both.
+
 ## Vast.ai Serverless setup
 
 Vast.ai serverless workers cannot attach a volume, so **your model must be inside the worker image**. Build one from the Hartsy Vast worker:
@@ -174,7 +176,8 @@ Everything the card does is available through SwarmUI's API. See [docs/APIRoutes
 |---|---|
 | `RunPod rejected the API key` / `Vast.ai rejected the API key` | Check the key in User Settings ▸ API Keys. |
 | `RunPod endpoint '...' was not found` | Check the Endpoint ID, and that the endpoint belongs to your account. |
-| `The RunPod worker image is too old` | Point the endpoint at `kalebbroo/swarmui-worker-runpod` 2.0.0 or later. |
+| `The RunPod worker image is too old` | The endpoint runs an image that is neither the version 1 nor the version 2 worker. Point it at `kalebbroo/swarmui-worker-runpod` 2.0.0 or later. |
+| `...version 1 worker image, which supports one worker at a time` | The version 1 image can hold only one worker. Move the endpoint to `kalebbroo/swarmui-worker-runpod` to run more. |
 | `No RunPod worker picked up the lease` / `No Vast.ai worker became available` | The provider had no GPU for you in time. Check the endpoint's max workers and GPU choices, or raise Startup Timeout. |
 | `worker ... is running SwarmUI with no backend configured` | The worker image is not a Hartsy worker image, or is broken. |
 | `worker ... refused its lease token` | The worker was released (idle, or stopped). The next generation starts a new one. |

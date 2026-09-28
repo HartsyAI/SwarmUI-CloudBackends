@@ -29,8 +29,17 @@ public class CloudWorkerInfo
     /// <summary>Vast.ai only: the session's expiry as the worker's Unix time, as last reported by the worker.</summary>
     public double LeaseExpiration;
 
-    /// <summary>Lease protocol version the worker reported.</summary>
+    /// <summary>Lease protocol version the worker reported. 1 is a RunPod version 1 worker, held by wakeup and keepalive jobs.</summary>
     public int Protocol;
+
+    /// <summary>RunPod version 1 workers only: seconds each keepalive job holds the worker.</summary>
+    public int KeepaliveSeconds;
+
+    /// <summary>RunPod version 1 workers only: when the queued keepalive jobs run out.</summary>
+    public DateTime KeepaliveExpiry;
+
+    /// <summary>RunPod version 1 workers only: keepalive jobs submitted and not yet cancelled.</summary>
+    public readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> KeepaliveJobs = new();
 
     /// <summary>Lease checks in a row that could not reach the worker. Reset by any answer.</summary>
     public int FailedLeaseChecks;

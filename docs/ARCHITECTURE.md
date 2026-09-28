@@ -61,7 +61,7 @@ RunPod's load-balancing endpoints were considered and rejected: no session affin
 
 ## Provider APIs
 
-- **RunPod Serverless**: job API at `api.runpod.ai/v2/<endpoint>/` (`run`, `stream`, `status`, `cancel`, `health`); endpoint configuration from `rest.runpod.io/v1/endpoints/<id>`. 429 and 5xx back off with `Retry-After` (`HttpRetry`).
+- **RunPod Serverless**: job API at `api.runpod.ai/v2/<endpoint>/` (`run`, `stream`, `status`, `cancel`, `health`); endpoint configuration from `rest.runpod.io/v1/endpoints/<id>`. 429 and 5xx back off with `Retry-After` (`HttpRetry`). An endpoint on the version 1 image answers the lease with its "Unknown action" refusal; the provider then holds workers the 1.x way (a `wakeup` job, then `keepalive` jobs topped up at half a window while in use, cancelled on release), with `WorkerLimit()` 1 and no gateway token.
 - **RunPod Pods**: REST API v2 (`api.runpod.io/v2`). Pods have no labels, so orphans are recognised by name prefix.
 - **Vast.ai Serverless**: `run.vast.ai/route/` for grants, the worker's PyWorker for sessions (exact wire format of `vastai/serverless/client/client.py`), and `console.vast.ai/api/v0/endptjobs/` for endpoint settings.
 - **Vast.ai Instances**: `console.vast.ai/api/v0` and `/api/v1/instances/`.
