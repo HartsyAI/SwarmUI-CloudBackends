@@ -78,6 +78,18 @@ public class ModelCacheTests
     }
 
     [Test]
+    public void ReloadedModelsAreValidForCoresModelList()
+    {
+        // Core casts loaded/standard_width/standard_height without a fallback; a cached entry lacking one broke the whole model list.
+        string raw = CloudBackendBase.SerializeModelCache(new Dictionary<string, Dictionary<string, JObject>> { ["Stable-Diffusion"] = new() { ["zimage/turbo.safetensors"] = new JObject { ["name"] = "zimage/turbo.safetensors", ["architecture"] = "z-image" } } });
+        JObject cached = CloudBackendBase.ParseModelCache(raw)["Stable-Diffusion"]["zimage/turbo.safetensors"];
+        Assert.That(() => SwarmUI.Text2Image.T2IModel.FromNetObject(cached), Throws.Nothing);
+        JObject nulls = CloudBackendBase.WithModelDefaults(new JObject { ["standard_width"] = JValue.CreateNull(), ["loaded"] = JValue.CreateNull() }, "a/b.safetensors");
+        Assert.That(() => SwarmUI.Text2Image.T2IModel.FromNetObject(nulls), Throws.Nothing);
+        Assert.That(nulls["local"]?.Value<bool>(), Is.False);
+    }
+
+    [Test]
     public void DamagedCacheThrowsSoTheCallerCanIgnoreIt()
     {
         Assert.That(() => CloudBackendBase.ParseModelCache("{not json"), Throws.Exception);

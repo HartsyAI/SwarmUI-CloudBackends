@@ -531,10 +531,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     async Task DetachAndReleaseAsync(WorkerSlot slot, string reason)
     {
         slot.Removing = true;
-        AdoptModelLists(slot);
+        // Copied before detaching (the lists go with the child), saved after releasing: saving triggers a model refresh that
+        // would reach this worker, whose token is already revoked when its lease ended, and must never stop the release.
+        List<KeyValuePair<string, Dictionary<string, JObject>>> models = ModelListsOf(slot);
         await CloudChildBackend.DetachAsync(Handler, slot.Child, slot.Provider.ProviderName);
         await slot.Provider.ReleaseLeaseAsync(slot.Worker);
         Logs.Info($"[{slot.Provider.ProviderName}] Released worker {slot.Worker.WorkerId} ({reason}); {Slots.Length} worker(s) left.");
+        if (models is not null)
+        {
+            CommitModels(models);
+        }
     }
 
     /// <summary>Finds a slot by the worker ID the provider reported.</summary>
@@ -834,16 +840,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     }
 
     /// <summary>
-    /// Copies a slot's mirrored model lists onto this backend, and saves them.
-    /// That is what lets a sleeping endpoint still offer its models, and core refuse models it does not have.
+    /// A copy of a slot's mirrored model lists, or null if it has none. Kept on this backend after the worker goes, which is
+    /// what lets a sleeping endpoint still offer its models, and core refuse models it does not have.
     /// </summary>
-    void AdoptModelLists(WorkerSlot slot)
+    List<KeyValuePair<string, Dictionary<string, JObject>>> ModelListsOf(WorkerSlot slot)
     {
         if (slot.Child?.AbstractBackend is not SwarmSwarmBackend swarm || swarm.RemoteModels is null || !swarm.RemoteModels.Any(kv => kv.Value.Count > 0))
         {
-            return;
+            return null;
         }
-        CommitModels(swarm.RemoteModels);
+        return [.. swarm.RemoteModels.Select(kv => new KeyValuePair<string, Dictionary<string, JObject>>(kv.Key, kv.Value.ToDictionary(m => m.Key, m => (JObject)m.Value.DeepClone())))];
     }
 
     /// <summary>
@@ -856,12 +862,46 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         Models ??= new();
         foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in listing)
         {
-            Dictionary<string, JObject> models = new(kv.Value);
+            Dictionary<string, JObject> models = kv.Value.ToDictionary(m => m.Key, m => WithModelDefaults(m.Value, m.Key));
             RemoteModels[kv.Key] = models;
             Models[kv.Key] = [.. models.Keys];
         }
         SaveModelCache();
-        Program.ModelRefreshEvent?.Invoke();
+        try
+        {
+            Program.ModelRefreshEvent?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            // Refreshing reaches every backend, including workers that just went away; the list itself is already saved.
+            Logs.Debug($"[{CloudProviderName}] Model refresh after updating the model list failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Marks a cloud model as remote and fills every field core's <see cref="T2IModel.FromNetObject"/> reads without a fallback
+    /// (loaded, standard_width, standard_height): one missing field there breaks the model list for the whole server.
+    /// </summary>
+    internal static JObject WithModelDefaults(JObject meta, string name)
+    {
+        meta["name"] ??= name;
+        meta["title"] ??= name.AfterLast('/');
+        meta["description"] ??= "";
+        meta["local"] = false;
+        meta["preview_image"] ??= "imgs/model_placeholder.jpg";
+        meta["is_supported_model_format"] ??= true;
+        if (meta["loaded"]?.Type != JTokenType.Boolean)
+        {
+            meta["loaded"] = false;
+        }
+        foreach (string dimension in new[] { "standard_width", "standard_height" })
+        {
+            if (meta[dimension]?.Type != JTokenType.Integer)
+            {
+                meta[dimension] = 0;
+            }
+        }
+        return meta;
     }
 
     /// <summary>Per-user storage key for this endpoint's model list.</summary>
@@ -911,13 +951,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             Dictionary<string, JObject> models = [];
             foreach (JProperty model in ((JObject)subtype.Value).Properties())
             {
-                JObject meta = (JObject)model.Value;
-                meta["name"] ??= model.Name;
-                meta["title"] ??= model.Name.AfterLast('/');
-                meta["local"] = false;
-                meta["preview_image"] = "imgs/model_placeholder.jpg";
-                meta["is_supported_model_format"] = true;
-                models[model.Name] = meta;
+                models[model.Name] = WithModelDefaults((JObject)model.Value, model.Name);
             }
             loaded[subtype.Name] = models;
         }
@@ -991,11 +1025,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     continue;
                 }
-                meta["local"] = false;
-                meta["title"] ??= name.AfterLast('/');
-                meta["preview_image"] ??= "imgs/model_placeholder.jpg";
-                meta["is_supported_model_format"] ??= true;
-                models[name] = meta;
+                models[name] = WithModelDefaults(meta, name);
             }
             listing[subtype] = models;
         }
