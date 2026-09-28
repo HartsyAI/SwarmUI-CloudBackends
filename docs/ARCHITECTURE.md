@@ -53,7 +53,7 @@ RunPod's load-balancing endpoints were considered and rejected: no session affin
 - **Handoff** (`ClaimGeneratorAsync`). Claims a free worker backend through `T2IBackendAccess` (under `SlotLock`, so two handoffs never take the same one). Otherwise it starts a lease, and keeps checking existing workers while it starts; if one frees up first, the new lease is withdrawn if the provider has not assigned a worker yet (a RunPod job still `IN_QUEUE`), or kept as a slot if it has.
 - `MaxUsages` is well above `MaxWorkers`, because a request holds its usage for the whole handed-off generation. Leasing is limited separately, by slots plus leases starting, so extra usages only let requests queue here while workers start.
 - **Maintenance** (`OnTick`, every 5 s): renews in-use leases (throttled per slot) and checks each lease every 15 s; a lease that has ended is removed (model list kept, child detached, lease released).
-- **Models**: `LoadModel` never leases (the worker loads the model as part of the generation). The model list is adopted from a slot's child when it is removed, merged, and saved per user and endpoint with `SaveGenericData` (names plus a few small fields, never previews). `RemoteModels` feeds the model browser via `ExtraModelProviders`.
+- **Models**: `LoadModel` never leases (the worker loads the model as part of the generation). The model list is adopted from a slot's child when it is removed (each reported model type's list replaces the old one), and saved per user and endpoint with `SaveGenericData` (names plus a few small fields, never previews). `RemoteModels` feeds the model browser via `ExtraModelProviders`.
 
 ## Instances
 

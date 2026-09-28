@@ -215,6 +215,7 @@ public class HttpRetryTests
     {
         Assert.That(HttpRetry.IsTransient(HttpStatusCode.TooManyRequests), Is.True);
         Assert.That(HttpRetry.IsTransient(HttpStatusCode.ServiceUnavailable), Is.True);
+        Assert.That(HttpRetry.IsTransient(HttpStatusCode.InternalServerError), Is.True);
         Assert.That(HttpRetry.IsTransient(HttpStatusCode.Unauthorized), Is.False);
         Assert.That(HttpRetry.IsTransient(HttpStatusCode.NotFound), Is.False);
     }

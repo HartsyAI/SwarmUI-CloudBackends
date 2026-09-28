@@ -108,10 +108,13 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
                 if (cancel.IsCancellationRequested && status is "IN_QUEUE")
                 {
                     // Nobody needs this worker anymore and none has been assigned: withdraw it before it bills.
-                    withdrawn = true;
-                    await CancelJobAsync(jobId);
-                    Logs.Debug($"{Tag} Lease job {jobId} withdrawn while still queued.");
-                    cancel.ThrowIfCancellationRequested();
+                    // Only a confirmed cancel ends tracking; otherwise keep polling, and keep the worker if one is assigned.
+                    if (await CancelJobAsync(jobId))
+                    {
+                        withdrawn = true;
+                        Logs.Debug($"{Tag} Lease job {jobId} withdrawn while still queued.");
+                        cancel.ThrowIfCancellationRequested();
+                    }
                 }
                 // Once IN_PROGRESS a worker is already assigned and billing, so it is kept (see the interface docs).
                 try
@@ -281,21 +284,23 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         return await ReadJsonAsync(response, new Uri(url).AbsolutePath, cancel);
     }
 
-    /// <summary>Cancels a job. Best-effort: never throws.</summary>
-    public async Task CancelJobAsync(string jobId)
+    /// <summary>Cancels a job. Best-effort: never throws. Returns true only if RunPod accepted the cancel.</summary>
+    public async Task<bool> CancelJobAsync(string jobId)
     {
         if (string.IsNullOrEmpty(jobId))
         {
-            return;
+            return false;
         }
         try
         {
             using HttpResponseMessage response = await HttpRetry.SendAsync(Http, () => Request(HttpMethod.Post, $"https://api.runpod.ai/v2/{endpointId}/cancel/{jobId}", null), Tag, CancellationToken.None);
-            Logs.Debug($"{Tag} Cancelled job {jobId} ({(int)response.StatusCode}).");
+            Logs.Debug($"{Tag} Cancel of job {jobId} answered {(int)response.StatusCode}.");
+            return response.IsSuccessStatusCode;
         }
         catch (Exception ex)
         {
             Logs.Verbose($"{Tag} Cancel failed for {jobId}: {ex.Message}");
+            return false;
         }
     }
 

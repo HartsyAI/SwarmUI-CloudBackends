@@ -6,7 +6,7 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 
 /// <summary>
 /// Retries provider API calls the provider asked us to back off from (429) or that failed transiently
-/// (502, 503, 504, connection errors). Honors <c>Retry-After</c>, otherwise backs off exponentially with jitter.
+/// (500, 502, 503, 504, connection errors). Honors <c>Retry-After</c>, otherwise backs off exponentially with jitter.
 /// Everything else is returned to the caller unchanged, including 4xx errors that need a readable message.
 /// </summary>
 public static class HttpRetry
@@ -23,7 +23,7 @@ public static class HttpRetry
     /// <summary>True for statuses worth retrying.</summary>
     public static bool IsTransient(HttpStatusCode status)
     {
-        return status is HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout;
+        return status is HttpStatusCode.TooManyRequests or HttpStatusCode.InternalServerError or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout;
     }
 
     /// <summary>How long to wait before the given retry attempt (1-based), honoring <paramref name="retryAfter"/> when present.</summary>

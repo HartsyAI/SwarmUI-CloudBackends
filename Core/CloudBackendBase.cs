@@ -777,7 +777,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     }
 
     /// <summary>
-    /// Copies a slot's mirrored model lists onto this backend (merged with what is already known), and saves them.
+    /// Copies a slot's mirrored model lists onto this backend, and saves them.
     /// That is what lets a sleeping endpoint still offer its models, and core refuse models it does not have.
     /// </summary>
     void AdoptModelLists(WorkerSlot slot)
@@ -789,20 +789,19 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         CommitModels(swarm.RemoteModels);
     }
 
-    /// <summary>Merges a model listing into <see cref="RemoteModels"/> and <see cref="AbstractT2IBackend.Models"/>, and persists it.</summary>
+    /// <summary>
+    /// Stores a model listing in <see cref="RemoteModels"/> and <see cref="AbstractT2IBackend.Models"/>, and persists it.
+    /// Each reported subtype's list is complete, so it replaces the old one: models removed from the endpoint drop out.
+    /// </summary>
     void CommitModels(IEnumerable<KeyValuePair<string, Dictionary<string, JObject>>> listing)
     {
         RemoteModels ??= new();
         Models ??= new();
         foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in listing)
         {
-            Dictionary<string, JObject> merged = RemoteModels.TryGetValue(kv.Key, out Dictionary<string, JObject> existing) ? new(existing) : [];
-            foreach (KeyValuePair<string, JObject> model in kv.Value)
-            {
-                merged[model.Key] = model.Value;
-            }
-            RemoteModels[kv.Key] = merged;
-            Models[kv.Key] = [.. merged.Keys];
+            Dictionary<string, JObject> models = new(kv.Value);
+            RemoteModels[kv.Key] = models;
+            Models[kv.Key] = [.. models.Keys];
         }
         SaveModelCache();
         Program.ModelRefreshEvent?.Invoke();
