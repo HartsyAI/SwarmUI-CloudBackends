@@ -18,8 +18,8 @@ By Hartsy. MIT licensed.
 - SwarmUI (current release).
 - An account with RunPod and/or Vast.ai, with credit.
 - For serverless: an endpoint running the Hartsy worker image. Setup is below.
-  - RunPod: [`hartsy/swarmui-worker-runpod`](https://github.com/HartsyAI/RunPod-Worker-SwarmUI)
-  - Vast.ai: an image built from [`hartsy/swarmui-worker-vast`](https://github.com/HartsyAI/Vast-Worker-SwarmUI)
+  - RunPod: [`kalebbroo/swarmui-worker-runpod`](https://github.com/HartsyAI/RunPod-Worker-SwarmUI)
+  - Vast.ai: an image built from [`kalebbroo/swarmui-worker-vast`](https://github.com/HartsyAI/Vast-Worker-SwarmUI)
 
 ## Installation
 
@@ -61,7 +61,7 @@ Either way the list is remembered per user and endpoint, across restarts. Use th
 ## RunPod Serverless setup
 
 1. **Network volume.** In RunPod, create a network volume in the data center you want. Put your models in `Models/` at its root, using SwarmUI's folder names: `Models/Stable-Diffusion`, `Models/Lora`, `Models/VAE`, and so on.
-2. **Endpoint.** Create a **Queue** serverless endpoint from `hartsy/swarmui-worker-runpod:<version>-comfyui` (or `-hartsyinference`), pinned to a release version:
+2. **Endpoint.** Create a **Queue** serverless endpoint from `kalebbroo/swarmui-worker-runpod:<version>-comfyui` (or `-hartsyinference`), pinned to a release version:
 
    | Setting | Value |
    |---|---|
@@ -174,7 +174,7 @@ Everything the card does is available through SwarmUI's API. See [docs/APIRoutes
 |---|---|
 | `RunPod rejected the API key` / `Vast.ai rejected the API key` | Check the key in User Settings ▸ API Keys. |
 | `RunPod endpoint '...' was not found` | Check the Endpoint ID, and that the endpoint belongs to your account. |
-| `The RunPod worker image is too old` | Point the endpoint at `hartsy/swarmui-worker-runpod` 2.0.0 or later. |
+| `The RunPod worker image is too old` | Point the endpoint at `kalebbroo/swarmui-worker-runpod` 2.0.0 or later. |
 | `No RunPod worker picked up the lease` / `No Vast.ai worker became available` | The provider had no GPU for you in time. Check the endpoint's max workers and GPU choices, or raise Startup Timeout. |
 | `worker ... is running SwarmUI with no backend configured` | The worker image is not a Hartsy worker image, or is broken. |
 | `worker ... refused its lease token` | The worker was released (idle, or stopped). The next generation starts a new one. |

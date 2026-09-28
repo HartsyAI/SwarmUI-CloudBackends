@@ -187,7 +187,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         string token = lease["token"]?.ToString();
         if (protocol < RequiredProtocol || string.IsNullOrWhiteSpace(publicUrl) || string.IsNullOrWhiteSpace(token))
         {
-            throw new SwarmReadableErrorException("The Vast.ai worker image is too old for this version of Cloud Backends. Use an image built from hartsy/swarmui-worker-vast.");
+            throw new SwarmReadableErrorException("The Vast.ai worker image is too old for this version of Cloud Backends. Use an image built from kalebbroo/swarmui-worker-vast.");
         }
         worker.PublicUrl = publicUrl.TrimEnd('/');
         worker.Token = token;

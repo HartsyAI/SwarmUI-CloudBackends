@@ -153,7 +153,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         string token = output["token"]?.ToString();
         if (protocol < RequiredProtocol || string.IsNullOrWhiteSpace(publicUrl) || string.IsNullOrWhiteSpace(token))
         {
-            throw new SwarmReadableErrorException($"The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at hartsy/swarmui-worker-runpod 2.0.0 or later.");
+            throw new SwarmReadableErrorException($"The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at kalebbroo/swarmui-worker-runpod 2.0.0 or later.");
         }
         Logs.Info($"{Tag} Lease {jobId} holds worker {output["worker_id"]}.");
         return new CloudWorkerInfo
@@ -175,7 +175,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         string error = job["error"]?.ToString() ?? (output as JObject)?["error"]?.ToString() ?? ((output as JArray)?.FirstOrDefault() as JObject)?["error"]?.ToString();
         if (error is not null && error.Contains("Unknown action", StringComparison.OrdinalIgnoreCase))
         {
-            return new SwarmReadableErrorException("The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at hartsy/swarmui-worker-runpod 2.0.0 or later.");
+            return new SwarmReadableErrorException("The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at kalebbroo/swarmui-worker-runpod 2.0.0 or later.");
         }
         return new SwarmReadableErrorException($"RunPod lease job {jobId} ended ({status}) before a worker was ready{(error is null ? "." : $": {error}")}");
     }
@@ -248,7 +248,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         }
         if (image.Length > 0 && !image.Contains("swarmui-worker-runpod", StringComparison.OrdinalIgnoreCase))
         {
-            findings.Add(Finding("warning", $"The endpoint runs '{image}', not the Hartsy RunPod worker (hartsy/swarmui-worker-runpod). Other images will not answer lease requests."));
+            findings.Add(Finding("warning", $"The endpoint runs '{image}', not the Hartsy RunPod worker (kalebbroo/swarmui-worker-runpod). Other images will not answer lease requests."));
         }
         if (image.EndsWith(":latest", StringComparison.OrdinalIgnoreCase) || (image.Length > 0 && !image.Contains(':')))
         {
