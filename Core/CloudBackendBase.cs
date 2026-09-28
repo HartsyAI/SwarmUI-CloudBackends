@@ -691,6 +691,27 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// Waits until the worker's SwarmUI has at least one backend running and none still loading. A worker that
     /// answers but has no backend at all is a broken image, reported promptly rather than after the full timeout.
     /// </summary>
+    /// <summary>The worker's own latest error log lines, so a failed start can say why. Null if they cannot be read.</summary>
+    async Task<string> RecentWorkerErrorsAsync(WorkerSlot slot)
+    {
+        try
+        {
+            JObject logs = await CallWorkerAPI(slot, "ListRecentLogMessages", new JObject { ["types"] = new JArray("Error"), ["last_sequence_ids"] = new JObject() }, 20);
+            string[] lines = [.. (logs["data"]?["Error"] as JArray ?? []).TakeLast(2).Select(m => m["message"]?.ToString()).Where(m => !string.IsNullOrWhiteSpace(m))];
+            if (lines.Length == 0)
+            {
+                return null;
+            }
+            string joined = string.Join(" | ", lines);
+            return joined.Length > 600 ? joined[..600] + "..." : joined;
+        }
+        catch (Exception ex)
+        {
+            Logs.Debug($"[{CloudProviderName}] Could not read worker {slot.Worker.WorkerId}'s logs: {ex.Message}");
+            return null;
+        }
+    }
+
     async Task WaitForWorkerBackendsLoadedAsync(WorkerSlot slot, ICloudProvider provider)
     {
         LeaseRequest request = MakeLeaseRequest();
@@ -732,7 +753,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 allFailedSince = allFailed ? allFailedSince ?? DateTime.UtcNow : null;
                 if (allFailedSince is DateTime since && (DateTime.UtcNow - since).TotalSeconds > 60)
                 {
-                    throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} could not start its generation backend ({state}). Check the worker's logs in the provider console.");
+                    string cause = await RecentWorkerErrorsAsync(slot);
+                    throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} could not start its generation backend ({state}).{(cause is null ? " Check the worker's logs in the provider console." : $" The worker reported: {cause}")}");
                 }
                 if (!everSawBackend && (DateTime.UtcNow - start).TotalSeconds > 90)
                 {
