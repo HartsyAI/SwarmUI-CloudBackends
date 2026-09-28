@@ -59,3 +59,41 @@
     opacity: 0.85;
     font-size: 0.9em;
 }
+
+/* Leased serverless workers, and orphaned instances. */
+
+.cloudbackends-worker-list {
+    flex-basis: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.cloudbackends-worker-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.9em;
+}
+
+.cloudbackends-worker-row span {
+    flex: 1;
+    overflow-wrap: anywhere;
+}
+
+.cloudbackends-pod-status {
+    white-space: pre-line;
+}
+
+.cloudbackends-orphans {
+    border: 1px solid var(--bs-warning, #c90);
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    background: rgba(204, 153, 0, 0.12);
+}
+
+.cloudbackends-orphans-title {
+    font-weight: 600;
+    margin-bottom: 4px;
+}

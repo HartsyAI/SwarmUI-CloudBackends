@@ -1,3 +1,4 @@
+using FreneticUtilities.FreneticExtensions;
 using FreneticUtilities.FreneticDataSyntax;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
@@ -86,13 +87,13 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     protected virtual void CheckRequiredConfig() { }
 
     /// <summary>The live provider, once created in Init.</summary>
-    public ICloudInstanceProvider Provider { get; private set; }
+    public ICloudInstanceProvider Provider;
 
     /// <summary>The running instance, once started.</summary>
-    public CloudInstanceInfo CurrentInstance { get; private set; }
+    public CloudInstanceInfo CurrentInstance;
 
     /// <summary>The child SwarmSwarmBackend attached to the instance, which does the actual work.</summary>
-    public BackendHandler.BackendData ChildBackend { get; private set; }
+    public BackendHandler.BackendData ChildBackend;
 
     /// <summary>Guards start and stop so two requests cannot race the instance lifecycle.</summary>
     public SemaphoreSlim InstanceLock = new(1, 1);
@@ -105,7 +106,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     // its own periodic housekeeping; throttled internally since the tick fires roughly once a second.
 
     /// <summary>When the current instance was confirmed up. Null while no instance is running.</summary>
-    public DateTime? InstanceStartedAt { get; private set; }
+    public DateTime? InstanceStartedAt;
 
     /// <summary>Guards against the failsafe re-triggering while an async stop from a prior trip is still in flight.</summary>
     volatile bool FailsafeTripped = false;
@@ -115,17 +116,29 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
 
     void FailsafeTick()
     {
-        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped) { return; }
-        if (InstanceConfig.MaxRuntimeMinutes <= 0 && InstanceConfig.MaxSpendUsd <= 0) { return; }
+        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped)
+        {
+            return;
+        }
+        if (InstanceConfig.MaxRuntimeMinutes <= 0 && InstanceConfig.MaxSpendUsd <= 0)
+        {
+            return;
+        }
         long now = Environment.TickCount64;
-        if (now < NextFailsafeCheckTicks) { return; }
+        if (now < NextFailsafeCheckTicks)
+        {
+            return;
+        }
         NextFailsafeCheckTicks = now + 30_000; // no need to check more than roughly twice a minute
         _ = Utilities.RunCheckedTask(CheckFailsafeAsync, $"{GetType().Name} #{BackendData?.ID} failsafe check");
     }
 
     async Task CheckFailsafeAsync()
     {
-        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped) { return; }
+        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped)
+        {
+            return;
+        }
         TimeSpan runtime = DateTime.UtcNow - InstanceStartedAt.Value;
         string reason = null;
         if (InstanceConfig.MaxRuntimeMinutes > 0 && runtime.TotalMinutes >= InstanceConfig.MaxRuntimeMinutes)
@@ -147,9 +160,15 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
                 }
             }
             // A failed rate lookup must not block the run - only the runtime cap is guaranteed regardless.
-            catch (Exception ex) { Logs.Verbose($"[{Provider?.ProviderName}] Failsafe spend check failed: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                Logs.Verbose($"[{Provider?.ProviderName}] Failsafe spend check failed: {ex.Message}");
+            }
         }
-        if (reason is null) { return; }
+        if (reason is null)
+        {
+            return;
+        }
         FailsafeTripped = true;
         try
         {
@@ -157,7 +176,10 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             AddLoadStatus($"Auto-stopped: {reason}.");
             await StopInstanceAsync();
         }
-        finally { FailsafeTripped = false; }
+        finally
+        {
+            FailsafeTripped = false;
+        }
     }
 
     // ── Per-user instance persistence ─────────────────────────────────────────
@@ -176,19 +198,82 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// to their provider as a reattach hint (used only after live verification, never trusted blindly),
     /// so a restart reattaches the owner's existing billed instance instead of creating a second one.
     /// </summary>
-    protected string PersistedInstanceId { get; private set; }
+    protected string PersistedInstanceId;
+
+    /// <summary>
+    /// The gateway token for this owner's instance, created once and remembered alongside the instance ID so a
+    /// restart can reattach. Injected into instances this backend creates, and sent by the attached child. Never logged.
+    /// </summary>
+    protected string WorkerToken;
+
+    /// <summary>A token set in the card for an existing machine you created yourself, or null to use (and inject) this backend's own.</summary>
+    protected virtual string ExistingWorkerToken => null;
 
     /// <summary>Remembers the provider's active instance ID in the owner's user data (no-op if unchanged or unknown).</summary>
+    /// <summary>How many instance IDs per provider are remembered for orphan detection.</summary>
+    const int KnownInstanceLimit = 50;
+
+    /// <summary>Makes each read-modify-write of a remembered-instances list atomic, so two cards finishing at once cannot drop each other's ID.</summary>
+    static readonly object KnownInstancesLock = new();
+
+    /// <summary>
+    /// Adds an instance ID to the owner's list of instances this extension has created or attached for a provider. Kept
+    /// separately from the active ID (which a newer instance replaces), so orphan detection can recognise machines with
+    /// any name or label, not only the default one.
+    /// </summary>
+    public static void RememberKnownInstance(User owner, string backendTypeName, string id)
+    {
+        if (owner is null || string.IsNullOrWhiteSpace(id))
+        {
+            return;
+        }
+        lock (KnownInstancesLock)
+        {
+            List<string> known = KnownInstances(owner, backendTypeName);
+            known.Remove(id);
+            known.Add(id);
+            if (known.Count > KnownInstanceLimit)
+            {
+                known.RemoveRange(0, known.Count - KnownInstanceLimit);
+            }
+            owner.SaveGenericData("cloudbackends", $"known_{backendTypeName}", new JArray(known).ToString(Newtonsoft.Json.Formatting.None));
+        }
+    }
+
+    /// <summary>Instance IDs this extension has created or attached for the owner, for one provider's backend type.</summary>
+    public static List<string> KnownInstances(User owner, string backendTypeName)
+    {
+        string raw = owner?.GetGenericData("cloudbackends", $"known_{backendTypeName}");
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return [];
+        }
+        try
+        {
+            return [.. JArray.Parse(raw).Select(t => t.ToString())];
+        }
+        catch (Newtonsoft.Json.JsonException)
+        {
+            return [];
+        }
+    }
+
     void PersistActiveInstanceId()
     {
         string id = Provider?.ActiveInstanceId;
-        if (string.IsNullOrWhiteSpace(id) || id == PersistedInstanceId)
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            return;
+        }
+        // Recorded even when unchanged: an ID remembered before the known-instances list existed must still join it.
+        RememberKnownInstance(Owner, GetType().Name, id);
+        if (id == PersistedInstanceId)
         {
             return;
         }
         PersistedInstanceId = id;
         Owner?.SaveGenericData("cloudbackends", PersistName, id);
-        Logs.Debug($"[{Provider?.ProviderName}] Remembered instance '{id}' for user '{OwnerUserId}' under '{PersistName.ToLowerInvariant()}'.");
+        Logs.Debug($"[{Provider?.ProviderName}] Remembered instance '{id}' for user '{OwnerUserId}' under '{PersistName.ToLowerFast()}'.");
     }
 
     public override async Task Init()
@@ -204,6 +289,14 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend has no valid owner user ('{OwnerUserId}').");
             apiKey = GetApiKey(owner);
             PersistedInstanceId = owner.GetGenericData("cloudbackends", PersistName)?.Trim();
+            // Covers installs whose instance was remembered before the known-instances list existed.
+            RememberKnownInstance(owner, GetType().Name, PersistedInstanceId);
+            WorkerToken = string.IsNullOrWhiteSpace(ExistingWorkerToken) ? owner.GetGenericData("cloudbackends", $"{PersistName}_token")?.Trim() : ExistingWorkerToken.Trim();
+            if (string.IsNullOrWhiteSpace(WorkerToken))
+            {
+                WorkerToken = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(36)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+                owner.SaveGenericData("cloudbackends", $"{PersistName}_token", WorkerToken);
+            }
         }
         catch (Exception ex)
         {
@@ -260,9 +353,13 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// Starts the cloud instance if it is not already running, and attaches the owner-bound swarm
     /// child to it. Safe to call repeatedly.
     /// </summary>
+    /// <summary>True while a start is in progress: the provider may already know the instance's ID, but the child is not attached yet.</summary>
+    public volatile bool Starting = false;
+
     public async Task StartInstanceAsync()
     {
         await InstanceLock.WaitAsync(Program.GlobalProgramCancel);
+        Starting = true;
         try
         {
             if (ChildBackend is not null && CurrentInstance is not null)
@@ -287,21 +384,37 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             InstanceStartedAt = DateTime.UtcNow;
             AddLoadStatus($"{Provider.ProviderName} instance ready.");
         }
-        finally { InstanceLock.Release(); }
+        finally
+        {
+            Starting = false;
+            InstanceLock.Release();
+        }
     }
 
     /// <summary>Hands the instance URL to an owner-bound swarm child, which does all the real work.</summary>
     internal void AttachChildBackend()
     {
         string title = $"[{Provider.ProviderName} {CurrentInstance.InstanceId}] {(string.IsNullOrWhiteSpace(CurrentInstance.Description) ? "Cloud Instance" : CurrentInstance.Description)}";
-        ChildBackend = CloudChildBackend.Attach(this, CurrentInstance.PublicUrl, title, InstanceConfig.StartupTimeoutSec);
+        ChildBackend = CloudChildBackend.Attach(this, GetChildAddress(CurrentInstance.PublicUrl), title, InstanceConfig.StartupTimeoutSec, $"Bearer {WorkerToken}");
         Logs.Info($"[{Provider.ProviderName}] Attached Swarm backend #{ChildBackend.ID} to instance '{CurrentInstance.InstanceId}'.");
     }
 
     /// <inheritdoc/>
     /// <remarks>A rented instance bills for wall-clock time until it is stopped, so generation activity
     /// changes nothing about its lifetime. Only serverless has anything to do here.</remarks>
-    public Task OnChildGenerationStartingAsync() => Task.CompletedTask;
+    public Task OnChildGenerationStartingAsync(SwarmSwarmBackend control) => Task.CompletedTask;
+
+    /// <summary>The address the child connects to for an instance URL. Vast.ai overrides this with a TLS relay.</summary>
+    protected virtual string GetChildAddress(string publicUrl)
+    {
+        return publicUrl;
+    }
+
+    /// <summary>Called after the child is detached, to free anything <see cref="GetChildAddress"/> created.</summary>
+    protected virtual Task OnChildDetachedAsync()
+    {
+        return Task.CompletedTask;
+    }
 
     /// <summary>Removes the child backend and releases the cloud instance.</summary>
     public async Task StopInstanceAsync()
@@ -314,17 +427,27 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
                 BackendHandler.BackendData child = ChildBackend;
                 ChildBackend = null;
                 await CloudChildBackend.DetachAsync(Handler, child, Provider?.ProviderName);
+                await OnChildDetachedAsync();
             }
             if (Provider is not null && CurrentInstance is not null)
             {
                 // Releasing matters more than tidiness: a running instance bills until it is stopped.
-                try { await Provider.ReleaseInstanceAsync(); }
-                catch (Exception ex) { Logs.Error($"[{Provider.ProviderName}] Failed to release instance '{CurrentInstance.InstanceId}', it may still be billing: {ex.ReadableString()}"); }
+                try
+                {
+                    await Provider.ReleaseInstanceAsync();
+                }
+                catch (Exception ex)
+                {
+                    Logs.Error($"[{Provider.ProviderName}] Failed to release instance '{CurrentInstance.InstanceId}', it may still be billing: {ex.ReadableString()}");
+                }
             }
             CurrentInstance = null;
             InstanceStartedAt = null;
         }
-        finally { InstanceLock.Release(); }
+        finally
+        {
+            InstanceLock.Release();
+        }
     }
 
     public override async Task Shutdown()

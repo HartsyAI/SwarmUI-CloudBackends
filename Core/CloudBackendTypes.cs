@@ -18,20 +18,26 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 /// </summary>
 public static class CloudBackendTypes
 {
+    /// <summary>Default worker image for RunPod pods: the Hartsy RunPod worker, pinned to the release this version was tested with.</summary>
+    public const string DefaultRunPodImage = "kalebbroo/swarmui-worker-runpod:2.0.0-comfyui";
+
+    /// <summary>Default worker image for Vast.ai instances: the Hartsy Vast.ai worker, pinned to the release this version was tested with.</summary>
+    public const string DefaultVastImage = "kalebbroo/swarmui-worker-vast:1.0.0-hartsyinference";
+
     /// <summary>Hidden type record for the RunPod Serverless child backend.</summary>
-    public static BackendHandler.BackendType RunPodServerless { get; private set; }
+    public static BackendHandler.BackendType RunPodServerless;
 
     /// <summary>Hidden type record for the RunPod GPU Pods child backend.</summary>
-    public static BackendHandler.BackendType RunPodPods { get; private set; }
+    public static BackendHandler.BackendType RunPodPods;
 
     /// <summary>Hidden type record for the Vast.ai Serverless child backend.</summary>
-    public static BackendHandler.BackendType VastAI { get; private set; }
+    public static BackendHandler.BackendType VastAI;
 
     /// <summary>Hidden type record for the Vast.ai Instances child backend.</summary>
-    public static BackendHandler.BackendType VastAIInstance { get; private set; }
+    public static BackendHandler.BackendType VastAIInstance;
 
     /// <summary>Type record for the owner-gated swarm backend attached to a started cloud instance (see <see cref="OwnerBoundSwarmBackend"/>).</summary>
-    public static BackendHandler.BackendType OwnerBoundSwarm { get; private set; }
+    public static BackendHandler.BackendType OwnerBoundSwarm;
 
     public static void Init()
     {

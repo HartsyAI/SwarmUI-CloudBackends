@@ -1,8 +1,6 @@
-using FreneticUtilities.FreneticDataSyntax;
 using Hartsy.Extensions.CloudBackends;
 using Hartsy.Extensions.CloudBackends.Core;
 using SwarmUI.Accounts;
-using SwarmUI.DataHolders;
 using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
@@ -14,23 +12,16 @@ namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
 /// </summary>
 public class VastAIBackend : CloudBackendBase
 {
+    /// <summary>Vast.ai serverless settings. <see cref="BaseSettings.EndpointId"/> holds the endpoint NAME, which is what /route/ matches on.</summary>
     public class Settings : BaseSettings
     {
-        // EndpointId holds the Vast.ai serverless endpoint NAME, which is what /route/ matches on.
-
-        [SuggestionPlaceholder(Text = "handler")]
-        [ConfigComment("Route on the worker that serves the SwarmUI wakeup handler.\nVast does not define a standard route name; this must match the route your worker image registers.")]
-        public string WorkerRoute = "handler";
     }
 
     public override BaseSettings BaseConfig => (Settings)SettingsRaw;
 
-    Settings VastConfig => (Settings)SettingsRaw;
-
     protected override ICloudProvider CreateProvider(string apiKey)
     {
-        string route = string.IsNullOrWhiteSpace(VastConfig.WorkerRoute) ? "handler" : VastConfig.WorkerRoute.Trim();
-        return new VastAIProvider(apiKey, BaseConfig.EndpointId?.Trim() ?? "", route);
+        return new VastAIProvider(apiKey, BaseConfig.EndpointId?.Trim() ?? "");
     }
 
     protected override string GetApiKey(User user)
@@ -45,7 +36,10 @@ public class VastAIBackend : CloudBackendBase
 
     public override void CheckPermission(Session session)
     {
-        if (session?.User is null) { return; }
+        if (session?.User is null)
+        {
+            return;
+        }
         if (!session.User.HasPermission(CloudBackendsExtension.PermUseVastAI))
         {
             throw new SwarmReadableErrorException("You do not have permission to use Vast.ai backends.");

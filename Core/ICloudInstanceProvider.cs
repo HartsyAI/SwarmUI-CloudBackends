@@ -4,13 +4,13 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 public class CloudInstanceInfo
 {
     /// <summary>Publicly reachable base URL of the SwarmUI running on the instance.</summary>
-    public string PublicUrl { get; set; }
+    public string PublicUrl;
 
     /// <summary>Provider-side identifier, for example a RunPod pod ID.</summary>
-    public string InstanceId { get; set; }
+    public string InstanceId;
 
     /// <summary>Human-readable description of the hardware, used in the backend title.</summary>
-    public string Description { get; set; }
+    public string Description;
 }
 
 /// <summary>

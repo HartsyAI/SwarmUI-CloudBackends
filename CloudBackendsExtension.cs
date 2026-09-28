@@ -33,6 +33,7 @@ public class CloudBackendsExtension : Extension
     // ── Permissions ───────────────────────────────────────────────────────────
     // One permission per provider so admins can grant access selectively.
 
+    /// <summary>Permission group for everything this extension adds.</summary>
     public static readonly PermInfoGroup CloudPermGroup = new("CloudBackends", "Permissions related to cloud GPU backends.");
 
     public static readonly PermInfo PermUseRunPodServerless = Permissions.Register(new PermInfo(
@@ -61,6 +62,16 @@ public class CloudBackendsExtension : Extension
         PermissionDefault.POWERUSERS, CloudPermGroup));
 
     // ── Extension lifecycle ───────────────────────────────────────────────────
+
+    public CloudBackendsExtension()
+    {
+        // Shown in the Extensions tab until the repo is on the official extension list, which then takes over.
+        ExtensionAuthor = "Hartsy";
+        Description = "Run SwarmUI generations on RunPod and Vast.ai GPUs, on demand: serverless workers that start when you generate, scale out under load, and shut down when idle, plus rented pods and instances.";
+        License = "MIT";
+        ReadmeURL = "https://github.com/HartsyAI/SwarmUI-CloudBackends";
+        Tags = ["backend", "paid", "cloud"];
+    }
 
     public override void OnPreInit()
     {
@@ -110,13 +121,9 @@ public class CloudBackendsExtension : Extension
         // some unrelated backend must never trigger it.
         RegisterPerUserProvisioning();
 
-        // ── PreGenerate auto-routing ──────────────────────────────────────────
-        // Same reasoning: a pod's models belong to a real Swarm backend that core routes to normally.
-        // The IDs here must match CloudBackendTypes' hidden BackendType records (T2IEngine matches
-        // T2IParamTypes.BackendType against each live backend's own HandlerTypeData.ID directly - it
-        // never looks the ID up in the public registry, so the hidden IDs work fine here).
-        RegisterPreGenerateRouting<RunPodServerlessBackend>(CloudBackendTypes.RunPodServerless.ID);
-        RegisterPreGenerateRouting<VastAIBackend>(CloudBackendTypes.VastAI.ID);
+        // No backend-type rewriting: core's own model filter already routes cloud-only models away from local
+        // backends, and forcing the serverless type would exclude the workers' mirrored backends (a different
+        // type) that should take warm generations directly.
 
         // ── Web API ───────────────────────────────────────────────────────────
         CloudBackendsWebAPI.Register();
@@ -125,6 +132,23 @@ public class CloudBackendsExtension : Extension
     }
 
     // ── Registration helpers ──────────────────────────────────────────────────
+
+    /// <summary>Last background warm attempt (TickCount64 ms) per parent/user/provider, so per-image PreGenerate stays cheap.</summary>
+    static readonly ConcurrentDictionary<string, long> LastWarmAttempt = new();
+
+    /// <summary>Minimum spacing between background warm attempts for one parent/user/provider.</summary>
+    const long WarmRetryMs = 60_000;
+
+    /// <summary>Atomically claims the warm-attempt window for a key, so concurrent generations schedule at most one attempt.</summary>
+    static bool TryClaimWarmAttempt(string key)
+    {
+        long now = Environment.TickCount64;
+        if (LastWarmAttempt.TryAdd(key, now))
+        {
+            return true;
+        }
+        return LastWarmAttempt.TryGetValue(key, out long last) && now - last >= WarmRetryMs && LastWarmAttempt.TryUpdate(key, now, last);
+    }
 
     static void RegisterPerUserProvisioning()
     {
@@ -160,7 +184,10 @@ public class CloudBackendsExtension : Extension
                             CloudBackendsBackend.WaitForChildReady(child).GetAwaiter().GetResult();
                             ready = true;
                         }
-                        catch (Exception ex) { lastFail = ex; }
+                        catch (Exception ex)
+                        {
+                            lastFail = ex;
+                        }
                     }
                     if (!ready && lastFail is not null)
                     {
@@ -171,8 +198,17 @@ public class CloudBackendsExtension : Extension
                 {
                     // Not targeted: warm the user's children in the background so their cloud models
                     // and routing become available, without delaying this (non-cloud) generation.
+                    // Skips a healthy existing child (in-memory, no DB read) and throttles the rest, since this runs per image.
                     foreach (CloudBackendsBackend parent in parents)
                     {
+                        if (parent.GetChildFor(user.UserID, def) is AbstractT2IBackend child && child.Status != BackendStatus.ERRORED)
+                        {
+                            continue;
+                        }
+                        if (!TryClaimWarmAttempt($"{parent.BackendData?.ID}/{user.UserID}/{def.Prefix}"))
+                        {
+                            continue;
+                        }
                         _ = Utilities.RunCheckedTask(() => parent.EnsureChildForUser(user, def), "cloud backends child provisioning");
                     }
                 }
@@ -195,7 +231,10 @@ public class CloudBackendsExtension : Extension
                     InfoHtml: new HtmlString(infoHtml)));
             }
         }
-        catch (Exception ex) { Logs.Error($"[CloudBackends] Failed to register API key '{keyType}': {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Failed to register API key '{keyType}': {ex.Message}");
+        }
     }
 
     static void RegisterModelProvider<T>(string backendTypeId) where T : CloudBackendBase
@@ -214,51 +253,10 @@ public class CloudBackendsExtension : Extension
                 };
             }
         }
-        catch (Exception ex) { Logs.Error($"[CloudBackends] Failed to register model provider for '{backendTypeId}': {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Error($"[CloudBackends] Failed to register model provider for '{backendTypeId}': {ex.Message}");
+        }
     }
 
-    static void RegisterPreGenerateRouting<T>(string backendTypeId) where T : CloudBackendBase
-    {
-        try
-        {
-            T2IEngine.PreGenerateEvent += (p) =>
-            {
-                string currentType = p.UserInput.Get(T2IParamTypes.BackendType, "Any");
-                if (!string.IsNullOrEmpty(currentType) && !currentType.Equals("Any", StringComparison.OrdinalIgnoreCase))
-                {
-                    return;
-                }
-                string requestedModel = null;
-                object m = p.UserInput.Get(T2IParamTypes.Model);
-                if (m is T2IModel tm) { requestedModel = tm.Name; }
-                else if (m is string ms) { requestedModel = ms; }
-                if (string.IsNullOrWhiteSpace(requestedModel)) { return; }
-                string bareName = requestedModel.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)
-                    ? requestedModel[..^".safetensors".Length] : requestedModel;
-                // Never divert a model the user already has locally onto a paid cloud GPU - the worker's
-                // volume usually holds the same checkpoints, so this would silently bill for every gen.
-                if (Program.MainSDModels.Models.ContainsKey(requestedModel) || Program.MainSDModels.Models.ContainsKey(bareName)) { return; }
-                foreach (T b in Program.Backends.RunningBackendsOfType<T>())
-                {
-                    // Only the requesting user's own children may route their generation - another
-                    // user's child would refuse it anyway (and bills a different account's key).
-                    if (b.OwnerUserId != p.UserInput.SourceSession?.User?.UserID) { continue; }
-                    ConcurrentDictionary<string, Dictionary<string, JObject>> rem = b.RemoteModels;
-                    if (rem is null) { continue; }
-                    string bare = bareName;
-                    bool found = rem.Values.Any(dict =>
-                        dict.ContainsKey(requestedModel) || dict.ContainsKey(bare)
-                        || dict.Keys.Any(k => k.Equals(requestedModel.AfterLast('/'), StringComparison.OrdinalIgnoreCase))
-                        || dict.Keys.Any(k => k.Equals(bare.AfterLast('/'), StringComparison.OrdinalIgnoreCase)));
-                    if (found)
-                    {
-                        Logs.Verbose($"[CloudBackends] Auto-routing '{requestedModel}' to backend type '{backendTypeId}'");
-                        p.UserInput.Set(T2IParamTypes.BackendType, backendTypeId);
-                        return;
-                    }
-                }
-            };
-        }
-        catch (Exception ex) { Logs.Error($"[CloudBackends] Failed to register PreGenerateEvent for '{backendTypeId}': {ex.Message}"); }
-    }
 }

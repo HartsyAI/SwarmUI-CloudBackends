@@ -57,6 +57,9 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
 
         [ConfigComment("Extra environment variables for a created instance, as KEY=VALUE, one per line.\nThe SwarmUI port mapping is added automatically - no need to include it here.")]
         public string Env = "";
+
+        [ConfigComment("Only for an instance you created yourself (set in Instance ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let this backend create the instance with a token of its own. Stored in the backend settings, so admins can see it.")]
+        public string WorkerToken = "";
     }
 
     public override InstanceSettings InstanceConfig => (Settings)SettingsRaw;
@@ -80,6 +83,7 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
             NetworkVolumeId = config.NetworkVolumeId?.Trim() ?? "",
             VolumeMountPath = config.VolumeMountPath?.Trim() ?? "/workspace",
             Env = config.Env ?? "",
+            WorkerToken = WorkerToken ?? "",
             TerminateOnShutdown = config.TerminateOnShutdown
         });
     }
@@ -96,7 +100,10 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
 
     public override void CheckPermission(Session session)
     {
-        if (session?.User is null) { return; }
+        if (session?.User is null)
+        {
+            return;
+        }
         if (!session.User.HasPermission(CloudBackendsExtension.PermUseVastAIInstances))
         {
             throw new SwarmReadableErrorException("You do not have permission to use Vast.ai Instance backends.");
@@ -109,6 +116,35 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         if (string.IsNullOrWhiteSpace(config.InstanceId) && string.IsNullOrWhiteSpace(config.Image) && string.IsNullOrWhiteSpace(config.TemplateHashId))
         {
             throw new SwarmReadableErrorException("Nothing to start. Set 'InstanceId' to use an existing instance, or set an 'Image' (or 'TemplateHashId') so one can be created.");
+        }
+    }
+
+    /// <inheritdoc/>
+    protected override string ExistingWorkerToken => InstConfig.WorkerToken;
+
+    /// <summary>The TLS relay to the current instance, if any.</summary>
+    VastTlsRelay Relay;
+
+    /// <inheritdoc/>
+    /// <remarks>Vast instances serve HTTPS with Vast's own CA, which the child cannot verify; it goes through a pinned relay.</remarks>
+    protected override string GetChildAddress(string publicUrl)
+    {
+        if (!publicUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            return publicUrl;
+        }
+        Relay = new VastTlsRelay(publicUrl);
+        return Relay.LocalUrl;
+    }
+
+    /// <inheritdoc/>
+    protected override async Task OnChildDetachedAsync()
+    {
+        VastTlsRelay relay = Relay;
+        Relay = null;
+        if (relay is not null)
+        {
+            await relay.DisposeAsync();
         }
     }
 }

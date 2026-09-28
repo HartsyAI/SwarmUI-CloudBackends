@@ -1,3 +1,4 @@
+using FreneticUtilities.FreneticExtensions;
 using Hartsy.Extensions.CloudBackends.Core;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Utils;
@@ -23,17 +24,31 @@ public class RunPodPodPlan
     /// <summary>Name given to created pods, and used to find one again so restarts do not pile up pods.</summary>
     public string PodName = "swarmui-cloudbackends";
 
+    /// <summary>Docker image to create the pod from (ignored when a template is set).</summary>
     public string ImageName = "";
+    /// <summary>GPU type to create the pod with, or empty for cheapest available.</summary>
     public string GpuTypeId = "";
+    /// <summary>GPUs per created pod.</summary>
     public int GpuCount = 1;
+    /// <summary>Container disk for a created pod, in GB.</summary>
     public int ContainerDiskGb = 50;
+    /// <summary>Pod volume in GB when no network volume is attached.</summary>
     public int VolumeGb = 0;
+    /// <summary>Where the volume is mounted inside the pod.</summary>
     public string VolumeMountPath = "/workspace";
+    /// <summary>Network volume to attach, if any.</summary>
     public string NetworkVolumeId = "";
+    /// <summary>RunPod cloud to create the pod in: SECURE or COMMUNITY.</summary>
     public string CloudType = "SECURE";
+    /// <summary>Data center to create the pod in, or empty to let RunPod choose.</summary>
     public string DataCenterId = "";
+    /// <summary>RunPod template to create the pod from, instead of an image.</summary>
     public string TemplateId = "";
+    /// <summary>Extra environment variables for a created pod, as KEY=VALUE lines.</summary>
     public string Env = "";
+
+    /// <summary>Gateway token for the pod's SwarmUI worker, injected as SWARMUI_WORKER_TOKEN when creating it.</summary>
+    public string WorkerToken = "";
 
     /// <summary>If true the pod is destroyed on shutdown; if false it is only stopped, so it can resume.</summary>
     public bool TerminateOnShutdown = false;
@@ -76,6 +91,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         _ => null
     });
 
+    /// <summary>Short-lived cache of the pod's status.</summary>
     readonly CloudStatusCache StatusCache = new();
 
     /// <summary>
@@ -85,14 +101,20 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// </summary>
     public async Task<CloudInstanceStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return null; }
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId))
+        {
+            return null;
+        }
         return await StatusCache.GetAsync(forceRefresh, async () => StatusFromPod(await GetPodAsync(ActiveInstanceId, cancel)), cancel);
     }
 
     /// <summary>Projects RunPod's <c>GET /pods/{id}</c> response (see https://docs.runpod.io/api-reference-v2/pods/get-a-pod) into the provider-neutral status shape.</summary>
     CloudInstanceStatus StatusFromPod(JObject pod)
     {
-        if (pod is null) { return null; }
+        if (pod is null)
+        {
+            return null;
+        }
         return new CloudInstanceStatus
         {
             InstanceId = ActiveInstanceId,
@@ -173,8 +195,14 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 }
                 Logs.Verbose($"[RunPodPods] Pod '{podId}' status={status}, waiting for it to run...");
             }
-            catch (SwarmReadableErrorException) { throw; }
-            catch (Exception ex) when (ex is not OperationCanceledException) { Logs.Verbose($"[RunPodPods] Pod poll error: {ex.Message}"); }
+            catch (SwarmReadableErrorException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Logs.Verbose($"[RunPodPods] Pod poll error: {ex.Message}");
+            }
             await Task.Delay(clampedPollMs, cancel);
         }
         if (DateTime.UtcNow >= deadline)
@@ -185,7 +213,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         string publicUrl = $"https://{podId}-{plan.SwarmUIPort}.proxy.runpod.net";
         // Wait for SwarmUI itself, not just the pod: the proxy answers 502 while the container boots,
         // and handing an unready URL to the Swarm backend would just make it fail its own connect.
-        await Api.WaitForSwarmAsync(publicUrl, deadline, $"Check that SwarmUI is installed in the pod and listening on port {plan.SwarmUIPort}, and that the port is exposed as http.", cancel);
+        await Api.WaitForSwarmAsync(publicUrl, deadline, $"Check that the pod runs the Hartsy RunPod worker image and that port {plan.SwarmUIPort} is exposed as http.", cancel, NullIfEmpty(plan.WorkerToken));
         // Cast, don't chain ?.: RunPod sends "gpu" as JSON null (not omitted) in early pod states, and a
         // JValue holding null still throws on `?[...]` (only a C#-null JToken reference short-circuits).
         string gpu = (pod?["gpu"] as JObject)?["id"]?.ToString();
@@ -208,8 +236,14 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Releases the pod, stopping or terminating it per the plan.</summary>
     public async Task ReleaseInstanceAsync(CancellationToken cancel = default)
     {
-        if (plan.TerminateOnShutdown) { await TerminatePodAsync(cancel); }
-        else { await StopPodAsync(cancel); }
+        if (plan.TerminateOnShutdown)
+        {
+            await TerminatePodAsync(cancel);
+        }
+        else
+        {
+            await StopPodAsync(cancel);
+        }
     }
 
     /// <inheritdoc/>
@@ -226,7 +260,10 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Finds the pod to use: an explicit ID, else a previously created pod by name, else creates one.</summary>
     async Task<string> ResolvePodAsync(CancellationToken cancel)
     {
-        if (!string.IsNullOrWhiteSpace(ActiveInstanceId)) { return ActiveInstanceId; }
+        if (!string.IsNullOrWhiteSpace(ActiveInstanceId))
+        {
+            return ActiveInstanceId;
+        }
         if (!plan.AutoCreate)
         {
             throw new SwarmReadableErrorException("No RunPod pod ID is set and AutoCreate is off.");
@@ -280,7 +317,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 dataCenterId = volumeDc;
             }
         }
-        List<string> candidates = await GpuCandidatesAsync(cancel);
+        List<string> candidates = await GpuCandidatesAsync(dataCenterId, cancel);
         string lastDetail = null;
         foreach (string gpuId in candidates)
         {
@@ -320,9 +357,18 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             ["ports"] = new JArray($"{plan.SwarmUIPort}/http", "22/tcp"),
             ["gpu"] = new JObject { ["id"] = gpuTypeId, ["count"] = Math.Max(1, plan.GpuCount) }
         };
-        if (!string.IsNullOrWhiteSpace(plan.TemplateId)) { body["templateId"] = plan.TemplateId; }
-        else { body["image"] = plan.ImageName; }
-        if (!string.IsNullOrWhiteSpace(dataCenterId)) { body["dataCenterIds"] = new JArray(dataCenterId); }
+        if (!string.IsNullOrWhiteSpace(plan.TemplateId))
+        {
+            body["templateId"] = plan.TemplateId;
+        }
+        else
+        {
+            body["image"] = plan.ImageName;
+        }
+        if (!string.IsNullOrWhiteSpace(dataCenterId))
+        {
+            body["dataCenterIds"] = new JArray(dataCenterId);
+        }
         if (!string.IsNullOrWhiteSpace(plan.NetworkVolumeId))
         {
             body["mounts"] = new JObject
@@ -338,36 +384,74 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             };
         }
         JObject env = CloudApiClient.ParseEnv(plan.Env);
-        if (env.HasValues) { body["env"] = env; }
+        if (!string.IsNullOrWhiteSpace(plan.WorkerToken))
+        {
+            env["SWARMUI_WORKER_TOKEN"] = plan.WorkerToken;
+        }
+        // Tells the worker image where the volume (and so the models) is mounted.
+        if (env["VOLUME_PATH"] is null && !string.IsNullOrWhiteSpace(plan.VolumeMountPath))
+        {
+            env["VOLUME_PATH"] = plan.VolumeMountPath;
+        }
+        if (env.HasValues)
+        {
+            body["env"] = env;
+        }
         return body;
     }
 
     /// <summary>
     /// GPU types to attempt, in order. An explicit choice is used alone; otherwise the catalog is asked
-    /// for types that are actually available for pods, cheapest first.
+    /// for types that are actually available for pods (in <paramref name="dataCenterId"/>, when the pod is pinned to one), cheapest first.
     /// </summary>
-    public async Task<List<string>> GpuCandidatesAsync(CancellationToken cancel = default)
+    public async Task<List<string>> GpuCandidatesAsync(string dataCenterId, CancellationToken cancel = default)
     {
-        if (!string.IsNullOrWhiteSpace(plan.GpuTypeId)) { return [plan.GpuTypeId]; }
+        if (!string.IsNullOrWhiteSpace(plan.GpuTypeId))
+        {
+            return [plan.GpuTypeId];
+        }
         string cloud = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperInvariant();
         JToken catalog = await ApiAsync(HttpMethod.Get, $"/catalog/gpus?include=AVAILABILITY&product=POD&cloud={cloud}", null, cancel);
-        List<(string Id, double Price)> usable = [];
-        foreach (JToken t in catalog?["gpus"] as JArray ?? [])
+        List<string> ordered = OrderGpuCandidates(catalog?["gpus"] as JArray, cloud, dataCenterId);
+        if (ordered.Count == 0)
         {
-            if (t is not JObject gpu) { continue; }
-            string availability = gpu["availability"]?.ToString();
-            if (string.Equals(availability, "NONE", StringComparison.OrdinalIgnoreCase)) { continue; }
-            string id = gpu["id"]?.ToString();
-            double price = gpu["price"]?[cloud.ToLowerInvariant()]?.Value<double>() ?? double.MaxValue;
-            if (!string.IsNullOrWhiteSpace(id)) { usable.Add((id, price)); }
+            string where = string.IsNullOrWhiteSpace(dataCenterId) ? "" : $" in {dataCenterId} (where the network volume is)";
+            throw new SwarmReadableErrorException($"RunPod reports no GPU types available for pods on the {cloud} cloud{where} right now. Try again later, set 'GpuTypeId' explicitly, or try the other cloud type.");
         }
-        if (usable.Count == 0)
-        {
-            throw new SwarmReadableErrorException($"RunPod reports no GPU types available for pods on the {cloud} cloud right now. Set 'GpuTypeId' explicitly, or try the other cloud type.");
-        }
-        List<string> ordered = [.. usable.OrderBy(g => g.Price).Select(g => g.Id).Take(5)];
-        Logs.Info($"[RunPodPods] No GPU type set; trying available types cheapest first: {string.Join(", ", ordered)}");
+        Logs.Info($"[RunPodPods] No GPU type set; trying available types{(string.IsNullOrWhiteSpace(dataCenterId) ? "" : $" in {dataCenterId}")} cheapest first: {string.Join(", ", ordered)}");
         return ordered;
+    }
+
+    /// <summary>
+    /// The five cheapest GPU types in a catalog listing that are available, and when <paramref name="dataCenterId"/> is set,
+    /// available in that data center. A pinned pod (a network volume pins it) can only be placed there, so GPUs elsewhere would only be refused.
+    /// </summary>
+    internal static List<string> OrderGpuCandidates(JArray gpus, string cloud, string dataCenterId)
+    {
+        List<(string Id, double Price)> usable = [];
+        foreach (JToken t in gpus ?? [])
+        {
+            if (t is not JObject gpu)
+            {
+                continue;
+            }
+            string availability = gpu["availability"]?.ToString();
+            if (string.Equals(availability, "NONE", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (!string.IsNullOrWhiteSpace(dataCenterId) && !(gpu["dataCenters"] as JArray ?? []).Any(d => string.Equals(d["id"]?.ToString(), dataCenterId, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+            string id = gpu["id"]?.ToString();
+            double price = gpu["price"]?[cloud.ToLowerFast()]?.Value<double>() ?? double.MaxValue;
+            if (!string.IsNullOrWhiteSpace(id))
+            {
+                usable.Add((id, price));
+            }
+        }
+        return [.. usable.OrderBy(g => g.Price).Select(g => g.Id).Take(5)];
     }
 
     /// <summary>
@@ -385,11 +469,17 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             List<JObject> found = [];
             foreach (JToken t in catalog?["gpus"] as JArray ?? [])
             {
-                if (t is not JObject gpu) { continue; }
+                if (t is not JObject gpu)
+                {
+                    continue;
+                }
                 string availability = gpu["availability"]?.ToString() ?? "UNKNOWN";
-                if (string.Equals(availability, "NONE", StringComparison.OrdinalIgnoreCase)) { continue; }
-                double? price = gpu["price"]?[cloud.ToLowerInvariant()]?.Value<double>();
-                int? maxCount = gpu["maxCount"]?[cloud.ToLowerInvariant()]?.Value<int>();
+                if (string.Equals(availability, "NONE", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                double? price = gpu["price"]?[cloud.ToLowerFast()]?.Value<double>();
+                int? maxCount = gpu["maxCount"]?[cloud.ToLowerFast()]?.Value<int>();
                 found.Add(new JObject
                 {
                     ["id"] = gpu["id"]?.ToString(),
@@ -404,14 +494,20 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             // Cheapest first is the order someone renting a GPU actually wants to scan.
             gpus = new JArray(found.OrderBy(g => g["price_per_hr"]?.Value<double>() ?? double.MaxValue));
         }
-        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list GPU types: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[RunPodPods] Could not list GPU types: {ex.Message}");
+        }
         JArray volumes = [];
         try
         {
             JToken vols = await ApiAsync(HttpMethod.Get, "/network-volumes", null, cancel);
             foreach (JToken t in vols?["networkVolumes"] as JArray ?? vols as JArray ?? [])
             {
-                if (t is not JObject v) { continue; }
+                if (t is not JObject v)
+                {
+                    continue;
+                }
                 volumes.Add(new JObject
                 {
                     ["id"] = v["id"]?.ToString(),
@@ -422,14 +518,20 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 });
             }
         }
-        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list network volumes: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[RunPodPods] Could not list network volumes: {ex.Message}");
+        }
         JArray templates = [];
         try
         {
             JToken tpls = await ApiAsync(HttpMethod.Get, "/templates", null, cancel);
             foreach (JToken t in tpls?["templates"] as JArray ?? tpls as JArray ?? [])
             {
-                if (t is not JObject tpl) { continue; }
+                if (t is not JObject tpl)
+                {
+                    continue;
+                }
                 templates.Add(new JObject
                 {
                     ["id"] = tpl["id"]?.ToString(),
@@ -438,24 +540,36 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 });
             }
         }
-        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list templates: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[RunPodPods] Could not list templates: {ex.Message}");
+        }
         JArray dataCenters = [];
         try
         {
             JToken dcs = await ApiAsync(HttpMethod.Get, "/catalog/datacenters", null, cancel);
             foreach (JToken t in dcs?["dataCenters"] as JArray ?? dcs as JArray ?? [])
             {
-                if (t is not JObject dc) { continue; }
+                if (t is not JObject dc)
+                {
+                    continue;
+                }
                 dataCenters.Add(new JObject { ["id"] = dc["id"]?.ToString(), ["name"] = dc["name"]?.ToString() });
             }
         }
-        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list data centers: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[RunPodPods] Could not list data centers: {ex.Message}");
+        }
         JArray pods = [];
         try
         {
             foreach (JToken t in await ListPodsAsync(cancel))
             {
-                if (t is not JObject p) { continue; }
+                if (t is not JObject p)
+                {
+                    continue;
+                }
                 pods.Add(new JObject
                 {
                     ["id"] = p["id"]?.ToString(),
@@ -466,7 +580,10 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 });
             }
         }
-        catch (Exception ex) { Logs.Warning($"[RunPodPods] Could not list pods: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[RunPodPods] Could not list pods: {ex.Message}");
+        }
         return new JObject
         {
             ["cloud"] = cloud,
@@ -494,7 +611,10 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             }
             Logs.Warning($"[RunPodPods] Network volume '{volumeId}' was not found on this account.");
         }
-        catch (Exception ex) { Logs.Verbose($"[RunPodPods] Could not look up network volume data center: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Verbose($"[RunPodPods] Could not look up network volume data center: {ex.Message}");
+        }
         return null;
     }
 
@@ -514,9 +634,15 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Stops the pod, releasing compute but keeping its disk so it can be started again.</summary>
     public async Task StopPodAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return; }
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId))
+        {
+            return;
+        }
         Logs.Info($"[RunPodPods] Stopping pod '{ActiveInstanceId}'...");
-        try { await ApiAsync(HttpMethod.Post, $"/pods/{ActiveInstanceId}/action", new JObject { ["action"] = "stop" }, cancel, allowNotFound: true); }
+        try
+        {
+            await ApiAsync(HttpMethod.Post, $"/pods/{ActiveInstanceId}/action", new JObject { ["action"] = "stop" }, cancel, allowNotFound: true);
+        }
         catch (CloudApiException ex) when (ex.Status == 409)
         {
             Logs.Verbose($"[RunPodPods] Pod '{ActiveInstanceId}' cannot be stopped from its current state: {ex.Detail}");
@@ -526,7 +652,10 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Permanently destroys the pod and its container disk. A network volume is only detached.</summary>
     public async Task TerminatePodAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return; }
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId))
+        {
+            return;
+        }
         Logs.Info($"[RunPodPods] Terminating pod '{ActiveInstanceId}'...");
         await ApiAsync(HttpMethod.Delete, $"/pods/{ActiveInstanceId}", null, cancel, allowNotFound: true);
     }
@@ -535,5 +664,38 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     public Task<JToken> ApiAsync(HttpMethod method, string path, JObject body, CancellationToken cancel = default, bool allowNotFound = false)
     {
         return Api.ApiAsync(method, path, body, cancel, allowNotFound);
+    }
+
+    /// <summary>Null for an empty string.</summary>
+    static string NullIfEmpty(string value)
+    {
+        return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
+
+    /// <summary>Name prefix of every pod this extension creates, used to recognise its orphans.</summary>
+    public const string ManagedNamePrefix = "swarmui-cloudbackends";
+
+    /// <summary>Running pods on the account that this extension created (by default name, or by an ID it remembers), as <c>{id, name, status, cost_per_hr}</c>.</summary>
+    public async Task<List<JObject>> ListManagedRunningAsync(ICollection<string> knownIds, CancellationToken cancel = default)
+    {
+        List<JObject> result = [];
+        foreach (JObject pod in (await ListPodsAsync(cancel)).OfType<JObject>())
+        {
+            string name = pod["name"]?.ToString() ?? "";
+            // REST API v2 field names, the same ones StatusFromPod and ListAccountOptionsAsync read.
+            string status = pod["status"]?.ToString() ?? "";
+            if ((name.StartsWith(ManagedNamePrefix, StringComparison.OrdinalIgnoreCase) || knownIds.Contains(pod["id"]?.ToString() ?? "")) && status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
+            {
+                result.Add(new JObject { ["id"] = pod["id"], ["name"] = name, ["status"] = status, ["cost_per_hr"] = pod["cost"] });
+            }
+        }
+        return result;
+    }
+
+    /// <summary>Stops any pod on the account by ID (orphan cleanup). Keeps its disk.</summary>
+    public async Task StopPodByIdAsync(string podId, CancellationToken cancel = default)
+    {
+        Logs.Info($"[RunPodPods] Stopping pod '{podId}' on request...");
+        await ApiAsync(HttpMethod.Post, $"/pods/{podId}/action", new JObject { ["action"] = "stop" }, cancel, allowNotFound: true);
     }
 }

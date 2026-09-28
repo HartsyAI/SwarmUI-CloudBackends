@@ -1,16 +1,39 @@
+using Newtonsoft.Json.Linq;
+
 namespace Hartsy.Extensions.CloudBackends.Core;
 
+/// <summary>What a lease asks the provider for. Mirrors the backend's settings at the time of the request.</summary>
+public class LeaseRequest
+{
+    /// <summary>Seconds a leased worker may sit with no generation before it is released.</summary>
+    public int IdleSeconds;
+
+    /// <summary>Seconds a new lease may wait for its first generation.</summary>
+    public int StartupGraceSeconds;
+
+    /// <summary>Longest a single lease may last, in seconds.</summary>
+    public int MaxLeaseSeconds;
+
+    /// <summary>Longest to wait for a worker to be assigned and answer, in seconds.</summary>
+    public int StartupTimeoutSec;
+
+    /// <summary>Polling interval while waiting, in milliseconds.</summary>
+    public int PollIntervalMs;
+}
+
 /// <summary>
-/// Abstraction over a cloud GPU provider (RunPod Serverless, RunPod Pods, Vast.ai, …).
+/// A serverless cloud GPU provider, as seen by <see cref="CloudBackendBase"/>. Implementations are per-instance,
+/// constructed with the owner's API key and the endpoint baked in.
 ///
-/// Implementations are **per-instance**: construct with the API key and endpoint identifier
-/// baked in so callers never need to thread credentials through method parameters.
-///
-/// The base backend (<see cref="CloudBackendBase"/>) owns all shared SwarmUI lifecycle logic;
-/// a provider only needs to know how to wake a worker, keep it alive, and tear it down.
+/// Every worker is held by exactly one <b>lease</b>: a provider-native handle (a RunPod job, a Vast.ai session)
+/// that keeps that one worker assigned while it is in use and lets it go when it is not. Leases are what let
+/// the provider's own autoscaler see real demand and add workers.
 /// </summary>
 public interface ICloudProvider : IDisposable
 {
+    /// <summary>Most workers this provider can hold at once, whatever Max Workers says.</summary>
+    int WorkerLimit() => int.MaxValue;
+
     /// <summary>Human-readable provider name shown in logs and status responses.</summary>
     string ProviderName { get; }
 
@@ -18,27 +41,36 @@ public interface ICloudProvider : IDisposable
     string ApiKeyType { get; }
 
     /// <summary>
-    /// Wake a worker and block until SwarmUI is accessible on it.
-    /// Returns a <see cref="CloudWorkerInfo"/> with the worker's public URL and session ID.
+    /// Leases a worker and returns once its gateway address and token are known. Cancelling <paramref name="cancel"/>
+    /// before a worker has been assigned withdraws the request so nothing is billed; once one has been assigned it
+    /// is returned anyway, because it is already being paid for and is useful capacity.
     /// </summary>
-    Task<CloudWorkerInfo> WakeupWorkerAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default);
+    Task<CloudWorkerInfo> AcquireWorkerAsync(LeaseRequest request, CancellationToken cancel);
+
+    /// <summary>True while the lease still holds its worker.</summary>
+    Task<bool> IsLeaseActiveAsync(CloudWorkerInfo worker, CancellationToken cancel);
 
     /// <summary>
-    /// Start or extend keepalive for an active worker.
-    /// Called after wakeup and again when the keepalive timer nears expiry.
-    /// The <paramref name="cancel"/> token is cancelled by <see cref="StopKeepaliveAsync"/>.
+    /// Called while the worker is in use. Providers whose worker releases itself on idle (RunPod) do nothing;
+    /// providers whose lease has a client-side lifetime (Vast.ai) extend it only when it is close to running out.
     /// </summary>
-    /// <returns>True if keepalive is actually established. False means the worker may be reaped early,
-    /// so the caller must not record a long keepalive expiry.</returns>
-    Task<bool> StartKeepaliveAsync(CloudWorkerInfo worker, int durationSeconds, CancellationToken cancel = default);
+    Task RenewLeaseAsync(CloudWorkerInfo worker, CancellationToken cancel);
 
-    /// <summary>Stop keepalive jobs or background loops. Called on backend shutdown.</summary>
-    Task StopKeepaliveAsync();
+    /// <summary>Ends the lease now. Best-effort; never throws.</summary>
+    Task ReleaseLeaseAsync(CloudWorkerInfo worker);
 
-    /// <summary>
-    /// Cheap validation of credentials and endpoint reachability, called once at backend init.
-    /// Throw <see cref="SwarmUI.Utils.SwarmReadableErrorException"/> on bad key / missing endpoint.
-    /// Default: no validation.
-    /// </summary>
+    /// <summary>Cheap validation of credentials and endpoint, called at backend init. Throws readable errors.</summary>
     Task ValidateAsync(CancellationToken cancel = default) => Task.CompletedTask;
+
+    /// <summary>
+    /// Checks the endpoint's provider-side configuration against this backend's settings and returns findings,
+    /// each <c>{ "level": "error"|"warning", "message": ... }</c>. Empty means nothing to report.
+    /// </summary>
+    Task<JArray> CheckEndpointAsync(LeaseRequest request, int maxWorkers, CancellationToken cancel) => Task.FromResult(new JArray());
+
+    /// <summary>
+    /// The URL this extension should use to reach a leased worker's gateway. Usually <see cref="CloudWorkerInfo.PublicUrl"/>;
+    /// Vast.ai returns a loopback relay that verifies Vast's own certificate authority.
+    /// </summary>
+    Task<string> GetConnectUrlAsync(CloudWorkerInfo worker) => Task.FromResult(worker.PublicUrl.TrimEnd('/'));
 }

@@ -25,6 +25,7 @@ public class CloudApiException(string providerName, int status, string detail) :
 /// </summary>
 public class CloudApiClient(string providerName, string apiBase, string apiKey, Func<int, string, Exception> errorMapper = null)
 {
+    /// <summary>Shared HTTP client for provider REST calls.</summary>
     public static readonly HttpClient Http = NetworkBackendUtils.MakeHttpClient();
 
     /// <summary>Human-readable provider name used in logs and error messages.</summary>
@@ -47,18 +48,36 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         Logs.Debug($"[{providerName}] {method} {path}");
         using HttpResponseMessage response = await Http.SendAsync(request, cancel);
         string text = await response.Content.ReadAsStringAsync(cancel);
-        if (response.StatusCode == HttpStatusCode.NotFound && allowNotFound) { return null; }
+        if (response.StatusCode == HttpStatusCode.NotFound && allowNotFound)
+        {
+            return null;
+        }
         if (response.IsSuccessStatusCode)
         {
-            if (string.IsNullOrWhiteSpace(text)) { return null; }
-            try { return JToken.Parse(text); }
-            catch (Exception) { return null; }
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+            try
+            {
+                return JToken.Parse(text);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
         int status = (int)response.StatusCode;
         // RFC 9457 problem responses carry the useful part in 'detail'; fall back to the raw body.
         string detail = text;
-        try { detail = JObject.Parse(text)["detail"]?.ToString() ?? text; }
-        catch (Exception) { }
+        try
+        {
+            detail = JObject.Parse(text)["detail"]?.ToString() ?? text;
+        }
+        catch (Exception)
+        {
+            // Intentionally empty.
+        }
         throw errorMapper?.Invoke(status, detail) ?? new CloudApiException(providerName, status, detail);
     }
 
@@ -66,11 +85,17 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
     public static JObject ParseEnv(string raw)
     {
         JObject result = [];
-        if (string.IsNullOrWhiteSpace(raw)) { return result; }
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return result;
+        }
         foreach (string line in raw.Split(['\n', '\r', ','], StringSplitOptions.RemoveEmptyEntries))
         {
             int eq = line.IndexOf('=');
-            if (eq > 0) { result[line[..eq].Trim()] = line[(eq + 1)..].Trim(); }
+            if (eq > 0)
+            {
+                result[line[..eq].Trim()] = line[(eq + 1)..].Trim();
+            }
         }
         return result;
     }
@@ -81,7 +106,13 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
     /// is listening, so this is the real readiness gate. On timeout, throws a readable error ending in
     /// <paramref name="failureHint"/> (provider-specific advice on what to check).
     /// </summary>
-    public async Task WaitForSwarmAsync(string publicUrl, DateTime deadline, string failureHint, CancellationToken cancel = default)
+    /// <param name="publicUrl">The instance's SwarmUI (gateway) address.</param>
+    /// <param name="deadline">When to give up.</param>
+    /// <param name="failureHint">Provider-specific advice appended to the timeout error.</param>
+    /// <param name="cancel">Cancels the wait.</param>
+    /// <param name="workerToken">The instance's gateway token, sent as a Bearer token, or null for an unsecured SwarmUI.</param>
+    /// <param name="client">HTTP client to use (e.g. one that trusts Vast.ai's CA), or null for the default.</param>
+    public async Task WaitForSwarmAsync(string publicUrl, DateTime deadline, string failureHint, CancellationToken cancel = default, string workerToken = null, HttpClient client = null)
     {
         Exception last = null;
         while (DateTime.UtcNow < deadline)
@@ -89,10 +120,24 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             cancel.ThrowIfCancellationRequested();
             try
             {
-                JObject session = await Http.PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], null, cancel);
-                if (!string.IsNullOrWhiteSpace(session?["session_id"]?.ToString())) { return; }
+                JObject session = await (client ?? Http).PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], workerToken is null ? null : req => req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", workerToken), cancel);
+                if (session?["error_id"]?.ToString() == "worker_unauthorized")
+                {
+                    throw new SwarmReadableErrorException($"The SwarmUI at {publicUrl} refused this backend's token. If you created that instance yourself, set its SWARMUI_WORKER_TOKEN to match, or let this backend create the instance.");
+                }
+                if (!string.IsNullOrWhiteSpace(session?["session_id"]?.ToString()))
+                {
+                    return;
+                }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException) { last = ex; }
+            catch (SwarmReadableErrorException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                last = ex;
+            }
             Logs.Verbose($"[{providerName}] Waiting for SwarmUI on {publicUrl} to answer...");
             await Task.Delay(5000, cancel);
         }
@@ -106,8 +151,10 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
 /// </summary>
 public class CloudStatusCache
 {
+    /// <summary>How long a cached status stays fresh.</summary>
     static readonly TimeSpan Ttl = TimeSpan.FromSeconds(5);
 
+    /// <summary>Single-flights status fetches.</summary>
     readonly SemaphoreSlim Lock = new(1, 1);
 
     CloudInstanceStatus Cached;
@@ -117,15 +164,24 @@ public class CloudStatusCache
     /// <summary>Returns the cached status, or fetches (single-flight) when expired or forced.</summary>
     public async Task<CloudInstanceStatus> GetAsync(bool forceRefresh, Func<Task<CloudInstanceStatus>> fetch, CancellationToken cancel = default)
     {
-        if (!forceRefresh && Cached is not null && DateTime.UtcNow < Expiry) { return Cached; }
+        if (!forceRefresh && Cached is not null && DateTime.UtcNow < Expiry)
+        {
+            return Cached;
+        }
         await Lock.WaitAsync(cancel);
         try
         {
-            if (!forceRefresh && Cached is not null && DateTime.UtcNow < Expiry) { return Cached; }
+            if (!forceRefresh && Cached is not null && DateTime.UtcNow < Expiry)
+            {
+                return Cached;
+            }
             Cached = await fetch();
             Expiry = DateTime.UtcNow.Add(Ttl);
             return Cached;
         }
-        finally { Lock.Release(); }
+        finally
+        {
+            Lock.Release();
+        }
     }
 }

@@ -23,18 +23,29 @@ public class VastAIInstancePlan
     /// <summary>Label given to instances this backend creates, and used to find one again so a restart reuses it.</summary>
     public string Label = "swarmui-cloudbackends";
 
+    /// <summary>Docker image to create the instance from (ignored when a template is set).</summary>
     public string Image = "";
+    /// <summary>Vast.ai template to create the instance from, instead of an image.</summary>
     public string TemplateHashId = "";
 
     /// <summary>Offer to create from. Blank picks the cheapest matching on-demand offer at create time.</summary>
     public string OfferId = "";
 
+    /// <summary>Container disk for a created instance, in GB.</summary>
     public int DiskGb = 20;
+    /// <summary>Existing network volume to attach, if any.</summary>
     public string NetworkVolumeId = "";
+    /// <summary>Where the volume is mounted inside the instance.</summary>
     public string VolumeMountPath = "/workspace";
 
     /// <summary>Extra environment variables, KEY=VALUE per line/comma. The SwarmUI port mapping is added automatically.</summary>
     public string Env = "";
+
+    /// <summary>Gateway token for the instance's SwarmUI worker, injected as SWARMUI_WORKER_TOKEN when creating it.</summary>
+    public string WorkerToken = "";
+
+    /// <summary>Reach the instance over HTTPS with Vast's instance certificate (the Hartsy Vast worker serves it).</summary>
+    public bool UseTls = true;
 
     /// <summary>If true the instance is destroyed on shutdown; if false it is only stopped, so it can resume.</summary>
     public bool TerminateOnShutdown = false;
@@ -75,12 +86,16 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         _ => null
     });
 
+    /// <summary>Short-lived cache of the instance's status.</summary>
     readonly CloudStatusCache StatusCache = new();
 
     /// <summary>Gets the instance's live status. Returns null if no instance has been resolved yet.</summary>
     public async Task<CloudInstanceStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return null; }
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId))
+        {
+            return null;
+        }
         return await StatusCache.GetAsync(forceRefresh, async () => StatusFromInstance(await GetInstanceAsync(ActiveInstanceId, cancel)), cancel);
     }
 
@@ -93,14 +108,20 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// </summary>
     CloudInstanceStatus StatusFromInstance(JObject inst)
     {
-        if (inst is null) { return null; }
+        if (inst is null)
+        {
+            return null;
+        }
         string ip = inst["public_ipaddr"]?.ToString();
         int? mappedPort = null;
         // Vast's port map is Docker-inspect shaped: ports["7801/tcp"] = [{ "HostIp": ..., "HostPort": "..." }, ...]
         if (inst["ports"] is JObject ports && ports[$"{plan.SwarmUIPort}/tcp"] is JArray bindings && bindings.Count > 0)
         {
             string hostPort = bindings[0]?["HostPort"]?.ToString();
-            if (int.TryParse(hostPort, out int parsed)) { mappedPort = parsed; }
+            if (int.TryParse(hostPort, out int parsed))
+            {
+                mappedPort = parsed;
+            }
         }
         return new CloudInstanceStatus
         {
@@ -111,7 +132,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             CostPerHour = inst["dph_total"]?.Value<double>() ?? 0,
             UptimeSeconds = (int)((inst["uptime_mins"]?.Value<double>() ?? 0) * 60),
             // Plain HTTP, no TLS: Vast has no proxy domain, just {public_ipaddr}:{mapped_external_port}.
-            PublicUrl = (!string.IsNullOrWhiteSpace(ip) && mappedPort is not null) ? $"http://{ip}:{mappedPort}" : null
+            PublicUrl = (!string.IsNullOrWhiteSpace(ip) && mappedPort is not null) ? $"{(plan.UseTls ? "https" : "http")}://{ip}:{mappedPort}" : null
         };
     }
 
@@ -143,8 +164,14 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         Logs.Info($"[VastAI Instances] Instance '{instanceId}' status={inst["actual_status"]}");
         // Vast has no documented "illegal from this state" action list the way RunPod publishes
         // actions[], so just always issue the start and tolerate a benign 4xx (already running).
-        try { await ApiAsync(HttpMethod.Put, $"/api/v0/instances/{instanceId}/", new JObject { ["state"] = "running" }, cancel); }
-        catch (CloudApiException ex) when (ex.Status is 400 or 409) { Logs.Verbose($"[VastAI Instances] Start on '{instanceId}' returned {ex.Status} (likely already running): {ex.Detail}"); }
+        try
+        {
+            await ApiAsync(HttpMethod.Put, $"/api/v0/instances/{instanceId}/", new JObject { ["state"] = "running" }, cancel);
+        }
+        catch (CloudApiException ex) when (ex.Status is 400 or 409)
+        {
+            Logs.Verbose($"[VastAI Instances] Start on '{instanceId}' returned {ex.Status} (likely already running): {ex.Detail}");
+        }
         int clampedPollMs = Math.Clamp(pollIntervalMs, 2000, 15000);
         CloudInstanceStatus liveStatus = null;
         while (DateTime.UtcNow < deadline)
@@ -160,7 +187,10 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
                 }
                 Logs.Verbose($"[VastAI Instances] Instance '{instanceId}' status={liveStatus?.Status}, waiting for public networking...");
             }
-            catch (Exception ex) when (ex is not OperationCanceledException) { Logs.Verbose($"[VastAI Instances] Instance poll error: {ex.Message}"); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Logs.Verbose($"[VastAI Instances] Instance poll error: {ex.Message}");
+            }
             await Task.Delay(clampedPollMs, cancel);
         }
         if (liveStatus?.PublicUrl is null)
@@ -169,7 +199,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         // Wait for SwarmUI itself, not just the port mapping: the mapped port answers as soon as the
         // container's network namespace exists, well before whatever is inside it has started listening.
-        await Api.WaitForSwarmAsync(liveStatus.PublicUrl, deadline, $"Check that SwarmUI is installed and listening on port {plan.SwarmUIPort}, and that '-p {plan.SwarmUIPort}:{plan.SwarmUIPort}' actually applied (some Vast templates strip extra docker options).", cancel);
+        await Api.WaitForSwarmAsync(liveStatus.PublicUrl, deadline, $"Check that SwarmUI is installed and listening on port {plan.SwarmUIPort}, and that '-p {plan.SwarmUIPort}:{plan.SwarmUIPort}' actually applied (some Vast templates strip extra docker options).", cancel, string.IsNullOrWhiteSpace(plan.WorkerToken) ? null : plan.WorkerToken, plan.UseTls ? VastTls.Http : null);
         Logs.Info($"[VastAI Instances] SwarmUI is up on instance '{instanceId}' at {liveStatus.PublicUrl}");
         return new CloudInstanceInfo
         {
@@ -182,8 +212,14 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Releases the instance, stopping or destroying it per the plan.</summary>
     public async Task ReleaseInstanceAsync(CancellationToken cancel = default)
     {
-        if (plan.TerminateOnShutdown) { await DestroyInstanceAsync(cancel); }
-        else { await StopInstanceRawAsync(cancel); }
+        if (plan.TerminateOnShutdown)
+        {
+            await DestroyInstanceAsync(cancel);
+        }
+        else
+        {
+            await StopInstanceRawAsync(cancel);
+        }
     }
 
     /// <inheritdoc/>
@@ -200,8 +236,14 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Finds the instance to use: an explicit ID, else a previously created one by label, else creates one.</summary>
     async Task<string> ResolveInstanceAsync(CancellationToken cancel)
     {
-        if (!string.IsNullOrWhiteSpace(ActiveInstanceId)) { return ActiveInstanceId; }
-        if (!plan.AutoCreate) { throw new SwarmReadableErrorException("No Vast.ai instance ID is set and AutoCreate is off."); }
+        if (!string.IsNullOrWhiteSpace(ActiveInstanceId))
+        {
+            return ActiveInstanceId;
+        }
+        if (!plan.AutoCreate)
+        {
+            throw new SwarmReadableErrorException("No Vast.ai instance ID is set and AutoCreate is off.");
+        }
         // An instance remembered from a previous run is only a hint - verify it still exists before
         // trusting it, so a stale memory can never block or misdirect a fresh create.
         if (!string.IsNullOrWhiteSpace(plan.PersistedId))
@@ -241,6 +283,15 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         // Port exposure is a Docker -p flag encoded as an env dict key (Vast has no structured ports
         // field on create), so it's merged into the same object as any user-supplied env vars.
         JObject env = CloudApiClient.ParseEnv(plan.Env);
+        if (!string.IsNullOrWhiteSpace(plan.WorkerToken))
+        {
+            env["SWARMUI_WORKER_TOKEN"] = plan.WorkerToken;
+        }
+        // Tells the worker image where the volume (and so the models) is mounted.
+        if (env["VOLUME_PATH"] is null && !string.IsNullOrWhiteSpace(plan.VolumeMountPath))
+        {
+            env["VOLUME_PATH"] = plan.VolumeMountPath;
+        }
         env[$"-p {plan.SwarmUIPort}:{plan.SwarmUIPort}"] = "1";
         JObject body = new()
         {
@@ -248,9 +299,19 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             ["disk"] = Math.Max(1, plan.DiskGb),
             ["env"] = env
         };
-        if (!string.IsNullOrWhiteSpace(plan.TemplateHashId)) { body["template_hash_id"] = plan.TemplateHashId; }
-        if (!string.IsNullOrWhiteSpace(plan.Image)) { body["image"] = plan.Image; }
-        if (!string.IsNullOrWhiteSpace(plan.Label)) { body["label"] = plan.Label; }
+        if (!string.IsNullOrWhiteSpace(plan.TemplateHashId))
+        {
+            body["template_hash_id"] = plan.TemplateHashId;
+        }
+        else if (!string.IsNullOrWhiteSpace(plan.Image))
+        {
+            // Only without a template: the template carries its own image, as RunPod's template path does.
+            body["image"] = plan.Image;
+        }
+        if (!string.IsNullOrWhiteSpace(plan.Label))
+        {
+            body["label"] = plan.Label;
+        }
         if (!string.IsNullOrWhiteSpace(plan.NetworkVolumeId))
         {
             body["volume_info"] = new JObject
@@ -303,19 +364,31 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     public async Task<JObject> ListAccountOptionsAsync(CancellationToken cancel = default)
     {
         JArray offers = [];
-        try { offers = await SearchOffersAsync(cancel); }
-        catch (Exception ex) { Logs.Warning($"[VastAI Instances] Could not list offers: {ex.Message}"); }
+        try
+        {
+            offers = await SearchOffersAsync(cancel);
+        }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[VastAI Instances] Could not list offers: {ex.Message}");
+        }
         JArray volumes = [];
         try
         {
             JToken resp = await ApiAsync(HttpMethod.Get, "/api/v0/volumes?owner=me&type=network_volume", null, cancel);
             foreach (JToken t in resp?["volumes"] as JArray ?? [])
             {
-                if (t is not JObject v) { continue; }
+                if (t is not JObject v)
+                {
+                    continue;
+                }
                 volumes.Add(new JObject { ["id"] = v["id"]?.ToString(), ["name"] = v["name"]?.ToString(), ["size_gb"] = v["size"]?.Value<int>() });
             }
         }
-        catch (Exception ex) { Logs.Warning($"[VastAI Instances] Could not list network volumes: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[VastAI Instances] Could not list network volumes: {ex.Message}");
+        }
         return new JObject
         {
             ["offers"] = new JArray(offers.Select(o => new JObject
@@ -355,16 +428,28 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Stops the instance, releasing compute but keeping its disk so it can be started again.</summary>
     public async Task StopInstanceRawAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return; }
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId))
+        {
+            return;
+        }
         Logs.Info($"[VastAI Instances] Stopping instance '{ActiveInstanceId}'...");
-        try { await ApiAsync(HttpMethod.Put, $"/api/v0/instances/{ActiveInstanceId}/", new JObject { ["state"] = "stopped" }, cancel, allowNotFound: true); }
-        catch (CloudApiException ex) { Logs.Verbose($"[VastAI Instances] Instance '{ActiveInstanceId}' stop returned {ex.Status}: {ex.Detail}"); }
+        try
+        {
+            await ApiAsync(HttpMethod.Put, $"/api/v0/instances/{ActiveInstanceId}/", new JObject { ["state"] = "stopped" }, cancel, allowNotFound: true);
+        }
+        catch (CloudApiException ex)
+        {
+            Logs.Verbose($"[VastAI Instances] Instance '{ActiveInstanceId}' stop returned {ex.Status}: {ex.Detail}");
+        }
     }
 
     /// <summary>Permanently destroys the instance and its container disk. A network volume is only detached.</summary>
     public async Task DestroyInstanceAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActiveInstanceId)) { return; }
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId))
+        {
+            return;
+        }
         Logs.Info($"[VastAI Instances] Destroying instance '{ActiveInstanceId}'...");
         await ApiAsync(HttpMethod.Delete, $"/api/v0/instances/{ActiveInstanceId}/", null, cancel, allowNotFound: true);
     }
@@ -373,5 +458,31 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     public Task<JToken> ApiAsync(HttpMethod method, string path, JObject body, CancellationToken cancel = default, bool allowNotFound = false)
     {
         return Api.ApiAsync(method, path, body, cancel, allowNotFound);
+    }
+
+    /// <summary>Label prefix of every instance this extension creates, used to recognise its orphans.</summary>
+    public const string ManagedLabelPrefix = "swarmui-cloudbackends";
+
+    /// <summary>Running instances on the account that this extension created (by default label, or by an ID it remembers), as <c>{id, name, status, cost_per_hr}</c>.</summary>
+    public async Task<List<JObject>> ListManagedRunningAsync(ICollection<string> knownIds, CancellationToken cancel = default)
+    {
+        List<JObject> result = [];
+        foreach (JObject instance in (await ListInstancesAsync(cancel)).OfType<JObject>())
+        {
+            string label = instance["label"]?.ToString() ?? "";
+            string status = instance["actual_status"]?.ToString() ?? "";
+            if ((label.StartsWith(ManagedLabelPrefix, StringComparison.OrdinalIgnoreCase) || knownIds.Contains(instance["id"]?.ToString() ?? "")) && status == "running")
+            {
+                result.Add(new JObject { ["id"] = instance["id"]?.ToString(), ["name"] = label, ["status"] = status, ["cost_per_hr"] = instance["dph_total"] });
+            }
+        }
+        return result;
+    }
+
+    /// <summary>Stops any instance on the account by ID (orphan cleanup). Keeps its disk.</summary>
+    public async Task StopInstanceByIdAsync(string instanceId, CancellationToken cancel = default)
+    {
+        Logs.Info($"[VastAI Instances] Stopping instance '{instanceId}' on request...");
+        await ApiAsync(HttpMethod.Put, $"/api/v0/instances/{instanceId}/", new JObject { ["state"] = "stopped" }, cancel, allowNotFound: true);
     }
 }

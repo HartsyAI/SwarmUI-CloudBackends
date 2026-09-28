@@ -3,4 +3,9 @@
     <AssemblyName>SwarmExtensionSwarmUI-CloudBackends</AssemblyName>
   </PropertyGroup>
   <Import Project="../../SwarmUI.extension.props" />
+  <ItemGroup>
+    <!-- The test project lives inside this folder but is built on its own. -->
+    <Compile Remove="Tests/**" />
+    <InternalsVisibleTo Include="SwarmUI-CloudBackends.Tests" />
+  </ItemGroup>
 </Project>

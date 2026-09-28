@@ -22,12 +22,18 @@ public class OwnerBoundSwarmBackend : SwarmSwarmBackend
     /// </summary>
     public ICloudBackend FindCloudRoot()
     {
+        return TopControl().BackendData?.AbstractParent?.AbstractBackend as ICloudBackend;
+    }
+
+    /// <summary>The control swarm backend at the top of this subtree: the one the cloud backend attached.</summary>
+    public SwarmSwarmBackend TopControl()
+    {
         SwarmSwarmBackend top = this;
         while (top.Parent is not null)
         {
             top = top.Parent;
         }
-        return top.BackendData?.AbstractParent?.AbstractBackend as ICloudBackend;
+        return top;
     }
 
     /// <inheritdoc/>
@@ -36,14 +42,14 @@ public class OwnerBoundSwarmBackend : SwarmSwarmBackend
     /// alive for as long as generations actually last.</remarks>
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
-        await (FindCloudRoot()?.OnChildGenerationStartingAsync() ?? Task.CompletedTask);
+        await (FindCloudRoot()?.OnChildGenerationStartingAsync(TopControl()) ?? Task.CompletedTask);
         return await base.Generate(user_input);
     }
 
     /// <inheritdoc/>
     public override async Task GenerateLive(T2IParamInput user_input, string batchId, Action<object> takeOutput)
     {
-        await (FindCloudRoot()?.OnChildGenerationStartingAsync() ?? Task.CompletedTask);
+        await (FindCloudRoot()?.OnChildGenerationStartingAsync(TopControl()) ?? Task.CompletedTask);
         await base.GenerateLive(user_input, batchId, takeOutput);
     }
 

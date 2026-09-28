@@ -30,6 +30,12 @@ public static class CloudBackendsWebAPI
         API.RegisterAPICall(CloudListProviders, false, Permissions.ViewBackendsList);
         API.RegisterAPICall(CloudDebugInvalidateSession, true, Permissions.EditBackends);
         API.RegisterAPICall(CloudListRunPodOptions, false, Permissions.EditBackends);
+        API.RegisterAPICall(CloudListWorkers, false, CloudBackendsExtension.PermCloudStatus);
+        API.RegisterAPICall(CloudStopWorker, true, CloudBackendsExtension.PermCloudStatus);
+        API.RegisterAPICall(CloudValidateBackend, false, CloudBackendsExtension.PermCloudStatus);
+        API.RegisterAPICall(CloudClearModelCache, true, CloudBackendsExtension.PermCloudStatus);
+        API.RegisterAPICall(CloudListOrphans, false, CloudBackendsExtension.PermCloudStatus);
+        API.RegisterAPICall(CloudStopOrphan, true, CloudBackendsExtension.PermCloudStatus);
         API.RegisterAPICall(VastAIListInstanceOptions, false, Permissions.EditBackends);
     }
 
@@ -38,8 +44,15 @@ public static class CloudBackendsWebAPI
     {
         // Only a permission refusal means "not yours" - anything else is a real fault and must not be
         // silently reported to the user as "no cloud backends are running".
-        try { backend.CheckPermission(session); return true; }
-        catch (SwarmReadableErrorException) { return false; }
+        try
+        {
+            backend.CheckPermission(session);
+            return true;
+        }
+        catch (SwarmReadableErrorException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -164,23 +177,29 @@ public static class CloudBackendsWebAPI
         }
     }
 
-    [API.APIDescription("Triggers a model refresh from the remote workers of all running serverless cloud backends the user may access (rented-instance backends mirror models through core's own Swarm backend instead).",
+    [API.APIDescription("Discovers the models of the user's serverless endpoints: uses a running worker, or leases one (billed until it goes idle). Scope it to one card and provider with backend_id and provider; with neither, every serverless endpoint of the user is refreshed, each leasing its own worker. Rented-instance backends mirror models through core's own Swarm backend instead.",
         """
             "refreshed": 2, // backends successfully refreshed
             "failed": 0, // backends that errored
             "errors": [{"backend_id": 1, "error": "reason"}],
             "message": "Refreshed 2 cloud backend(s), 0 failed."
         """)]
-    public static async Task<JObject> CloudRefreshModels(Session session)
+    public static async Task<JObject> CloudRefreshModels(Session session,
+        [API.APIParameter("ID of the 'Cloud Backends' card to discover for. 0 for every card.")] int backend_id = 0,
+        [API.APIParameter("Settings prefix of the one provider to discover for: 'RunPodServerless_' or 'VastAI_'. Empty for every serverless provider.")] string provider = "")
     {
+        bool InScope(CloudBackendsBackend.ProviderDef def)
+        {
+            return string.IsNullOrWhiteSpace(provider) || def.Prefix.Equals(provider, StringComparison.OrdinalIgnoreCase);
+        }
         // An explicit refresh is a deliberate user action, so it may spawn the user's serverless
         // children first (each on the user's own key) - then refresh only the user's own children.
         // Each child must finish Init before the RUNNING filter below, or a first-ever refresh
         // would see them all as still-loading and wrongly report "none available"; a child that
         // fails Init is tolerated here and surfaces its real reason via the ERRORED fallback below.
-        foreach (CloudBackendsBackend parent in Program.Backends.RunningBackendsOfType<CloudBackendsBackend>())
+        foreach (CloudBackendsBackend parent in Program.Backends.RunningBackendsOfType<CloudBackendsBackend>().Where(p => backend_id == 0 || p.BackendData?.ID == backend_id))
         {
-            foreach (CloudBackendsBackend.ProviderDef def in CloudBackendsBackend.Providers.Where(d => !d.IsInstance))
+            foreach (CloudBackendsBackend.ProviderDef def in CloudBackendsBackend.Providers.Where(d => !d.IsInstance && InScope(d)))
             {
                 try
                 {
@@ -190,11 +209,14 @@ public static class CloudBackendsWebAPI
                         await CloudBackendsBackend.WaitForChildReady(child);
                     }
                 }
-                catch (SwarmReadableErrorException) { }
+                catch (SwarmReadableErrorException)
+                {
+                    // Intentionally empty.
+                }
             }
         }
-        CloudBackendBase[] backends = [.. Program.Backends.RunningBackendsOfType<CloudBackendBase>()
-            .Where(b => b.OwnerUserId == session.User.UserID && HasBackendPermission(b, session))];
+        CloudBackendBase[] backends = [.. (backend_id == 0 ? Program.Backends.RunningBackendsOfType<CloudBackendBase>().Where(b => b.OwnerUserId == session.User.UserID && HasBackendPermission(b, session)) : UserServerless(session, backend_id, provider))
+            .Where(b => CloudBackendsBackend.Providers.Any(d => !d.IsInstance && InScope(d) && d.Type().ID == b.HandlerTypeData.ID))];
         if (backends.Length is 0)
         {
             // A child may exist but have failed Init (bad key, bad endpoint) - its real reason is far
@@ -253,7 +275,7 @@ public static class CloudBackendsWebAPI
                     "provider": "RunPod Serverless",
                     "kind": "serverless", // or "instance"
                     "status": "RUNNING",
-                    // serverless: "endpoint", "model_count", "worker_id", "worker_url", "max_concurrent", "auto_refresh"
+                    // serverless: "endpoint", "model_count", "workers", "workers_starting", "max_workers"
                     // instance: "instance_id", "instance_url", "child_backend_id"
                 }
             ],
@@ -483,25 +505,297 @@ public static class CloudBackendsWebAPI
         return Task.FromResult(new JObject { ["providers"] = providers });
     }
 
-    [API.APIDescription("Debug/testing hook: corrupts the cached remote worker session ID for a serverless cloud backend, so the session-recovery path can be exercised deterministically (remote sessions otherwise last ~31 days). Admin-only; no effect on the worker itself.",
+    /// <summary>
+    /// The requesting user's serverless backends under the given Cloud Backends card, optionally for one provider.
+    /// Accepts the card's ID (what the UI knows) or a serverless backend's own ID. Only backends the user owns and
+    /// has the provider permission for are returned.
+    /// </summary>
+    static List<CloudBackendBase> UserServerless(Session session, int backendId, string provider)
+    {
+        return [.. Program.Backends.RunningBackendsOfType<CloudBackendBase>()
+            .Where(b => b.BackendData?.ID == backendId || b.BackendData?.AbstractParent?.ID == backendId)
+            .Where(b => b.OwnerUserId == session.User.UserID && HasBackendPermission(b, session))
+            .Where(b => string.IsNullOrWhiteSpace(provider) || CloudBackendsBackend.Providers.Any(d => d.Prefix.Equals(provider, StringComparison.OrdinalIgnoreCase) && d.Type().ID == b.HandlerTypeData.ID))];
+    }
+
+    /// <summary>Stable error object.</summary>
+    static JObject Error(string message, string errorId)
+    {
+        return new JObject { ["error"] = message, ["error_id"] = errorId };
+    }
+
+    [API.APIDescription("Lists the requesting user's leased serverless workers under a Cloud Backends card: one entry per provider, each with its workers and their backends. Never includes access tokens.",
         """
-            "message": "Worker session invalidated for backend #1."
+            "backends":
+            [
+                {
+                    "backend_id": -12, // the user's hidden serverless backend
+                    "provider": "RunPod Serverless",
+                    "endpoint": "abc123",
+                    "max_workers": 2,
+                    "workers_starting": 0,
+                    "workers":
+                    [
+                        {
+                            "worker_id": "podid",
+                            "lease_id": "job-or-session-id",
+                            "public_url": "https://podid-7801.proxy.runpod.net",
+                            "age_seconds": 95,
+                            "in_use": true,
+                            "child_backend_id": -13,
+                            "backends": [{"id": -14, "status": "running", "usages": 1, "max_usages": 2}]
+                        }
+                    ]
+                }
+            ]
+        """)]
+    public static Task<JObject> CloudListWorkers(Session session,
+        [API.APIParameter("ID of the 'Cloud Backends' card (or of one of its serverless backends).")] int backend_id,
+        [API.APIParameter("Optional settings prefix to limit the list to one provider: 'RunPodServerless_' or 'VastAI_'. Empty for all.")] string provider = "")
+    {
+        JArray backends = [];
+        foreach (CloudBackendBase backend in UserServerless(session, backend_id, provider))
+        {
+            JObject status = backend.GetStatusNet();
+            backends.Add(new JObject
+            {
+                ["backend_id"] = backend.BackendData?.ID,
+                ["provider"] = backend.CloudProviderName,
+                ["endpoint"] = status["endpoint"],
+                ["max_workers"] = status["max_workers"],
+                ["workers_starting"] = status["workers_starting"],
+                ["workers"] = backend.DescribeWorkers()
+            });
+        }
+        return Task.FromResult(new JObject { ["backends"] = backends });
+    }
+
+    [API.APIDescription("Releases one leased serverless worker now: detaches its backends and ends its lease, which stops billing for it. Anything it was generating fails.",
+        """
+            "success": true
+        """)]
+    public static async Task<JObject> CloudStopWorker(Session session,
+        [API.APIParameter("ID of the 'Cloud Backends' card (or of one of its serverless backends).")] int backend_id,
+        [API.APIParameter("Worker ID, as listed by CloudListWorkers.")] string worker_id)
+    {
+        foreach (CloudBackendBase backend in UserServerless(session, backend_id, ""))
+        {
+            WorkerSlot slot = backend.FindSlot(worker_id);
+            if (slot is not null)
+            {
+                backend.CheckPermission(session);
+                await backend.RemoveSlotAsync(slot, $"stopped by {session.User.UserID}");
+                return new JObject { ["success"] = true };
+            }
+        }
+        return Error($"No leased worker '{worker_id}' of yours was found under backend #{backend_id}.", "worker_not_found");
+    }
+
+    [API.APIDescription("Checks the provider-side configuration of the user's serverless endpoints against the card's settings (execution timeout vs lease length, endpoint max workers, image version, Vast scale-to-zero settings). Makes no changes and bills nothing.",
+        """
+            "results":
+            [
+                {
+                    "provider": "RunPod Serverless",
+                    "backend_id": -12,
+                    "findings": [{"level": "error", "message": "..."}] // empty when all is well
+                }
+            ]
+        """)]
+    public static async Task<JObject> CloudValidateBackend(Session session,
+        [API.APIParameter("ID of the 'Cloud Backends' card (or of one of its serverless backends).")] int backend_id)
+    {
+        // Make sure the user's serverless backends for this card exist, as they do not until first use. Creating one
+        // only validates credentials; it never leases a worker.
+        foreach (CloudBackendsBackend parent in Program.Backends.RunningBackendsOfType<CloudBackendsBackend>().Where(p => p.BackendData?.ID == backend_id))
+        {
+            foreach (CloudBackendsBackend.ProviderDef def in CloudBackendsBackend.Providers.Where(d => !d.IsInstance && parent.IsProviderEnabled(d)))
+            {
+                try
+                {
+                    AbstractT2IBackend child = await parent.EnsureChildForUser(session.User, def);
+                    if (child is not null)
+                    {
+                        await CloudBackendsBackend.WaitForChildReady(child);
+                    }
+                }
+                catch (SwarmReadableErrorException ex)
+                {
+                    Logs.Debug($"[CloudBackends] Could not prepare {def.Label} for validation: {ex.Message}");
+                }
+            }
+        }
+        List<CloudBackendBase> backends = UserServerless(session, backend_id, "");
+        if (backends.Count == 0)
+        {
+            return Error("You have no running serverless backend under this card. Enable a serverless section and set your API key in User Settings, then generate or use Discover models once.", "no_backend");
+        }
+        JArray results = [];
+        foreach (CloudBackendBase backend in backends)
+        {
+            JObject entry = new() { ["provider"] = backend.CloudProviderName, ["backend_id"] = backend.BackendData?.ID };
+            try
+            {
+                using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(30));
+                entry["findings"] = await backend.CheckConfigurationAsync(cancel.Token);
+            }
+            catch (SwarmReadableErrorException ex)
+            {
+                entry["findings"] = new JArray(new JObject { ["level"] = "error", ["message"] = ex.Message });
+            }
+            results.Add(entry);
+        }
+        return new JObject { ["results"] = results };
+    }
+
+    [API.APIDescription("Forgets the remembered model list of the user's serverless endpoints, so it is learned again from a worker (the next generation with a model you have locally, or Discover models).",
+        """
+            "success": true,
+            "cleared": 1
+        """)]
+    public static Task<JObject> CloudClearModelCache(Session session,
+        [API.APIParameter("ID of the 'Cloud Backends' card (or of one of its serverless backends).")] int backend_id,
+        [API.APIParameter("Optional settings prefix to limit this to one provider: 'RunPodServerless_' or 'VastAI_'. Empty for all.")] string provider = "")
+    {
+        List<CloudBackendBase> backends = UserServerless(session, backend_id, provider);
+        foreach (CloudBackendBase backend in backends)
+        {
+            backend.ClearModelCache();
+        }
+        return Task.FromResult(new JObject { ["success"] = true, ["cleared"] = backends.Count });
+    }
+
+    /// <summary>IDs of instances the user's own instance backends have attached, or are starting right now (so they are not orphans).</summary>
+    static HashSet<string> AttachedInstanceIds(Session session)
+    {
+        return [.. Program.Backends.RunningBackendsOfType<CloudInstanceBackendBase>()
+            .Where(b => b.OwnerUserId == session.User.UserID && (b.ChildBackend is not null || b.Starting) && !string.IsNullOrWhiteSpace(b.Provider?.ActiveInstanceId))
+            .Select(b => b.Provider.ActiveInstanceId)];
+    }
+
+    [API.APIDescription("Lists running pods and instances on the user's own RunPod and Vast.ai accounts that this extension created but that no Cloud Backends card has attached right now - for example after SwarmUI stopped uncleanly, or a section was disabled while its instance ran. They bill until stopped. Stopping is only ever done explicitly, with CloudStopOrphan.",
+        """
+            "orphans":
+            [
+                {"provider": "runpod", "id": "podid", "name": "swarmui-cloudbackends-3", "status": "RUNNING", "cost_per_hr": 0.44}
+            ],
+            "errors": [{"provider": "vastai", "error": "..."}] // providers that could not be checked
+        """)]
+    public static async Task<JObject> CloudListOrphans(Session session)
+    {
+        HashSet<string> attached = AttachedInstanceIds(session);
+        JArray orphans = [];
+        JArray errors = [];
+        string runpodKey = session.User.GetGenericData("runpod_api", "key")?.Trim();
+        if (!string.IsNullOrEmpty(runpodKey) && session.User.HasPermission(CloudBackendsExtension.PermUseRunPodPods))
+        {
+            try
+            {
+                using RunPodPodsProvider provider = new(runpodKey, new RunPodPodPlan());
+                foreach (JObject pod in await provider.ListManagedRunningAsync(CloudInstanceBackendBase.KnownInstances(session.User, nameof(RunPodPodsBackend))))
+                {
+                    if (!attached.Contains(pod["id"]?.ToString() ?? ""))
+                    {
+                        pod["provider"] = "runpod";
+                        orphans.Add(pod);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // One provider being unreachable must not hide the other's billing orphans.
+                errors.Add(new JObject { ["provider"] = "runpod", ["error"] = ex.Message });
+            }
+        }
+        string vastKey = session.User.GetGenericData("vastai_api", "key")?.Trim();
+        if (!string.IsNullOrEmpty(vastKey) && session.User.HasPermission(CloudBackendsExtension.PermUseVastAIInstances))
+        {
+            try
+            {
+                using VastAIInstanceProvider provider = new(vastKey, new VastAIInstancePlan());
+                foreach (JObject instance in await provider.ListManagedRunningAsync(CloudInstanceBackendBase.KnownInstances(session.User, nameof(VastAIInstanceBackend))))
+                {
+                    if (!attached.Contains(instance["id"]?.ToString() ?? ""))
+                    {
+                        instance["provider"] = "vastai";
+                        orphans.Add(instance);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // One provider being unreachable must not hide the other's billing orphans.
+                errors.Add(new JObject { ["provider"] = "vastai", ["error"] = ex.Message });
+            }
+        }
+        return new JObject { ["orphans"] = orphans, ["errors"] = errors };
+    }
+
+    [API.APIDescription("Stops (does not destroy) one orphaned pod or instance listed by CloudListOrphans, on the user's own account. Its disk is kept, so it can be started again.",
+        """
+            "success": true
+        """)]
+    public static async Task<JObject> CloudStopOrphan(Session session,
+        [API.APIParameter("'runpod' or 'vastai'.")] string provider,
+        [API.APIParameter("Pod or instance ID, as listed by CloudListOrphans.")] string resource_id)
+    {
+        if (AttachedInstanceIds(session).Contains(resource_id))
+        {
+            return Error("That instance is attached to one of your Cloud Backends cards; stop it from the card instead.", "not_orphan");
+        }
+        if (provider == "runpod")
+        {
+            string key = session.User.GetGenericData("runpod_api", "key")?.Trim();
+            if (string.IsNullOrEmpty(key) || !session.User.HasPermission(CloudBackendsExtension.PermUseRunPodPods))
+            {
+                return Error("You need a RunPod API key and the RunPod GPU Pods permission to do this.", "no_api_key");
+            }
+            using RunPodPodsProvider pods = new(key, new RunPodPodPlan());
+            if (!(await pods.ListManagedRunningAsync(CloudInstanceBackendBase.KnownInstances(session.User, nameof(RunPodPodsBackend)))).Any(p => p["id"]?.ToString() == resource_id))
+            {
+                return Error($"No running pod '{resource_id}' created by Cloud Backends was found on your RunPod account.", "orphan_not_found");
+            }
+            await pods.StopPodByIdAsync(resource_id);
+            return new JObject { ["success"] = true };
+        }
+        if (provider == "vastai")
+        {
+            string key = session.User.GetGenericData("vastai_api", "key")?.Trim();
+            if (string.IsNullOrEmpty(key) || !session.User.HasPermission(CloudBackendsExtension.PermUseVastAIInstances))
+            {
+                return Error("You need a Vast.ai API key and the Vast.ai Instances permission to do this.", "no_api_key");
+            }
+            using VastAIInstanceProvider instances = new(key, new VastAIInstancePlan());
+            if (!(await instances.ListManagedRunningAsync(CloudInstanceBackendBase.KnownInstances(session.User, nameof(VastAIInstanceBackend)))).Any(i => i["id"]?.ToString() == resource_id))
+            {
+                return Error($"No running instance '{resource_id}' created by Cloud Backends was found on your Vast.ai account.", "orphan_not_found");
+            }
+            await instances.StopInstanceByIdAsync(resource_id);
+            return new JObject { ["success"] = true };
+        }
+        return Error($"Unknown provider '{provider}'. Use 'runpod' or 'vastai'.", "invalid_provider");
+    }
+
+    [API.APIDescription("Debug/testing hook: corrupts the cached SwarmUI session ID this server holds against each of a serverless backend's leased workers, so the session-recovery path can be exercised deterministically. Requires backend editing permission; no effect on the workers themselves.",
+        """
+            "success": true,
+            "invalidated": 1
         """)]
     public static Task<JObject> CloudDebugInvalidateSession(Session session,
-        [API.APIParameter("ID of the serverless cloud backend whose cached worker session to invalidate.")] int backend_id)
+        [API.APIParameter("ID of the serverless cloud backend (or its 'Cloud Backends' card) whose worker sessions to invalidate.")] int backend_id)
     {
-        CloudBackendBase backend = Program.Backends.RunningBackendsOfType<CloudBackendBase>()
-            .FirstOrDefault(b => b.BackendData?.ID == backend_id);
-        if (backend is null)
+        List<CloudBackendBase> backends = UserServerless(session, backend_id, "");
+        int count = 0;
+        foreach (WorkerSlot slot in backends.SelectMany(b => b.Slots))
         {
-            return Task.FromResult(new JObject { ["error"] = $"No running serverless cloud backend found with ID {backend_id}." });
+            slot.Worker.SessionId = "swarm_debug_invalidated_session";
+            count++;
         }
-        if (backend.CurrentWorker is null)
+        if (count == 0)
         {
-            return Task.FromResult(new JObject { ["error"] = "Backend has no active worker session to invalidate." });
+            return Task.FromResult(Error("None of your serverless backends under this ID has a leased worker.", "worker_not_found"));
         }
-        backend.CurrentWorker.SessionId = "swarm_debug_invalidated_session";
-        Logs.Info($"[CloudBackends] Debug: invalidated worker session for backend #{backend_id}.");
-        return Task.FromResult(new JObject { ["message"] = $"Worker session invalidated for backend #{backend_id}." });
+        Logs.Info($"[CloudBackends] Debug: invalidated {count} worker session(s) under backend #{backend_id}.");
+        return Task.FromResult(new JObject { ["success"] = true, ["invalidated"] = count });
     }
 }

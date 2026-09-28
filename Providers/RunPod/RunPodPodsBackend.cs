@@ -76,6 +76,9 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
 
         [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
         public string PodEnv = "";
+
+        [ConfigComment("Only for a pod you created yourself (set in Pod ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let this backend create the pod with a token of its own. Stored in the backend settings, so admins can see it.")]
+        public string WorkerToken = "";
     }
 
     public override InstanceSettings InstanceConfig => (Settings)SettingsRaw;
@@ -103,6 +106,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
             CloudType = config.CloudType,
             DataCenterId = config.DataCenterId?.Trim() ?? "",
             Env = config.PodEnv ?? "",
+            WorkerToken = WorkerToken ?? "",
             TerminateOnShutdown = config.TerminateOnShutdown
         });
     }
@@ -119,7 +123,10 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
 
     public override void CheckPermission(Session session)
     {
-        if (session?.User is null) { return; }
+        if (session?.User is null)
+        {
+            return;
+        }
         if (!session.User.HasPermission(CloudBackendsExtension.PermUseRunPodPods))
         {
             throw new SwarmReadableErrorException("You do not have permission to use RunPod GPU Pod backends.");
@@ -136,4 +143,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
             throw new SwarmReadableErrorException("Nothing to start. Set 'PodId' to use an existing pod, or set an 'ImageName' (or 'TemplateId') so a pod can be created.");
         }
     }
+
+    /// <inheritdoc/>
+    protected override string ExistingWorkerToken => PodConfig.WorkerToken;
 }
