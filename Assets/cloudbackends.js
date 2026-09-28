@@ -251,6 +251,27 @@ class CloudBackendsHelper {
     // ── Section regrouping ───────────────────────────────────────────────────
 
     /**
+     * Labels a setting by its name without the provider prefix (EndpointId, not RunPodServerless_EndpointId), as
+     * Swarm's own settings read; the section header already names the provider. Only the displayed label and help
+     * title change: the input's data-name, and so saving and the API, keep the full field name.
+     */
+    showUnprefixedName(div, prefix) {
+        let fullName = div.querySelector('[data-name]').dataset.name;
+        let shortName = fullName.substring(prefix.length);
+        for (let span of div.querySelectorAll('.auto-input-name .translate')) {
+            if (span.dataset.pretranslated == fullName) {
+                span.dataset.pretranslated = shortName;
+                span.innerText = translate(shortName);
+            }
+        }
+        for (let bold of div.querySelectorAll('.sui-popover b')) {
+            if (bold.innerText == fullName) {
+                bold.innerText = shortName;
+            }
+        }
+    }
+
+    /**
      * Regroups a freshly-rendered card's flat field list into one collapsible section per provider,
      * each with its own Enabled toggle in the header. Every field div keeps its original data-name
      * input untouched (just moved in the DOM), so Save/Edit continue to work unmodified.
@@ -261,6 +282,9 @@ class CloudBackendsHelper {
             let matches = settingDivs.filter(div => div.querySelector('[data-name]').dataset.name.startsWith(provider.prefix));
             if (matches.length == 0) {
                 continue;
+            }
+            for (let div of matches) {
+                this.showUnprefixedName(div, provider.prefix);
             }
             let toggleDiv = matches.find(div => div.querySelector('[data-name]').dataset.name == `${provider.prefix}Enabled`);
             let section = createDiv(null, 'cloudbackends-provider-section');
