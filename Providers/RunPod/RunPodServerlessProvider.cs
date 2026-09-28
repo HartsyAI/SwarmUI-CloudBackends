@@ -459,10 +459,11 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         JObject endpoint = await GetJsonAsync($"https://rest.runpod.io/v1/endpoints/{endpointId}?includeTemplate=true", cancel);
         int workersMax = endpoint["workersMax"]?.Value<int>() ?? 0;
         long executionTimeoutMs = endpoint["executionTimeoutMs"]?.Value<long>() ?? 0;
-        string image = endpoint["template"]?["imageName"]?.ToString() ?? "";
-        List<string> ports = TemplatePorts(endpoint["template"]?["ports"]);
-        Logs.Debug($"{Tag} Endpoint {endpointId} template: image '{image}', ports [{string.Join(", ", ports)}]. Fields: {string.Join(", ", endpoint.Properties().Select(p => p.Name))}; template fields: {string.Join(", ", (endpoint["template"] as JObject)?.Properties().Select(p => p.Name) ?? [])}.");
-        if (endpoint["template"] is JObject && !ports.Any(p => p.Equals($"{WorkerPort}/http", StringComparison.OrdinalIgnoreCase)))
+        JObject template = endpoint["template"] as JObject ?? await GetTemplateAsync(endpoint["templateId"]?.ToString(), cancel);
+        string image = template?["imageName"]?.ToString() ?? "";
+        List<string> ports = TemplatePorts(template?["ports"]);
+        Logs.Debug($"{Tag} Endpoint {endpointId} template: image '{image}', ports [{string.Join(", ", ports)}].");
+        if (template is not null && !ports.Any(p => p.Equals($"{WorkerPort}/http", StringComparison.OrdinalIgnoreCase)))
         {
             findings.Add(Finding("error", $"The endpoint does not expose port {WorkerPort} as HTTP, so RunPod's proxy cannot reach the worker's SwarmUI and workers never become usable. Edit the endpoint and add {WorkerPort} under Container configuration, Expose HTTP ports."));
         }
@@ -488,6 +489,27 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             findings.Add(Finding("warning", $"The endpoint's image '{image}' is not pinned to a version. Pin a release tag so workers do not change underneath you."));
         }
         return findings;
+    }
+
+    /// <summary>
+    /// An endpoint's template. The endpoint API documents includeTemplate but in practice returns only templateId, so it is
+    /// fetched by ID. Null if it cannot be read, which only skips the checks that need it.
+    /// </summary>
+    async Task<JObject> GetTemplateAsync(string templateId, CancellationToken cancel)
+    {
+        if (string.IsNullOrWhiteSpace(templateId))
+        {
+            return null;
+        }
+        try
+        {
+            return await GetJsonAsync($"https://rest.runpod.io/v1/templates/{templateId}", cancel);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Logs.Debug($"{Tag} Could not read template {templateId}: {ex.Message}");
+            return null;
+        }
     }
 
     /// <summary>The worker's gateway port, which the endpoint must expose as HTTP for RunPod's proxy to reach it.</summary>
