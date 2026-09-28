@@ -461,7 +461,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         long executionTimeoutMs = endpoint["executionTimeoutMs"]?.Value<long>() ?? 0;
         string image = endpoint["template"]?["imageName"]?.ToString() ?? "";
         List<string> ports = TemplatePorts(endpoint["template"]?["ports"]);
-        Logs.Debug($"{Tag} Endpoint {endpointId} template: image '{image}', ports [{string.Join(", ", ports)}].");
+        Logs.Debug($"{Tag} Endpoint {endpointId} template: image '{image}', ports [{string.Join(", ", ports)}]. Fields: {string.Join(", ", endpoint.Properties().Select(p => p.Name))}; template fields: {string.Join(", ", (endpoint["template"] as JObject)?.Properties().Select(p => p.Name) ?? [])}.");
         if (endpoint["template"] is JObject && !ports.Any(p => p.Equals($"{WorkerPort}/http", StringComparison.OrdinalIgnoreCase)))
         {
             findings.Add(Finding("error", $"The endpoint does not expose port {WorkerPort} as HTTP, so RunPod's proxy cannot reach the worker's SwarmUI and workers never become usable. Edit the endpoint and add {WorkerPort} under Container configuration, Expose HTTP ports."));
