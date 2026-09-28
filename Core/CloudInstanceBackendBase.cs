@@ -116,7 +116,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
 
     void FailsafeTick()
     {
-        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped)
+        if (!HasBillableInstance || InstanceStartedAt is null || FailsafeTripped)
         {
             return;
         }
@@ -133,9 +133,15 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         _ = Utilities.RunCheckedTask(CheckFailsafeAsync, $"{GetType().Name} #{BackendData?.ID} failsafe check");
     }
 
+    /// <summary>
+    /// True while this backend holds an instance that may be billing: attached, or created or started by a start that has not
+    /// finished (or failed). An instance only named in the settings, and never started here, is not ours to stop.
+    /// </summary>
+    bool HasBillableInstance => CurrentInstance is not null || (InstanceStartedAt is not null && !string.IsNullOrWhiteSpace(Provider?.ActiveInstanceId));
+
     async Task CheckFailsafeAsync()
     {
-        if (CurrentInstance is null || InstanceStartedAt is null || FailsafeTripped)
+        if (!HasBillableInstance || InstanceStartedAt is null || FailsafeTripped)
         {
             return;
         }
@@ -368,9 +374,23 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             }
             RefreshProviderIfKeyChanged();
             AddLoadStatus($"Starting {Provider.ProviderName} instance (up to {InstanceConfig.StartupTimeoutSec}s)...");
+            // The runtime and spend caps count from here, so they also cover an instance whose SwarmUI never answers.
+            InstanceStartedAt = DateTime.UtcNow;
             try
             {
                 CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, InstanceConfig.PollIntervalMs, Program.GlobalProgramCancel);
+            }
+            catch (Exception)
+            {
+                if (string.IsNullOrWhiteSpace(Provider?.ActiveInstanceId))
+                {
+                    InstanceStartedAt = null;
+                }
+                else
+                {
+                    AddLoadStatus($"Instance '{Provider.ActiveInstanceId}' was not ready in time and is still running (and billing). Start again to reattach it, or Stop to release it.");
+                }
+                throw;
             }
             finally
             {
@@ -381,7 +401,6 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             }
             AddLoadStatus($"Instance '{CurrentInstance.InstanceId}' is up at {CurrentInstance.PublicUrl}, attaching Swarm backend...");
             AttachChildBackend();
-            InstanceStartedAt = DateTime.UtcNow;
             AddLoadStatus($"{Provider.ProviderName} instance ready.");
         }
         finally
@@ -416,10 +435,11 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         return Task.CompletedTask;
     }
 
-    /// <summary>Removes the child backend and releases the cloud instance.</summary>
-    public async Task StopInstanceAsync()
+    /// <summary>Removes the child backend and releases the cloud instance. Returns false if there was no instance to release.</summary>
+    public async Task<bool> StopInstanceAsync()
     {
         await InstanceLock.WaitAsync(CancellationToken.None);
+        bool released = false;
         try
         {
             if (ChildBackend is not null)
@@ -429,16 +449,20 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
                 await CloudChildBackend.DetachAsync(Handler, child, Provider?.ProviderName);
                 await OnChildDetachedAsync();
             }
-            if (Provider is not null && CurrentInstance is not null)
+            // Also an instance a failed start created or reattached: it has no CurrentInstance, but it bills all the same.
+            if (Provider is not null && HasBillableInstance)
             {
+                string instanceId = CurrentInstance?.InstanceId ?? Provider.ActiveInstanceId;
                 // Releasing matters more than tidiness: a running instance bills until it is stopped.
                 try
                 {
                     await Provider.ReleaseInstanceAsync();
+                    released = true;
                 }
                 catch (Exception ex)
                 {
-                    Logs.Error($"[{Provider.ProviderName}] Failed to release instance '{CurrentInstance.InstanceId}', it may still be billing: {ex.ReadableString()}");
+                    Logs.Error($"[{Provider.ProviderName}] Failed to release instance '{instanceId}', it may still be billing: {ex.ReadableString()}");
+                    throw new SwarmReadableErrorException($"Could not release instance '{instanceId}'; it may still be billing: {ex.Message}");
                 }
             }
             CurrentInstance = null;
@@ -448,6 +472,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         {
             InstanceLock.Release();
         }
+        return released;
     }
 
     public override async Task Shutdown()
@@ -455,7 +480,14 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         Program.TickEvent -= FailsafeTick;
         string name = Provider?.ProviderName ?? GetType().Name;
         Logs.Info($"[{name}] Backend {BackendData?.ID} shutting down...");
-        await StopInstanceAsync();
+        try
+        {
+            await StopInstanceAsync();
+        }
+        catch (SwarmReadableErrorException)
+        {
+            // Already logged as an error; shutdown carries on regardless.
+        }
         Provider?.Dispose();
         Provider = null;
         Status = BackendStatus.DISABLED;

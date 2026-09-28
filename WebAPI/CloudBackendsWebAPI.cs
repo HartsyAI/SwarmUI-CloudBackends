@@ -101,6 +101,7 @@ public static class CloudBackendsWebAPI
             // Status streaming below is best-effort on top of that - starting/stopping must never be
             // gated on it.
             Task action = input.Start ? backend.StartInstanceAsync() : backend.StopInstanceAsync();
+            Task<bool> stop = action as Task<bool>;
             int seen = 0;
             while (true)
             {
@@ -127,7 +128,8 @@ public static class CloudBackendsWebAPI
                 await Task.WhenAny(action, Task.Delay(500, Program.GlobalProgramCancel));
             }
             await action;
-            output(new JObject { ["message"] = $"Instance {(input.Start ? "started" : "stopped")} for backend #{input.BackendId}.", ["done"] = true });
+            string result = input.Start ? $"Instance started for backend #{input.BackendId}." : stop.Result ? $"Instance stopped for backend #{input.BackendId}." : $"No running instance to stop for backend #{input.BackendId}.";
+            output(new JObject { ["message"] = result, ["done"] = true });
         }
         catch (SwarmReadableErrorException ex)
         {
