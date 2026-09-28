@@ -147,6 +147,16 @@ public class RunPodLeaseTests
     }
 
     [Test]
+    public void FlagsCudaHostsTooOldForHartsyInference()
+    {
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray("12.8", "12.9", "13.0"), 13.0), Is.True);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray("13.0", "13.1"), 13.0), Is.False);
+        // No list means any version, including old ones.
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray(), 13.0), Is.True);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(null, 13.0), Is.True);
+    }
+
+    [Test]
     public void KeepsAVersion1WorkerAliveLikeCloudBackends1()
     {
         DateTime now = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);

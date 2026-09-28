@@ -475,6 +475,10 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         {
             findings.Add(Finding("warning", $"Max Workers is {maxWorkers}, but the endpoint allows only {workersMax}. Scaling will stop at {workersMax}."));
         }
+        if (image.Contains("hartsyinference", StringComparison.OrdinalIgnoreCase) && AllowsCudaBelow(endpoint["allowedCudaVersions"], 13.0))
+        {
+            findings.Add(Finding("error", "The endpoint runs the HartsyInference image but allows hosts older than CUDA 13.0. Its GPU kernels need a CUDA 13 driver, so workers on older hosts cannot start their backend. Edit the endpoint and set the minimum CUDA version to 13.0."));
+        }
         bool version1Image = image.Contains("swarmui-runpod", StringComparison.OrdinalIgnoreCase);
         if (version1Image)
         {
@@ -510,6 +514,13 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             Logs.Debug($"{Tag} Could not read template {templateId}: {ex.Message}");
             return null;
         }
+    }
+
+    /// <summary>True if an endpoint's allowed CUDA versions (none listed means any) include one below <paramref name="minimum"/>.</summary>
+    internal static bool AllowsCudaBelow(JToken allowed, double minimum)
+    {
+        List<double> versions = [.. TemplatePorts(allowed).Select(v => double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) ? d : 0)];
+        return versions.Count == 0 || versions.Any(v => v < minimum);
     }
 
     /// <summary>The worker's gateway port, which the endpoint must expose as HTTP for RunPod's proxy to reach it.</summary>

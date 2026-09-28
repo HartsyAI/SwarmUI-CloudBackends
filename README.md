@@ -67,7 +67,7 @@ Either way the list is remembered per user and endpoint, across restarts. Use th
    |---|---|
    | Network volume | the volume from step 1 |
    | GPU | 16 GB VRAM or more (24 GB for large models) |
-   | CUDA version | 12.8 or newer |
+   | CUDA version | 12.8 or newer for ComfyUI; **13.0 or newer for HartsyInference** (its GPU kernels need a CUDA 13 driver) |
    | Container disk | 30 GB (ComfyUI) or 15 GB (HartsyInference) |
    | Expose HTTP ports | `7801` (under Container configuration). Without it RunPod's proxy cannot reach the worker. |
    | Active workers | 0 |

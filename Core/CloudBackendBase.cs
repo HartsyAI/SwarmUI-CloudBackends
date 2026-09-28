@@ -964,14 +964,24 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         ConcurrentDictionary<string, Dictionary<string, JObject>> listing = new();
         foreach (string subtype in Program.T2IModelSets.Keys)
         {
-            JObject response = await CallWorkerAPI(slot, "ListModels", new JObject
+            JObject response;
+            try
             {
-                ["path"] = "",
-                ["depth"] = 999,
-                ["subtype"] = subtype,
-                ["allowRemote"] = false,
-                ["dataImages"] = false
-            });
+                response = await CallWorkerAPI(slot, "ListModels", new JObject
+                {
+                    ["path"] = "",
+                    ["depth"] = 999,
+                    ["subtype"] = subtype,
+                    ["allowRemote"] = false,
+                    ["dataImages"] = false
+                });
+            }
+            catch (SwarmReadableErrorException ex) when (ex.Message.Contains("Invalid sub-type"))
+            {
+                // A model type only a local extension adds (audio, LLM, ...): the worker has none of those.
+                Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} has no '{subtype}' model type; skipping it.");
+                continue;
+            }
             Dictionary<string, JObject> models = [];
             foreach (JToken file in response["files"] as JArray ?? [])
             {
