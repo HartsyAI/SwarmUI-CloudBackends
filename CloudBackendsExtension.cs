@@ -139,6 +139,17 @@ public class CloudBackendsExtension : Extension
     /// <summary>Minimum spacing between background warm attempts for one parent/user/provider.</summary>
     const long WarmRetryMs = 60_000;
 
+    /// <summary>Atomically claims the warm-attempt window for a key, so concurrent generations schedule at most one attempt.</summary>
+    static bool TryClaimWarmAttempt(string key)
+    {
+        long now = Environment.TickCount64;
+        if (LastWarmAttempt.TryAdd(key, now))
+        {
+            return true;
+        }
+        return LastWarmAttempt.TryGetValue(key, out long last) && now - last >= WarmRetryMs && LastWarmAttempt.TryUpdate(key, now, last);
+    }
+
     static void RegisterPerUserProvisioning()
     {
         T2IEngine.PreGenerateEvent += (p) =>
@@ -194,13 +205,10 @@ public class CloudBackendsExtension : Extension
                         {
                             continue;
                         }
-                        string warmKey = $"{parent.BackendData?.ID}/{user.UserID}/{def.Prefix}";
-                        long now = Environment.TickCount64;
-                        if (LastWarmAttempt.TryGetValue(warmKey, out long last) && now - last < WarmRetryMs)
+                        if (!TryClaimWarmAttempt($"{parent.BackendData?.ID}/{user.UserID}/{def.Prefix}"))
                         {
                             continue;
                         }
-                        LastWarmAttempt[warmKey] = now;
                         _ = Utilities.RunCheckedTask(() => parent.EnsureChildForUser(user, def), "cloud backends child provisioning");
                     }
                 }
