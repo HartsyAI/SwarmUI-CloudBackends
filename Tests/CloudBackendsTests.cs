@@ -147,6 +147,11 @@ public class RunPodLeaseTests
         Assert.That(RunPodServerlessProvider.IsVersion1Refusal(new JObject { ["success"] = false, ["error"] = "Unknown action: lease", ["available_actions"] = new JArray("run") }), Is.False);
         Assert.That(RunPodServerlessProvider.IsVersion1Refusal(Lease()), Is.False);
         Assert.That(RunPodServerlessProvider.IsVersion1Refusal(null), Is.False);
+        // RunPod fails such a job and may keep only the error text (seen live on a version 1 endpoint).
+        Assert.That(RunPodServerlessProvider.IsVersion1JobError("Unknown action: lease"), Is.True);
+        Assert.That(RunPodServerlessProvider.IsVersion1JobError("{'success': False, 'error': 'Unknown action: lease', 'available_actions': ['wakeup']}"), Is.True);
+        Assert.That(RunPodServerlessProvider.IsVersion1JobError("Unknown action 'lease'. This worker supports 'lease' and 'health'."), Is.False);
+        Assert.That(RunPodServerlessProvider.IsVersion1JobError(null), Is.False);
     }
 
     [Test]

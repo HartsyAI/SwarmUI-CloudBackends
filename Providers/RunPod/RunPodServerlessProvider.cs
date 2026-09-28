@@ -128,7 +128,9 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
                 if (status is "COMPLETED" or "FAILED" or "CANCELLED" or "TIMED_OUT")
                 {
                     JObject ended = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{jobId}", CancellationToken.None);
-                    if (IsVersion1Refusal(EndedOutput(ended)))
+                    string endedError = ended["error"]?.ToString() ?? "";
+                    Logs.Debug($"{Tag} Lease job {jobId} ended {status}: {(endedError.Length > 300 ? endedError[..300] : endedError)}");
+                    if (IsVersion1Refusal(EndedOutput(ended)) || IsVersion1JobError(ended["error"]?.ToString()))
                     {
                         break;
                     }
@@ -216,6 +218,16 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         }
         string error = output["error"]?.ToString() ?? "";
         return error.StartsWith("Unknown action", StringComparison.OrdinalIgnoreCase) && actions.Any(a => a.ToString() == "wakeup") && actions.Any(a => a.ToString() == "keepalive");
+    }
+
+    /// <summary>
+    /// True for a failed job's error from the version 1 worker refusing the lease. RunPod fails a job whose output has an
+    /// error and may keep only that text, so the action list is gone; version 1 words it "Unknown action: lease", while
+    /// version 2 says "Unknown action 'lease'".
+    /// </summary>
+    internal static bool IsVersion1JobError(string error)
+    {
+        return error is not null && error.Contains("Unknown action: lease", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>Builds a readable error for a lease job that ended before streaming a worker.</summary>
