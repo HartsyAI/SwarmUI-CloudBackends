@@ -69,6 +69,7 @@ Either way the list is remembered per user and endpoint, across restarts. Use th
    | GPU | 16 GB VRAM or more (24 GB for large models) |
    | CUDA version | 12.8 or newer |
    | Container disk | 30 GB (ComfyUI) or 15 GB (HartsyInference) |
+   | Expose HTTP ports | `7801` (under Container configuration). Without it RunPod's proxy cannot reach the worker. |
    | Active workers | 0 |
    | Max workers | at least your **Max Workers** below |
    | Execution timeout | longer than **Max Lease Seconds** (e.g. 4200 s for the default 3600) |

@@ -460,6 +460,12 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         int workersMax = endpoint["workersMax"]?.Value<int>() ?? 0;
         long executionTimeoutMs = endpoint["executionTimeoutMs"]?.Value<long>() ?? 0;
         string image = endpoint["template"]?["imageName"]?.ToString() ?? "";
+        List<string> ports = TemplatePorts(endpoint["template"]?["ports"]);
+        Logs.Debug($"{Tag} Endpoint {endpointId} template: image '{image}', ports [{string.Join(", ", ports)}].");
+        if (endpoint["template"] is JObject && !ports.Any(p => p.Equals($"{WorkerPort}/http", StringComparison.OrdinalIgnoreCase)))
+        {
+            findings.Add(Finding("error", $"The endpoint does not expose port {WorkerPort} as HTTP, so RunPod's proxy cannot reach the worker's SwarmUI and workers never become usable. Edit the endpoint and add {WorkerPort} under Container configuration, Expose HTTP ports."));
+        }
         if (executionTimeoutMs > 0 && executionTimeoutMs / 1000 <= request.MaxLeaseSeconds)
         {
             findings.Add(Finding("error", $"The endpoint's execution timeout ({executionTimeoutMs / 1000}s) must be longer than Max Lease Seconds ({request.MaxLeaseSeconds}s), or RunPod will stop workers mid-lease. Raise it on the endpoint to at least {request.MaxLeaseSeconds + 300}s."));
@@ -482,6 +488,16 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             findings.Add(Finding("warning", $"The endpoint's image '{image}' is not pinned to a version. Pin a release tag so workers do not change underneath you."));
         }
         return findings;
+    }
+
+    /// <summary>The worker's gateway port, which the endpoint must expose as HTTP for RunPod's proxy to reach it.</summary>
+    public const int WorkerPort = 7801;
+
+    /// <summary>A template's exposed ports, e.g. "7801/http", whether the API sends them as a list or one comma-separated string.</summary>
+    internal static List<string> TemplatePorts(JToken ports)
+    {
+        IEnumerable<string> raw = ports is JArray list ? list.Select(p => p.ToString()) : (ports?.ToString() ?? "").Split(',');
+        return [.. raw.Select(p => p.Trim()).Where(p => p.Length > 0)];
     }
 
     /// <summary>Builds one validation finding.</summary>

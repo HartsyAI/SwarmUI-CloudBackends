@@ -138,6 +138,15 @@ public class RunPodLeaseTests
     }
 
     [Test]
+    public void ReadsTemplatePortsInEitherShape()
+    {
+        Assert.That(RunPodServerlessProvider.TemplatePorts(new JArray("7801/http", "22/tcp")), Is.EqualTo(new[] { "7801/http", "22/tcp" }));
+        Assert.That(RunPodServerlessProvider.TemplatePorts(new JValue("7801/http, 22/tcp")), Is.EqualTo(new[] { "7801/http", "22/tcp" }));
+        Assert.That(RunPodServerlessProvider.TemplatePorts(new JValue("")), Is.Empty);
+        Assert.That(RunPodServerlessProvider.TemplatePorts(null), Is.Empty);
+    }
+
+    [Test]
     public void KeepsAVersion1WorkerAliveLikeCloudBackends1()
     {
         DateTime now = new(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);

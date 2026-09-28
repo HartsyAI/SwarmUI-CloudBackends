@@ -696,7 +696,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         LeaseRequest request = MakeLeaseRequest();
         DateTime start = DateTime.UtcNow;
         bool everSawBackend = false;
+        bool everAnswered = false;
         string lastError = null;
+        string lastState = null;
+        DateTime? allFailedSince = null;
         while ((DateTime.UtcNow - start).TotalSeconds < request.StartupTimeoutSec)
         {
             if (ShuttingDown || !ReferenceEquals(Provider, provider))
@@ -708,14 +711,28 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             try
             {
                 JObject data = await CallWorkerAPI(slot, "ListBackends", new JObject { ["nonreal"] = true, ["full_data"] = true }, 30);
+                everAnswered = true;
                 JObject[] backends = [.. data.Properties().Select(p => p.Value).OfType<JObject>()];
                 everSawBackend |= backends.Length > 0;
                 UpdateFeaturesFromWorker(data);
+                string state = string.Join(", ", backends.Select(b => $"{b["type"]}={b["status"]}"));
+                if (state != lastState)
+                {
+                    Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} backends: {(state.Length == 0 ? "none yet" : state)}");
+                    lastState = state;
+                }
                 bool anyRunning = backends.Any(b => b["status"]?.ToString() == "running");
                 bool anyLoading = backends.Any(b => b["status"]?.ToString() == "loading");
                 if (anyRunning && !anyLoading)
                 {
                     return;
+                }
+                // Every backend failed to start: waiting out the startup timeout will not change that.
+                bool allFailed = backends.Length > 0 && backends.All(b => b["status"]?.ToString() is "errored" or "disabled");
+                allFailedSince = allFailed ? allFailedSince ?? DateTime.UtcNow : null;
+                if (allFailedSince is DateTime since && (DateTime.UtcNow - since).TotalSeconds > 60)
+                {
+                    throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} could not start its generation backend ({state}). Check the worker's logs in the provider console.");
                 }
                 if (!everSawBackend && (DateTime.UtcNow - start).TotalSeconds > 90)
                 {
@@ -726,10 +743,28 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             {
                 throw;
             }
+            catch (WorkerNotReadyException)
+            {
+                // The worker's gateway answered: it is reachable, and its SwarmUI is still starting.
+                if (!everAnswered)
+                {
+                    Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} is reachable; its SwarmUI is still starting.");
+                }
+                everAnswered = true;
+            }
             catch (Exception ex)
             {
                 // A freshly assigned worker's proxy often answers nothing for a few seconds.
+                if (ex.Message != lastError)
+                {
+                    Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} not answering yet: {ex.Message}");
+                }
                 lastError = ex.Message;
+                // The worker's gateway answers as soon as it runs, even while SwarmUI starts, so minutes of silence mean the address is unreachable.
+                if (!everAnswered && (DateTime.UtcNow - start).TotalSeconds > 180)
+                {
+                    throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} was assigned but never answered at {slot.ConnectUrl} (last error: {lastError}). On RunPod, the endpoint must expose port 7801 as HTTP; Validate checks this.");
+                }
             }
             await RenewQuietlyAsync(provider, slot);
             await Task.Delay(request.PollIntervalMs, Program.GlobalProgramCancel);
