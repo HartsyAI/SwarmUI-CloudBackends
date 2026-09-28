@@ -467,9 +467,13 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         {
             findings.Add(Finding("error", $"The endpoint does not expose port {WorkerPort} as HTTP, so RunPod's proxy cannot reach the worker's SwarmUI and workers never become usable. Edit the endpoint and add {WorkerPort} under Container configuration, Expose HTTP ports."));
         }
-        if (executionTimeoutMs > 0 && executionTimeoutMs / 1000 <= request.MaxLeaseSeconds)
+        bool version1Image = image.Contains("swarmui-runpod", StringComparison.OrdinalIgnoreCase);
+        // The longest single job this backend runs: a lease, or on the version 1 image one keepalive.
+        int longestJob = version1Image ? Math.Max(60, request.IdleSeconds) : request.MaxLeaseSeconds;
+        if (executionTimeoutMs > 0 && executionTimeoutMs / 1000 <= longestJob)
         {
-            findings.Add(Finding("error", $"The endpoint's execution timeout ({executionTimeoutMs / 1000}s) must be longer than Max Lease Seconds ({request.MaxLeaseSeconds}s), or RunPod will stop workers mid-lease. Raise it on the endpoint to at least {request.MaxLeaseSeconds + 300}s."));
+            string what = version1Image ? $"a keepalive job ({longestJob}s, from Idle Seconds)" : $"Max Lease Seconds ({longestJob}s)";
+            findings.Add(Finding("error", $"The endpoint's execution timeout ({executionTimeoutMs / 1000}s) must be longer than {what}, or RunPod will stop workers mid-job. Raise it on the endpoint to at least {longestJob + 300}s."));
         }
         if (workersMax > 0 && workersMax < maxWorkers)
         {
@@ -479,7 +483,6 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         {
             findings.Add(Finding("error", "The endpoint runs the HartsyInference image but allows hosts older than CUDA 13.0. Its GPU kernels need a CUDA 13 driver, so workers on older hosts cannot start their backend. Edit the endpoint and set the minimum CUDA version to 13.0."));
         }
-        bool version1Image = image.Contains("swarmui-runpod", StringComparison.OrdinalIgnoreCase);
         if (version1Image)
         {
             findings.Add(Finding("warning", $"The endpoint runs the version 1 worker image '{image}'. It works in single-worker compatibility mode (Max Workers is held to 1, and the worker has no access token). Point the endpoint at kalebbroo/swarmui-worker-runpod to scale out and secure it."));
