@@ -447,6 +447,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec + 60);
         using CancellationTokenSource withdraw = new();
         Task<WorkerSlot> acquiring = null;
+        DateTime? refusedSince = null;
         try
         {
             while (DateTime.UtcNow < deadline)
@@ -455,6 +456,13 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 if (access is not null)
                 {
                     return access;
+                }
+                // An idle worker that refuses the request will keep refusing it; say why instead of waiting out the timeout.
+                string refusal = RefusalReason(input);
+                refusedSince = refusal is null ? null : refusedSince ?? DateTime.UtcNow;
+                if (refusedSince is DateTime since && (DateTime.UtcNow - since).TotalSeconds > 30)
+                {
+                    throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} workers cannot run this request: {refusal}");
                 }
                 if (acquiring is null && TryReserveLease())
                 {
@@ -486,6 +494,25 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     }
 
     /// <summary>Picks and claims a mirrored backend that can serve the request, atomically. Null if none is available.</summary>
+    /// <summary>
+    /// Why the attached workers refuse a request, when at least one of their backends is running and idle and none will take
+    /// it; null when some could, or when every backend is simply busy or starting (worth waiting for).
+    /// </summary>
+    string RefusalReason(T2IParamInput input)
+    {
+        BackendHandler.T2IBackendData[] idle = [.. Slots.SelectMany(s => s.RunningGrandchildren).Where(d => !d.CheckIsInUse)];
+        if (idle.Length == 0 || idle.Any(d => CanServe(d, input)))
+        {
+            return null;
+        }
+        HashSet<string> missing = [.. idle.SelectMany(d => input.RequiredFlags.Where(f => !d.Backend.SupportedFeatures.Contains(f) && !T2IEngine.DisregardedFeatureFlags.Contains(f)))];
+        string reason = missing.Count > 0
+            ? $"their backends do not support {string.Join(", ", missing.Order())}. The worker image may be too old for this model or feature."
+            : "their backends do not accept this model or its parameters. Check the model exists on the endpoint, or press Discover models.";
+        Logs.Debug($"[{CloudProviderName}] Idle worker backends refuse request: {reason}");
+        return reason;
+    }
+
     async Task<T2IBackendAccess> TryClaimAsync(T2IParamInput input, bool allowBusy)
     {
         await SlotLock.WaitAsync(Program.GlobalProgramCancel);
