@@ -317,7 +317,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 dataCenterId = volumeDc;
             }
         }
-        List<string> candidates = await GpuCandidatesAsync(cancel);
+        List<string> candidates = await GpuCandidatesAsync(dataCenterId, cancel);
         string lastDetail = null;
         foreach (string gpuId in candidates)
         {
@@ -402,9 +402,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
 
     /// <summary>
     /// GPU types to attempt, in order. An explicit choice is used alone; otherwise the catalog is asked
-    /// for types that are actually available for pods, cheapest first.
+    /// for types that are actually available for pods (in <paramref name="dataCenterId"/>, when the pod is pinned to one), cheapest first.
     /// </summary>
-    public async Task<List<string>> GpuCandidatesAsync(CancellationToken cancel = default)
+    public async Task<List<string>> GpuCandidatesAsync(string dataCenterId, CancellationToken cancel = default)
     {
         if (!string.IsNullOrWhiteSpace(plan.GpuTypeId))
         {
@@ -412,8 +412,24 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         }
         string cloud = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperInvariant();
         JToken catalog = await ApiAsync(HttpMethod.Get, $"/catalog/gpus?include=AVAILABILITY&product=POD&cloud={cloud}", null, cancel);
+        List<string> ordered = OrderGpuCandidates(catalog?["gpus"] as JArray, cloud, dataCenterId);
+        if (ordered.Count == 0)
+        {
+            string where = string.IsNullOrWhiteSpace(dataCenterId) ? "" : $" in {dataCenterId} (where the network volume is)";
+            throw new SwarmReadableErrorException($"RunPod reports no GPU types available for pods on the {cloud} cloud{where} right now. Try again later, set 'GpuTypeId' explicitly, or try the other cloud type.");
+        }
+        Logs.Info($"[RunPodPods] No GPU type set; trying available types{(string.IsNullOrWhiteSpace(dataCenterId) ? "" : $" in {dataCenterId}")} cheapest first: {string.Join(", ", ordered)}");
+        return ordered;
+    }
+
+    /// <summary>
+    /// The five cheapest GPU types in a catalog listing that are available, and when <paramref name="dataCenterId"/> is set,
+    /// available in that data center. A pinned pod (a network volume pins it) can only be placed there, so GPUs elsewhere would only be refused.
+    /// </summary>
+    internal static List<string> OrderGpuCandidates(JArray gpus, string cloud, string dataCenterId)
+    {
         List<(string Id, double Price)> usable = [];
-        foreach (JToken t in catalog?["gpus"] as JArray ?? [])
+        foreach (JToken t in gpus ?? [])
         {
             if (t is not JObject gpu)
             {
@@ -424,6 +440,10 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             {
                 continue;
             }
+            if (!string.IsNullOrWhiteSpace(dataCenterId) && !(gpu["dataCenters"] as JArray ?? []).Any(d => string.Equals(d["id"]?.ToString(), dataCenterId, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
             string id = gpu["id"]?.ToString();
             double price = gpu["price"]?[cloud.ToLowerFast()]?.Value<double>() ?? double.MaxValue;
             if (!string.IsNullOrWhiteSpace(id))
@@ -431,13 +451,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 usable.Add((id, price));
             }
         }
-        if (usable.Count == 0)
-        {
-            throw new SwarmReadableErrorException($"RunPod reports no GPU types available for pods on the {cloud} cloud right now. Set 'GpuTypeId' explicitly, or try the other cloud type.");
-        }
-        List<string> ordered = [.. usable.OrderBy(g => g.Price).Select(g => g.Id).Take(5)];
-        Logs.Info($"[RunPodPods] No GPU type set; trying available types cheapest first: {string.Join(", ", ordered)}");
-        return ordered;
+        return [.. usable.OrderBy(g => g.Price).Select(g => g.Id).Take(5)];
     }
 
     /// <summary>

@@ -159,6 +159,30 @@ public class RunPodLeaseTests
     }
 }
 
+/// <summary>RunPod pod GPU selection.</summary>
+[TestFixture]
+public class RunPodPodTests
+{
+    static JObject Gpu(string id, double price, string availability, params string[] dataCenters) => new()
+    {
+        ["id"] = id,
+        ["availability"] = availability,
+        ["price"] = new JObject { ["secure"] = price },
+        ["dataCenters"] = new JArray(dataCenters.Select(d => new JObject { ["id"] = d }))
+    };
+
+    [Test]
+    public void OnlyTriesGpusAvailableWhereTheVolumeIs()
+    {
+        // The real catalog at the time this was found: the five cheapest GPUs were all outside EU-RO-1.
+        JArray catalog = [Gpu("NVIDIA RTX A4000", 0.25, "LOW", "EUR-IS-1"), Gpu("NVIDIA RTX A5000", 0.27, "LOW", "CA-MTL-1"), Gpu("NVIDIA RTX A6000", 0.53, "LOW"),
+            Gpu("NVIDIA RTX PRO 4000 Blackwell", 0.57, "LOW", "EU-RO-1"), Gpu("NVIDIA GeForce RTX 4090", 0.74, "MEDIUM", "EU-RO-1", "EUR-IS-1"), Gpu("NVIDIA H100", 2.89, "NONE", "EU-RO-1")];
+        Assert.That(RunPodPodsProvider.OrderGpuCandidates(catalog, "SECURE", "EU-RO-1"), Is.EqualTo(new[] { "NVIDIA RTX PRO 4000 Blackwell", "NVIDIA GeForce RTX 4090" }));
+        Assert.That(RunPodPodsProvider.OrderGpuCandidates(catalog, "SECURE", ""), Is.EqualTo(new[] { "NVIDIA RTX A4000", "NVIDIA RTX A5000", "NVIDIA RTX A6000", "NVIDIA RTX PRO 4000 Blackwell", "NVIDIA GeForce RTX 4090" }));
+        Assert.That(RunPodPodsProvider.OrderGpuCandidates(catalog, "SECURE", "US-KS-2"), Is.Empty);
+    }
+}
+
 /// <summary>Vast.ai session renewal and lease parsing.</summary>
 [TestFixture]
 public class VastSessionTests
