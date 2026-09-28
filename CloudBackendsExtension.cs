@@ -133,6 +133,12 @@ public class CloudBackendsExtension : Extension
 
     // ── Registration helpers ──────────────────────────────────────────────────
 
+    /// <summary>Last background warm attempt (TickCount64 ms) per parent/user/provider, so per-image PreGenerate stays cheap.</summary>
+    static readonly ConcurrentDictionary<string, long> LastWarmAttempt = new();
+
+    /// <summary>Minimum spacing between background warm attempts for one parent/user/provider.</summary>
+    const long WarmRetryMs = 60_000;
+
     static void RegisterPerUserProvisioning()
     {
         T2IEngine.PreGenerateEvent += (p) =>
@@ -181,8 +187,20 @@ public class CloudBackendsExtension : Extension
                 {
                     // Not targeted: warm the user's children in the background so their cloud models
                     // and routing become available, without delaying this (non-cloud) generation.
+                    // Skips a healthy existing child (in-memory, no DB read) and throttles the rest, since this runs per image.
                     foreach (CloudBackendsBackend parent in parents)
                     {
+                        if (parent.GetChildFor(user.UserID, def) is AbstractT2IBackend child && child.Status != BackendStatus.ERRORED)
+                        {
+                            continue;
+                        }
+                        string warmKey = $"{parent.BackendData?.ID}/{user.UserID}/{def.Prefix}";
+                        long now = Environment.TickCount64;
+                        if (LastWarmAttempt.TryGetValue(warmKey, out long last) && now - last < WarmRetryMs)
+                        {
+                            continue;
+                        }
+                        LastWarmAttempt[warmKey] = now;
                         _ = Utilities.RunCheckedTask(() => parent.EnsureChildForUser(user, def), "cloud backends child provisioning");
                     }
                 }
