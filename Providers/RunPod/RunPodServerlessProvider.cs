@@ -503,7 +503,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         }
         try
         {
-            return await GetJsonAsync($"https://rest.runpod.io/v1/templates/{templateId}", cancel);
+            return await GetJsonAsync($"https://rest.runpod.io/v1/templates/{templateId}?includeEndpointBoundTemplates=true", cancel);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
