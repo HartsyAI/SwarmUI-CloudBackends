@@ -39,14 +39,20 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
     /// </summary>
     public async Task<JToken> ApiAsync(HttpMethod method, string path, JObject body = null, CancellationToken cancel = default, bool allowNotFound = false)
     {
-        using HttpRequestMessage request = new(method, $"{apiBase}{path}");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        if (body is not null)
+        HttpRequestMessage MakeRequest()
         {
-            request.Content = new StringContent(body.ToString(), Encoding.UTF8, "application/json");
+            HttpRequestMessage request = new(method, $"{apiBase}{path}");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            if (body is not null)
+            {
+                request.Content = new StringContent(body.ToString(), Encoding.UTF8, "application/json");
+            }
+            return request;
         }
         Logs.Debug($"[{providerName}] {method} {path}");
-        using HttpResponseMessage response = await Http.SendAsync(request, cancel);
+        // Backs off on rate limits (Vast.ai allows about two requests a second); only reads and deletes retry server errors.
+        bool idempotent = method == HttpMethod.Get || method == HttpMethod.Delete;
+        using HttpResponseMessage response = await HttpRetry.SendAsync(Http, MakeRequest, $"[{providerName}]", cancel, idempotent);
         string text = await response.Content.ReadAsStringAsync(cancel);
         if (response.StatusCode == HttpStatusCode.NotFound && allowNotFound)
         {

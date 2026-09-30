@@ -359,3 +359,41 @@ public class RunPodErrorTests
         Assert.That(new RunPodApiException(503, "x").IsPermanent, Is.False);
     }
 }
+
+/// <summary>Retry rules for provider API calls.</summary>
+[TestFixture]
+public class HttpRetryRuleTests
+{
+    /// <summary>Answers with the queued statuses in order, counting the calls.</summary>
+    class Scripted(params HttpStatusCode[] statuses) : HttpMessageHandler
+    {
+        public int Calls;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            HttpStatusCode status = statuses[Math.Min(Calls, statuses.Length - 1)];
+            Calls++;
+            HttpResponseMessage response = new(status);
+            response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromMilliseconds(10));
+            return Task.FromResult(response);
+        }
+    }
+
+    [Test]
+    public async Task CreatingRequestsRetryOnlyRateLimits()
+    {
+        Scripted limited = new(HttpStatusCode.TooManyRequests, HttpStatusCode.OK);
+        using (HttpResponseMessage r = await HttpRetry.SendAsync(new HttpClient(limited), () => new HttpRequestMessage(HttpMethod.Put, "http://x/asks/1"), "[t]", default, idempotent: false))
+        {
+            Assert.That(r.StatusCode, Is.EqualTo(HttpStatusCode.OK));
+        }
+        Assert.That(limited.Calls, Is.EqualTo(2));
+        // A 5xx on a create may already have rented something: it must not be repeated.
+        Scripted failing = new(HttpStatusCode.BadGateway, HttpStatusCode.OK);
+        using (HttpResponseMessage r = await HttpRetry.SendAsync(new HttpClient(failing), () => new HttpRequestMessage(HttpMethod.Put, "http://x/asks/1"), "[t]", default, idempotent: false))
+        {
+            Assert.That(r.StatusCode, Is.EqualTo(HttpStatusCode.BadGateway));
+        }
+        Assert.That(failing.Calls, Is.EqualTo(1));
+    }
+}

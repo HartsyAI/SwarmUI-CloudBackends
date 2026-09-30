@@ -382,8 +382,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             body["image"] = plan.ImageName;
             if (CloudBackendTypes.NeedsCuda13(plan.ImageName))
             {
-                // Without this the pod can land on a host whose driver cannot load the backend's kernels.
-                body["allowedCudaVersions"] = new JArray("13.0");
+                // Without this the pod can land on a host whose driver cannot load the backend's kernels. The v2 API
+                // takes it on the gpu object (a top-level field is rejected as an unknown property).
+                ((JObject)body["gpu"])["minCudaVersion"] = "13.0";
             }
         }
         if (!string.IsNullOrWhiteSpace(dataCenterId))
