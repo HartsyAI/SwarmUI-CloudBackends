@@ -24,6 +24,12 @@ public static class CloudBackendTypes
     /// <summary>Default worker image for Vast.ai instances: the Hartsy Vast.ai worker, pinned to the release this version was tested with.</summary>
     public const string DefaultVastImage = "kalebbroo/swarmui-worker-vast:1.0.0-hartsyinference";
 
+    /// <summary>True for worker images whose backend needs a CUDA 13 driver: HartsyInference's GPU kernels are PTX 9.0.</summary>
+    public static bool NeedsCuda13(string image)
+    {
+        return image?.Contains("hartsyinference", StringComparison.OrdinalIgnoreCase) ?? false;
+    }
+
     /// <summary>Hidden type record for the RunPod Serverless child backend.</summary>
     public static BackendHandler.BackendType RunPodServerless;
 

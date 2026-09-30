@@ -526,7 +526,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         {
             findings.Add(Finding("warning", $"Max Workers is {maxWorkers}, but the endpoint allows only {workersMax}. Scaling will stop at {workersMax}."));
         }
-        if (image.Contains("hartsyinference", StringComparison.OrdinalIgnoreCase) && AllowsCudaBelow(endpoint["allowedCudaVersions"], 13.0))
+        if (CloudBackendTypes.NeedsCuda13(image) && AllowsCudaBelow(endpoint["allowedCudaVersions"], 13.0))
         {
             findings.Add(Finding("error", "The endpoint runs the HartsyInference image but allows hosts older than CUDA 13.0. Its GPU kernels need a CUDA 13 driver, so workers on older hosts cannot start their backend. Edit the endpoint and set the minimum CUDA version to 13.0."));
         }

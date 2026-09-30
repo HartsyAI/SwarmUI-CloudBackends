@@ -364,6 +364,11 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         else
         {
             body["image"] = plan.ImageName;
+            if (CloudBackendTypes.NeedsCuda13(plan.ImageName))
+            {
+                // Without this the pod can land on a host whose driver cannot load the backend's kernels.
+                body["allowedCudaVersions"] = new JArray("13.0");
+            }
         }
         if (!string.IsNullOrWhiteSpace(dataCenterId))
         {

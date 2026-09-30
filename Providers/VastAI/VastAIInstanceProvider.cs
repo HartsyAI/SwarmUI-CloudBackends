@@ -351,6 +351,11 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             // [[field, direction]] shape (confirmed live: "order.0/order.1: Input should be a valid
             // tuple"), so cheapest-first is done client-side below instead of depending on that contract.
         };
+        if (string.IsNullOrWhiteSpace(plan.TemplateHashId) && CloudBackendTypes.NeedsCuda13(plan.Image))
+        {
+            // Hosts whose driver cannot load the backend's kernels would rent fine and then never start it.
+            query["cuda_max_good"] = new JObject { ["gte"] = 13.0 };
+        }
         JObject resp = await ApiAsync(HttpMethod.Post, "/api/v0/bundles/", query, cancel) as JObject;
         JArray offers = resp?["offers"] as JArray ?? [];
         return [.. offers.OrderBy(o => o["dph_total"]?.Value<double>() ?? double.MaxValue)];

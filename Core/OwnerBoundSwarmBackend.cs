@@ -62,7 +62,9 @@ public class OwnerBoundSwarmBackend : SwarmSwarmBackend
         {
             if (requester != root.OwnerUserId)
             {
-                input.RefusalReasons.Add($"{root.CloudProviderName ?? "Cloud"} instance backend belongs to another user. Your own is created when you start an instance with your own API key set.");
+                input.RefusalReasons.Add(root is CloudBackendBase
+                    ? $"{root.CloudProviderName ?? "Cloud"} worker belongs to another user. Yours start automatically once your own API key is set in User Settings."
+                    : $"{root.CloudProviderName ?? "Cloud"} instance belongs to another user. Yours is created when you start an instance with your own API key set.");
                 return false;
             }
             try
