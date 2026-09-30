@@ -385,6 +385,11 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
                 volumes.Add(new JObject { ["id"] = v["id"]?.ToString(), ["name"] = v["name"]?.ToString(), ["size_gb"] = v["size"]?.Value<int>() });
             }
         }
+        catch (CloudApiException ex) when (ex.Status is 401 or 403)
+        {
+            // Some Vast.ai API keys are not allowed to list volumes; that only leaves the volume dropdown empty.
+            Logs.Debug($"[VastAI Instances] This API key cannot list network volumes ({ex.Status}); the volume list stays empty.");
+        }
         catch (Exception ex)
         {
             Logs.Warning($"[VastAI Instances] Could not list network volumes: {ex.Message}");

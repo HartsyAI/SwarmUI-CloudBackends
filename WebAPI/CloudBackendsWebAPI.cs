@@ -101,6 +101,7 @@ public static class CloudBackendsWebAPI
             // Status streaming below is best-effort on top of that - starting/stopping must never be
             // gated on it.
             Task action = input.Start ? backend.StartInstanceAsync() : backend.StopInstanceAsync();
+            Task<bool> stop = action as Task<bool>;
             int seen = 0;
             while (true)
             {
@@ -127,7 +128,8 @@ public static class CloudBackendsWebAPI
                 await Task.WhenAny(action, Task.Delay(500, Program.GlobalProgramCancel));
             }
             await action;
-            output(new JObject { ["message"] = $"Instance {(input.Start ? "started" : "stopped")} for backend #{input.BackendId}.", ["done"] = true });
+            string result = input.Start ? $"Instance started for backend #{input.BackendId}." : stop.Result ? $"Instance stopped for backend #{input.BackendId}." : $"No running instance to stop for backend #{input.BackendId}.";
+            output(new JObject { ["message"] = result, ["done"] = true });
         }
         catch (SwarmReadableErrorException ex)
         {
@@ -626,6 +628,10 @@ public static class CloudBackendsWebAPI
             }
         }
         List<CloudBackendBase> backends = UserServerless(session, backend_id, "");
+        if (backends.Count == 0 && Program.Backends.AllBackends.TryGetValue(backend_id, out BackendHandler.BackendData card) && card.AbstractBackend is CloudBackendsBackend && card.AbstractBackend.Status is BackendStatus.WAITING or BackendStatus.LOADING)
+        {
+            return Error("This Cloud Backends card is still starting. Try again in a moment.", "card_starting");
+        }
         if (backends.Count == 0)
         {
             return Error("You have no running serverless backend under this card. Enable a serverless section and set your API key in User Settings, then generate or use Discover models once.", "no_backend");

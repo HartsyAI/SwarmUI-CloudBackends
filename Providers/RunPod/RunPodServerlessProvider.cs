@@ -53,6 +53,9 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     /// <summary>The one version 1 worker held (or being woken), if any.</summary>
     CloudWorkerInfo Version1Held;
 
+    /// <summary>The wakeup in progress for <see cref="Version1Held"/>, if any; concurrent callers wait for it instead of failing.</summary>
+    Task Version1Waking;
+
     /// <inheritdoc/>
     /// <remarks>Version 1 keepalive jobs are not tied to a worker, so that image is limited to one worker.</remarks>
     public int WorkerLimit() => Version1 ? 1 : int.MaxValue;
@@ -128,7 +131,9 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
                 if (status is "COMPLETED" or "FAILED" or "CANCELLED" or "TIMED_OUT")
                 {
                     JObject ended = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{jobId}", CancellationToken.None);
-                    if (IsVersion1Refusal(EndedOutput(ended)))
+                    string endedError = ended["error"]?.ToString() ?? "";
+                    Logs.Debug($"{Tag} Lease job {jobId} ended {status}: {(endedError.Length > 300 ? endedError[..300] : endedError)}");
+                    if (IsVersion1Refusal(EndedOutput(ended)) || IsVersion1JobError(ended["error"]?.ToString()))
                     {
                         break;
                     }
@@ -158,7 +163,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         }
         catch (Exception) when (!withdrawn)
         {
-            await CancelJobAsync(jobId);
+            await CancelJobConfirmedAsync(jobId);
             throw;
         }
         // Only reached when the worker answered as the version 1 image.
@@ -218,6 +223,16 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         return error.StartsWith("Unknown action", StringComparison.OrdinalIgnoreCase) && actions.Any(a => a.ToString() == "wakeup") && actions.Any(a => a.ToString() == "keepalive");
     }
 
+    /// <summary>
+    /// True for a failed job's error from the version 1 worker refusing the lease. RunPod fails a job whose output has an
+    /// error and may keep only that text, so the action list is gone; version 1 words it "Unknown action: lease", while
+    /// version 2 says "Unknown action 'lease'".
+    /// </summary>
+    internal static bool IsVersion1JobError(string error)
+    {
+        return error is not null && error.Contains("Unknown action: lease", StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>Builds a readable error for a lease job that ended before streaming a worker.</summary>
     static Exception DescribeEndedJob(string jobId, string status, JObject job)
     {
@@ -243,13 +258,30 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             Logs.Warning($"{Tag} Endpoint {endpointId} runs the version 1 worker image. Using it in single-worker compatibility mode; point the endpoint at kalebbroo/swarmui-worker-runpod to scale out and get per-lease access tokens.");
         }
         CloudWorkerInfo worker = new() { Protocol = 1, KeepaliveSeconds = Math.Max(60, request.IdleSeconds) };
+        TaskCompletionSource waking = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task otherWakeup = null;
         lock (Version1Lock)
         {
-            if (Version1Held is not null)
+            if (Version1Waking is not null && !Version1Waking.IsCompleted)
             {
-                throw new SwarmReadableErrorException("This RunPod endpoint runs the version 1 worker image, which supports one worker at a time, and that worker is already in use.");
+                otherWakeup = Version1Waking;
             }
-            Version1Held = worker;
+            // A held worker whose keepalives have all run out no longer runs, even if its release could not be confirmed.
+            else if (Version1Held is not null && DateTime.UtcNow < Version1Held.KeepaliveExpiry)
+            {
+                throw new WorkerLimitReachedException("This RunPod endpoint runs the version 1 worker image, which supports one worker at a time, and that worker is already in use.");
+            }
+            else
+            {
+                Version1Held = worker;
+                Version1Waking = waking.Task;
+            }
+        }
+        if (otherWakeup is not null)
+        {
+            // Several requests arrived before the endpoint was known to be version 1: one worker is being woken for all of them.
+            await otherWakeup;
+            throw new WorkerLimitReachedException("This RunPod endpoint runs the version 1 worker image, which supports one worker at a time; the request waits for the worker being woken.");
         }
         try
         {
@@ -275,7 +307,8 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             worker.WorkerId = output["worker_id"]?.ToString();
             worker.SessionId = output["session_id"]?.ToString();
             // A finished wakeup leaves the worker without a job, and RunPod stops idle workers within seconds.
-            bool alive = await SubmitKeepaliveAsync(worker);
+            // Not the acquisition's token: a worker assigned by now is kept, so it must stay alive.
+            bool alive = await SubmitKeepaliveAsync(worker, CancellationToken.None);
             // Without a keepalive, only trust the worker briefly, as 1.x did.
             worker.KeepaliveExpiry = DateTime.UtcNow.AddSeconds(alive ? worker.KeepaliveSeconds : 60);
             Logs.Info($"{Tag} Version 1 worker {worker.WorkerId} ready at {worker.PublicUrl}.");
@@ -286,6 +319,10 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             await CancelJobAsync(worker.LeaseId);
             await ReleaseVersion1Async(worker);
             throw;
+        }
+        finally
+        {
+            waking.TrySetResult();
         }
     }
 
@@ -301,7 +338,16 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             {
                 throw new SwarmReadableErrorException($"No RunPod worker answered the wakeup within {request.StartupTimeoutSec}s. Check the endpoint's max workers, GPU availability, and worker logs.");
             }
-            JObject job = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{jobId}", CancellationToken.None);
+            JObject job;
+            try
+            {
+                // Cancellable until a withdraw is requested; after that, polls finish so the status can decide withdraw or keep.
+                job = await GetJsonAsync($"https://api.runpod.ai/v2/{endpointId}/status/{jobId}", cancel.IsCancellationRequested ? CancellationToken.None : cancel);
+            }
+            catch (OperationCanceledException) when (cancel.IsCancellationRequested && !Program.GlobalProgramCancel.IsCancellationRequested)
+            {
+                continue;
+            }
             string status = job["status"]?.ToString() ?? "UNKNOWN";
             if (status == "COMPLETED")
             {
@@ -328,11 +374,11 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     }
 
     /// <summary>Submits one keepalive job for a version 1 worker. Returns false, logging why, if it could not.</summary>
-    async Task<bool> SubmitKeepaliveAsync(CloudWorkerInfo worker)
+    async Task<bool> SubmitKeepaliveAsync(CloudWorkerInfo worker, CancellationToken cancel)
     {
         try
         {
-            string jobId = await SubmitJobAsync(new JObject { ["action"] = "keepalive", ["duration"] = worker.KeepaliveSeconds, ["interval"] = 30 }, CancellationToken.None);
+            string jobId = await SubmitJobAsync(new JObject { ["action"] = "keepalive", ["duration"] = worker.KeepaliveSeconds, ["interval"] = 30 }, cancel);
             worker.KeepaliveJobs[jobId] = 0;
             Logs.Debug($"{Tag} Keepalive job {jobId} submitted for worker {worker.WorkerId} ({worker.KeepaliveSeconds}s).");
             return true;
@@ -361,14 +407,15 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     {
         foreach (string jobId in worker.KeepaliveJobs.Keys.ToArray())
         {
-            if (worker.KeepaliveJobs.TryRemove(jobId, out _))
+            // A job whose cancel is not confirmed stays tracked: it may still be keeping the worker (and its bill) alive.
+            if (await CancelJobConfirmedAsync(jobId))
             {
-                await CancelJobAsync(jobId);
+                worker.KeepaliveJobs.TryRemove(jobId, out _);
             }
         }
         lock (Version1Lock)
         {
-            if (ReferenceEquals(Version1Held, worker))
+            if (ReferenceEquals(Version1Held, worker) && worker.KeepaliveJobs.IsEmpty)
             {
                 Version1Held = null;
             }
@@ -417,7 +464,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         await worker.RenewLock.WaitAsync(cancel);
         try
         {
-            if (KeepaliveDue(worker.KeepaliveExpiry, worker.KeepaliveSeconds, DateTime.UtcNow) && await SubmitKeepaliveAsync(worker))
+            if (KeepaliveDue(worker.KeepaliveExpiry, worker.KeepaliveSeconds, DateTime.UtcNow) && await SubmitKeepaliveAsync(worker, cancel))
             {
                 worker.KeepaliveExpiry = ExtendKeepalive(worker.KeepaliveExpiry, worker.KeepaliveSeconds, DateTime.UtcNow);
             }
@@ -459,16 +506,30 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         JObject endpoint = await GetJsonAsync($"https://rest.runpod.io/v1/endpoints/{endpointId}?includeTemplate=true", cancel);
         int workersMax = endpoint["workersMax"]?.Value<int>() ?? 0;
         long executionTimeoutMs = endpoint["executionTimeoutMs"]?.Value<long>() ?? 0;
-        string image = endpoint["template"]?["imageName"]?.ToString() ?? "";
-        if (executionTimeoutMs > 0 && executionTimeoutMs / 1000 <= request.MaxLeaseSeconds)
+        JObject template = endpoint["template"] as JObject ?? await GetTemplateAsync(endpoint["templateId"]?.ToString(), cancel);
+        string image = template?["imageName"]?.ToString() ?? "";
+        List<string> ports = TemplatePorts(template?["ports"]);
+        Logs.Debug($"{Tag} Endpoint {endpointId} template: image '{image}', ports [{string.Join(", ", ports)}].");
+        if (template is not null && !ports.Any(p => p.Equals($"{WorkerPort}/http", StringComparison.OrdinalIgnoreCase)))
         {
-            findings.Add(Finding("error", $"The endpoint's execution timeout ({executionTimeoutMs / 1000}s) must be longer than Max Lease Seconds ({request.MaxLeaseSeconds}s), or RunPod will stop workers mid-lease. Raise it on the endpoint to at least {request.MaxLeaseSeconds + 300}s."));
+            findings.Add(Finding("error", $"The endpoint does not expose port {WorkerPort} as HTTP, so RunPod's proxy cannot reach the worker's SwarmUI and workers never become usable. Edit the endpoint and add {WorkerPort} under Container configuration, Expose HTTP ports."));
+        }
+        bool version1Image = image.Contains("swarmui-runpod", StringComparison.OrdinalIgnoreCase);
+        // The longest single job this backend runs: a lease, or on the version 1 image one keepalive.
+        int longestJob = version1Image ? Math.Max(60, request.IdleSeconds) : request.MaxLeaseSeconds;
+        if (executionTimeoutMs > 0 && executionTimeoutMs / 1000 <= longestJob)
+        {
+            string what = version1Image ? $"a keepalive job ({longestJob}s, from Idle Seconds)" : $"Max Lease Seconds ({longestJob}s)";
+            findings.Add(Finding("error", $"The endpoint's execution timeout ({executionTimeoutMs / 1000}s) must be longer than {what}, or RunPod will stop workers mid-job. Raise it on the endpoint to at least {longestJob + 300}s."));
         }
         if (workersMax > 0 && workersMax < maxWorkers)
         {
             findings.Add(Finding("warning", $"Max Workers is {maxWorkers}, but the endpoint allows only {workersMax}. Scaling will stop at {workersMax}."));
         }
-        bool version1Image = image.Contains("swarmui-runpod", StringComparison.OrdinalIgnoreCase);
+        if (image.Contains("hartsyinference", StringComparison.OrdinalIgnoreCase) && AllowsCudaBelow(endpoint["allowedCudaVersions"], 13.0))
+        {
+            findings.Add(Finding("error", "The endpoint runs the HartsyInference image but allows hosts older than CUDA 13.0. Its GPU kernels need a CUDA 13 driver, so workers on older hosts cannot start their backend. Edit the endpoint and set the minimum CUDA version to 13.0."));
+        }
         if (version1Image)
         {
             findings.Add(Finding("warning", $"The endpoint runs the version 1 worker image '{image}'. It works in single-worker compatibility mode (Max Workers is held to 1, and the worker has no access token). Point the endpoint at kalebbroo/swarmui-worker-runpod to scale out and secure it."));
@@ -482,6 +543,44 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             findings.Add(Finding("warning", $"The endpoint's image '{image}' is not pinned to a version. Pin a release tag so workers do not change underneath you."));
         }
         return findings;
+    }
+
+    /// <summary>
+    /// An endpoint's template. The endpoint API documents includeTemplate but in practice returns only templateId, so it is
+    /// fetched by ID. Null if it cannot be read, which only skips the checks that need it.
+    /// </summary>
+    async Task<JObject> GetTemplateAsync(string templateId, CancellationToken cancel)
+    {
+        if (string.IsNullOrWhiteSpace(templateId))
+        {
+            return null;
+        }
+        try
+        {
+            return await GetJsonAsync($"https://rest.runpod.io/v1/templates/{templateId}?includeEndpointBoundTemplates=true", cancel);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Logs.Debug($"{Tag} Could not read template {templateId}: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>True if an endpoint's allowed CUDA versions (none listed means any) include one below <paramref name="minimum"/>.</summary>
+    internal static bool AllowsCudaBelow(JToken allowed, double minimum)
+    {
+        List<double> versions = [.. TemplatePorts(allowed).Select(v => double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) ? d : 0)];
+        return versions.Count == 0 || versions.Any(v => v < minimum);
+    }
+
+    /// <summary>The worker's gateway port, which the endpoint must expose as HTTP for RunPod's proxy to reach it.</summary>
+    public const int WorkerPort = 7801;
+
+    /// <summary>A template's exposed ports, e.g. "7801/http", whether the API sends them as a list or one comma-separated string.</summary>
+    internal static List<string> TemplatePorts(JToken ports)
+    {
+        IEnumerable<string> raw = ports is JArray list ? list.Select(p => p.ToString()) : (ports?.ToString() ?? "").Split(',');
+        return [.. raw.Select(p => p.Trim()).Where(p => p.Length > 0)];
     }
 
     /// <summary>Builds one validation finding.</summary>
@@ -506,6 +605,39 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     {
         using HttpResponseMessage response = await HttpRetry.SendAsync(Http, () => Request(HttpMethod.Get, url, null), Tag, cancel);
         return await ReadJsonAsync(response, new Uri(url).AbsolutePath, cancel);
+    }
+
+    /// <summary>
+    /// Cancels a job, retrying a few times until RunPod accepts. Returns false if it never did: the job may then still
+    /// hold (or later get) a worker, which a lease ends itself after its startup grace and a keepalive after its window.
+    /// </summary>
+    async Task<bool> CancelJobConfirmedAsync(string jobId)
+    {
+        for (int attempt = 0; attempt < 4; attempt++)
+        {
+            if (attempt > 0)
+            {
+                // Shutting down: one attempt is all there is time for, and releasing must never throw.
+                if (Program.GlobalProgramCancel.IsCancellationRequested)
+                {
+                    break;
+                }
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1 << attempt), Program.GlobalProgramCancel);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+            if (await CancelJobAsync(jobId))
+            {
+                return true;
+            }
+        }
+        Logs.Warning($"{Tag} Could not confirm cancelling RunPod job {jobId}; if it holds a worker, that worker stops on its own when its job runs out.");
+        return false;
     }
 
     /// <summary>Cancels a job. Best-effort: never throws. Returns true only if RunPod accepted the cancel.</summary>

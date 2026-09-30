@@ -447,6 +447,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec + 60);
         using CancellationTokenSource withdraw = new();
         Task<WorkerSlot> acquiring = null;
+        DateTime? refusedSince = null;
         try
         {
             while (DateTime.UtcNow < deadline)
@@ -456,6 +457,13 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     return access;
                 }
+                // An idle worker that refuses the request will keep refusing it; say why instead of waiting out the timeout.
+                string refusal = RefusalReason(input);
+                refusedSince = refusal is null ? null : refusedSince ?? DateTime.UtcNow;
+                if (refusedSince is DateTime since && (DateTime.UtcNow - since).TotalSeconds > 30)
+                {
+                    throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} workers cannot run this request: {refusal}");
+                }
                 if (acquiring is null && TryReserveLease())
                 {
                     acquiring = AcquireSlotAsync(withdraw.Token);
@@ -463,7 +471,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 else if (acquiring is not null && acquiring.IsCompleted)
                 {
                     // Surfaces a failed lease as this request's error. A good one is now a slot, found on the next pass.
-                    await acquiring;
+                    try
+                    {
+                        await acquiring;
+                    }
+                    catch (WorkerLimitReachedException ex)
+                    {
+                        // The provider holds all the workers it can; this request waits for one of them.
+                        Logs.Debug($"[{CloudProviderName}] {ex.Message}");
+                    }
                     acquiring = null;
                 }
                 else if (acquiring is null && Slots.Length == 0 && PendingAcquires == 0)
@@ -486,6 +502,25 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     }
 
     /// <summary>Picks and claims a mirrored backend that can serve the request, atomically. Null if none is available.</summary>
+    /// <summary>
+    /// Why the attached workers refuse a request, when at least one of their backends is running and idle and none will take
+    /// it; null when some could, or when every backend is simply busy or starting (worth waiting for).
+    /// </summary>
+    string RefusalReason(T2IParamInput input)
+    {
+        BackendHandler.T2IBackendData[] idle = [.. Slots.SelectMany(s => s.RunningGrandchildren).Where(d => !d.CheckIsInUse)];
+        if (idle.Length == 0 || idle.Any(d => CanServe(d, input)))
+        {
+            return null;
+        }
+        HashSet<string> missing = [.. idle.SelectMany(d => input.RequiredFlags.Where(f => !d.Backend.SupportedFeatures.Contains(f) && !T2IEngine.DisregardedFeatureFlags.Contains(f)))];
+        string reason = missing.Count > 0
+            ? $"their backends do not support {string.Join(", ", missing.Order())}. The worker image may be too old for this model or feature."
+            : "their backends do not accept this model or its parameters. Check the model exists on the endpoint, or press Discover models.";
+        Logs.Debug($"[{CloudProviderName}] Idle worker backends refuse request: {reason}");
+        return reason;
+    }
+
     async Task<T2IBackendAccess> TryClaimAsync(T2IParamInput input, bool allowBusy)
     {
         await SlotLock.WaitAsync(Program.GlobalProgramCancel);
@@ -531,10 +566,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     async Task DetachAndReleaseAsync(WorkerSlot slot, string reason)
     {
         slot.Removing = true;
-        AdoptModelLists(slot);
+        // Copied before detaching (the lists go with the child), saved after releasing: saving triggers a model refresh that
+        // would reach this worker, whose token is already revoked when its lease ended, and must never stop the release.
+        List<KeyValuePair<string, Dictionary<string, JObject>>> models = ModelListsOf(slot);
         await CloudChildBackend.DetachAsync(Handler, slot.Child, slot.Provider.ProviderName);
         await slot.Provider.ReleaseLeaseAsync(slot.Worker);
         Logs.Info($"[{slot.Provider.ProviderName}] Released worker {slot.Worker.WorkerId} ({reason}); {Slots.Length} worker(s) left.");
+        if (models is not null)
+        {
+            CommitModels(models);
+        }
     }
 
     /// <summary>Finds a slot by the worker ID the provider reported.</summary>
@@ -691,12 +732,36 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// Waits until the worker's SwarmUI has at least one backend running and none still loading. A worker that
     /// answers but has no backend at all is a broken image, reported promptly rather than after the full timeout.
     /// </summary>
+    /// <summary>The worker's own latest error log lines, so a failed start can say why. Null if they cannot be read.</summary>
+    async Task<string> RecentWorkerErrorsAsync(WorkerSlot slot)
+    {
+        try
+        {
+            JObject logs = await CallWorkerAPI(slot, "ListRecentLogMessages", new JObject { ["types"] = new JArray("Error"), ["last_sequence_ids"] = new JObject() }, 20);
+            string[] lines = [.. (logs["data"]?["Error"] as JArray ?? []).TakeLast(2).Select(m => m["message"]?.ToString()).Where(m => !string.IsNullOrWhiteSpace(m))];
+            if (lines.Length == 0)
+            {
+                return null;
+            }
+            string joined = string.Join(" | ", lines);
+            return joined.Length > 600 ? joined[..600] + "..." : joined;
+        }
+        catch (Exception ex)
+        {
+            Logs.Debug($"[{CloudProviderName}] Could not read worker {slot.Worker.WorkerId}'s logs: {ex.Message}");
+            return null;
+        }
+    }
+
     async Task WaitForWorkerBackendsLoadedAsync(WorkerSlot slot, ICloudProvider provider)
     {
         LeaseRequest request = MakeLeaseRequest();
         DateTime start = DateTime.UtcNow;
         bool everSawBackend = false;
+        bool everAnswered = false;
         string lastError = null;
+        string lastState = null;
+        DateTime? allFailedSince = null;
         while ((DateTime.UtcNow - start).TotalSeconds < request.StartupTimeoutSec)
         {
             if (ShuttingDown || !ReferenceEquals(Provider, provider))
@@ -708,14 +773,29 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             try
             {
                 JObject data = await CallWorkerAPI(slot, "ListBackends", new JObject { ["nonreal"] = true, ["full_data"] = true }, 30);
+                everAnswered = true;
                 JObject[] backends = [.. data.Properties().Select(p => p.Value).OfType<JObject>()];
                 everSawBackend |= backends.Length > 0;
                 UpdateFeaturesFromWorker(data);
+                string state = string.Join(", ", backends.Select(b => $"{b["type"]}={b["status"]}"));
+                if (state != lastState)
+                {
+                    Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} backends: {(state.Length == 0 ? "none yet" : state)}");
+                    lastState = state;
+                }
                 bool anyRunning = backends.Any(b => b["status"]?.ToString() == "running");
                 bool anyLoading = backends.Any(b => b["status"]?.ToString() == "loading");
                 if (anyRunning && !anyLoading)
                 {
                     return;
+                }
+                // Every backend failed to start: waiting out the startup timeout will not change that.
+                bool allFailed = backends.Length > 0 && backends.All(b => b["status"]?.ToString() is "errored" or "disabled");
+                allFailedSince = allFailed ? allFailedSince ?? DateTime.UtcNow : null;
+                if (allFailedSince is DateTime since && (DateTime.UtcNow - since).TotalSeconds > 60)
+                {
+                    string cause = await RecentWorkerErrorsAsync(slot);
+                    throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} could not start its generation backend ({state}).{(cause is null ? " Check the worker's logs in the provider console." : $" The worker reported: {cause}")}");
                 }
                 if (!everSawBackend && (DateTime.UtcNow - start).TotalSeconds > 90)
                 {
@@ -726,10 +806,28 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             {
                 throw;
             }
+            catch (WorkerNotReadyException)
+            {
+                // The worker's gateway answered: it is reachable, and its SwarmUI is still starting.
+                if (!everAnswered)
+                {
+                    Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} is reachable; its SwarmUI is still starting.");
+                }
+                everAnswered = true;
+            }
             catch (Exception ex)
             {
                 // A freshly assigned worker's proxy often answers nothing for a few seconds.
+                if (ex.Message != lastError)
+                {
+                    Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} not answering yet: {ex.Message}");
+                }
                 lastError = ex.Message;
+                // The worker's gateway answers as soon as it runs, even while SwarmUI starts, so minutes of silence mean the address is unreachable.
+                if (!everAnswered && (DateTime.UtcNow - start).TotalSeconds > 180)
+                {
+                    throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} was assigned but never answered at {slot.ConnectUrl} (last error: {lastError}). On RunPod, the endpoint must expose port 7801 as HTTP; Validate checks this.");
+                }
             }
             await RenewQuietlyAsync(provider, slot);
             await Task.Delay(request.PollIntervalMs, Program.GlobalProgramCancel);
@@ -777,16 +875,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     }
 
     /// <summary>
-    /// Copies a slot's mirrored model lists onto this backend, and saves them.
-    /// That is what lets a sleeping endpoint still offer its models, and core refuse models it does not have.
+    /// A copy of a slot's mirrored model lists, or null if it has none. Kept on this backend after the worker goes, which is
+    /// what lets a sleeping endpoint still offer its models, and core refuse models it does not have.
     /// </summary>
-    void AdoptModelLists(WorkerSlot slot)
+    List<KeyValuePair<string, Dictionary<string, JObject>>> ModelListsOf(WorkerSlot slot)
     {
         if (slot.Child?.AbstractBackend is not SwarmSwarmBackend swarm || swarm.RemoteModels is null || !swarm.RemoteModels.Any(kv => kv.Value.Count > 0))
         {
-            return;
+            return null;
         }
-        CommitModels(swarm.RemoteModels);
+        return [.. swarm.RemoteModels.Select(kv => new KeyValuePair<string, Dictionary<string, JObject>>(kv.Key, kv.Value.ToDictionary(m => m.Key, m => (JObject)m.Value.DeepClone())))];
     }
 
     /// <summary>
@@ -799,12 +897,46 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         Models ??= new();
         foreach (KeyValuePair<string, Dictionary<string, JObject>> kv in listing)
         {
-            Dictionary<string, JObject> models = new(kv.Value);
+            Dictionary<string, JObject> models = kv.Value.ToDictionary(m => m.Key, m => WithModelDefaults(m.Value, m.Key));
             RemoteModels[kv.Key] = models;
             Models[kv.Key] = [.. models.Keys];
         }
         SaveModelCache();
-        Program.ModelRefreshEvent?.Invoke();
+        try
+        {
+            Program.ModelRefreshEvent?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            // Refreshing reaches every backend, including workers that just went away; the list itself is already saved.
+            Logs.Debug($"[{CloudProviderName}] Model refresh after updating the model list failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Marks a cloud model as remote and fills every field core's <see cref="T2IModel.FromNetObject"/> reads without a fallback
+    /// (loaded, standard_width, standard_height): one missing field there breaks the model list for the whole server.
+    /// </summary>
+    internal static JObject WithModelDefaults(JObject meta, string name)
+    {
+        meta["name"] ??= name;
+        meta["title"] ??= name.AfterLast('/');
+        meta["description"] ??= "";
+        meta["local"] = false;
+        meta["preview_image"] ??= "imgs/model_placeholder.jpg";
+        meta["is_supported_model_format"] ??= true;
+        if (meta["loaded"]?.Type != JTokenType.Boolean)
+        {
+            meta["loaded"] = false;
+        }
+        foreach (string dimension in new[] { "standard_width", "standard_height" })
+        {
+            if (meta[dimension]?.Type != JTokenType.Integer)
+            {
+                meta[dimension] = 0;
+            }
+        }
+        return meta;
     }
 
     /// <summary>Per-user storage key for this endpoint's model list.</summary>
@@ -854,13 +986,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             Dictionary<string, JObject> models = [];
             foreach (JProperty model in ((JObject)subtype.Value).Properties())
             {
-                JObject meta = (JObject)model.Value;
-                meta["name"] ??= model.Name;
-                meta["title"] ??= model.Name.AfterLast('/');
-                meta["local"] = false;
-                meta["preview_image"] = "imgs/model_placeholder.jpg";
-                meta["is_supported_model_format"] = true;
-                models[model.Name] = meta;
+                models[model.Name] = WithModelDefaults((JObject)model.Value, model.Name);
             }
             loaded[subtype.Name] = models;
         }
@@ -907,14 +1033,24 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         ConcurrentDictionary<string, Dictionary<string, JObject>> listing = new();
         foreach (string subtype in Program.T2IModelSets.Keys)
         {
-            JObject response = await CallWorkerAPI(slot, "ListModels", new JObject
+            JObject response;
+            try
             {
-                ["path"] = "",
-                ["depth"] = 999,
-                ["subtype"] = subtype,
-                ["allowRemote"] = false,
-                ["dataImages"] = false
-            });
+                response = await CallWorkerAPI(slot, "ListModels", new JObject
+                {
+                    ["path"] = "",
+                    ["depth"] = 999,
+                    ["subtype"] = subtype,
+                    ["allowRemote"] = false,
+                    ["dataImages"] = false
+                });
+            }
+            catch (SwarmReadableErrorException ex) when (ex.Message.Contains("Invalid sub-type"))
+            {
+                // A model type only a local extension adds (audio, LLM, ...): the worker has none of those.
+                Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} has no '{subtype}' model type; skipping it.");
+                continue;
+            }
             Dictionary<string, JObject> models = [];
             foreach (JToken file in response["files"] as JArray ?? [])
             {
@@ -924,11 +1060,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     continue;
                 }
-                meta["local"] = false;
-                meta["title"] ??= name.AfterLast('/');
-                meta["preview_image"] ??= "imgs/model_placeholder.jpg";
-                meta["is_supported_model_format"] ??= true;
-                models[name] = meta;
+                models[name] = WithModelDefaults(meta, name);
             }
             listing[subtype] = models;
         }

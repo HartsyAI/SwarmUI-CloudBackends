@@ -303,7 +303,9 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         try
         {
             JObject body = new() { ["session_id"] = worker.LeaseId, ["session_auth"] = worker.SessionAuth };
-            using HttpResponseMessage response = await VastTls.Http.PostAsync($"{SessionUrl(worker)}/session/end", Json(body), CancellationToken.None);
+            // Bounded: Stop, key changes and shutdown wait for this, and an undelivered end only means the session expires on its own.
+            using CancellationTokenSource timeout = Utilities.TimedCancel(TimeSpan.FromSeconds(20));
+            using HttpResponseMessage response = await VastTls.Http.PostAsync($"{SessionUrl(worker)}/session/end", Json(body), timeout.Token);
             Logs.Debug($"{Tag} Ended session {worker.LeaseId} ({(int)response.StatusCode}).");
         }
         catch (Exception ex)

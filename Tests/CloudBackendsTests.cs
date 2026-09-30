@@ -78,6 +78,18 @@ public class ModelCacheTests
     }
 
     [Test]
+    public void ReloadedModelsAreValidForCoresModelList()
+    {
+        // Core casts loaded/standard_width/standard_height without a fallback; a cached entry lacking one broke the whole model list.
+        string raw = CloudBackendBase.SerializeModelCache(new Dictionary<string, Dictionary<string, JObject>> { ["Stable-Diffusion"] = new() { ["zimage/turbo.safetensors"] = new JObject { ["name"] = "zimage/turbo.safetensors", ["architecture"] = "z-image" } } });
+        JObject cached = CloudBackendBase.ParseModelCache(raw)["Stable-Diffusion"]["zimage/turbo.safetensors"];
+        Assert.That(() => SwarmUI.Text2Image.T2IModel.FromNetObject(cached), Throws.Nothing);
+        JObject nulls = CloudBackendBase.WithModelDefaults(new JObject { ["standard_width"] = JValue.CreateNull(), ["loaded"] = JValue.CreateNull() }, "a/b.safetensors");
+        Assert.That(() => SwarmUI.Text2Image.T2IModel.FromNetObject(nulls), Throws.Nothing);
+        Assert.That(nulls["local"]?.Value<bool>(), Is.False);
+    }
+
+    [Test]
     public void DamagedCacheThrowsSoTheCallerCanIgnoreIt()
     {
         Assert.That(() => CloudBackendBase.ParseModelCache("{not json"), Throws.Exception);
@@ -135,6 +147,30 @@ public class RunPodLeaseTests
         Assert.That(RunPodServerlessProvider.IsVersion1Refusal(new JObject { ["success"] = false, ["error"] = "Unknown action: lease", ["available_actions"] = new JArray("run") }), Is.False);
         Assert.That(RunPodServerlessProvider.IsVersion1Refusal(Lease()), Is.False);
         Assert.That(RunPodServerlessProvider.IsVersion1Refusal(null), Is.False);
+        // RunPod fails such a job and may keep only the error text (seen live on a version 1 endpoint).
+        Assert.That(RunPodServerlessProvider.IsVersion1JobError("Unknown action: lease"), Is.True);
+        Assert.That(RunPodServerlessProvider.IsVersion1JobError("{'success': False, 'error': 'Unknown action: lease', 'available_actions': ['wakeup']}"), Is.True);
+        Assert.That(RunPodServerlessProvider.IsVersion1JobError("Unknown action 'lease'. This worker supports 'lease' and 'health'."), Is.False);
+        Assert.That(RunPodServerlessProvider.IsVersion1JobError(null), Is.False);
+    }
+
+    [Test]
+    public void ReadsTemplatePortsInEitherShape()
+    {
+        Assert.That(RunPodServerlessProvider.TemplatePorts(new JArray("7801/http", "22/tcp")), Is.EqualTo(new[] { "7801/http", "22/tcp" }));
+        Assert.That(RunPodServerlessProvider.TemplatePorts(new JValue("7801/http, 22/tcp")), Is.EqualTo(new[] { "7801/http", "22/tcp" }));
+        Assert.That(RunPodServerlessProvider.TemplatePorts(new JValue("")), Is.Empty);
+        Assert.That(RunPodServerlessProvider.TemplatePorts(null), Is.Empty);
+    }
+
+    [Test]
+    public void FlagsCudaHostsTooOldForHartsyInference()
+    {
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray("12.8", "12.9", "13.0"), 13.0), Is.True);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray("13.0", "13.1"), 13.0), Is.False);
+        // No list means any version, including old ones.
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray(), 13.0), Is.True);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(null, 13.0), Is.True);
     }
 
     [Test]

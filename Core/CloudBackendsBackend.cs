@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using FreneticUtilities.FreneticDataSyntax;
+using FreneticUtilities.FreneticExtensions;
 using Hartsy.Extensions.CloudBackends.Providers.RunPod;
 using Hartsy.Extensions.CloudBackends.Providers.VastAI;
 using SwarmUI.Accounts;
@@ -217,6 +218,39 @@ public class CloudBackendsBackend : AbstractT2IBackend
         AddLoadStatus(enabledCount is 0
             ? "No provider enabled - nothing available. Expand a provider section, enable it, and Save."
             : $"{enabledCount} provider(s) enabled. Per-user backends are created on demand for each user with an API key set.");
+        WarmUsersWithKeys();
+    }
+
+    /// <summary>
+    /// Creates, in the background, the serverless backends of every user who already has that provider's API key, which
+    /// loads their saved cloud model lists. Core checks a model name before any backend sees a request, so without this a
+    /// cloud-only model is refused after a restart until something else wakes the user's backend. Leases nothing, and
+    /// instance sections are left alone because starting one bills.
+    /// </summary>
+    void WarmUsersWithKeys()
+    {
+        foreach (ProviderDef def in Providers.Where(d => !d.IsInstance && IsProviderEnabled(d)))
+        {
+            foreach (string userId in UsersWithKey(def.KeyType))
+            {
+                User user = Program.Sessions.GetUser(userId, makeNew: false);
+                if (user is not null)
+                {
+                    _ = Utilities.RunCheckedTask(() => EnsureChildForUser(user, def), "cloud backends startup provisioning");
+                }
+            }
+        }
+    }
+
+    /// <summary>IDs of users who have saved an API key of the given type.</summary>
+    static List<string> UsersWithKey(string keyType)
+    {
+        // Core stores it as generic data '{user}///${keyType}///key'.
+        string suffix = $"///${keyType}///key";
+        lock (Program.Sessions.DBLock)
+        {
+            return [.. Program.Sessions.GenericData.FindAll().Select(g => g.ID).Where(id => id.EndsWith(suffix)).Select(id => id.Before("///")).Distinct()];
+        }
     }
 
     /// <summary>Returns the given user's existing child for a provider, in any status, or null.</summary>
