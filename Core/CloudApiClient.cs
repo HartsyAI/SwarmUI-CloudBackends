@@ -72,7 +72,13 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         string detail = text;
         try
         {
-            detail = JObject.Parse(text)["detail"]?.ToString() ?? text;
+            JObject problem = JObject.Parse(text);
+            detail = problem["detail"]?.ToString() ?? text;
+            string fields = ValidationErrors(problem);
+            if (fields is not null)
+            {
+                detail = $"{detail.TrimEnd('.')}: {fields}";
+            }
         }
         catch (Exception)
         {
@@ -142,6 +148,27 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             await Task.Delay(5000, cancel);
         }
         throw new SwarmReadableErrorException($"Instance is running but SwarmUI at {publicUrl} did not answer before the startup timeout. {failureHint}{(last is null ? "" : $" Last error: {last.Message}")}");
+    }
+
+    /// <summary>
+    /// The field-level reasons in a validation problem ('errors' or 'invalid-params'), as "path: message" pairs. Only paths
+    /// and messages are kept, never the rejected values, which can echo secrets such as a worker token.
+    /// </summary>
+    internal static string ValidationErrors(JObject problem)
+    {
+        JArray list = problem["errors"] as JArray ?? problem["invalid-params"] as JArray;
+        if (list is null || list.Count == 0)
+        {
+            return null;
+        }
+        IEnumerable<string> items = list.OfType<JObject>().Select(e =>
+        {
+            string path = (e["path"] ?? e["location"] ?? e["field"] ?? e["name"])?.ToString(Newtonsoft.Json.Formatting.None).Trim('"');
+            string message = (e["message"] ?? e["reason"] ?? e["msg"])?.ToString();
+            return string.IsNullOrWhiteSpace(path) ? message : $"{path}: {message}";
+        }).Where(m => !string.IsNullOrWhiteSpace(m)).Take(5);
+        string joined = string.Join("; ", items);
+        return joined.Length == 0 ? null : joined;
     }
 }
 
