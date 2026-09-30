@@ -73,6 +73,7 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         try
         {
             JObject problem = JObject.Parse(text);
+            Logs.Debug($"[{providerName}] API error {status} response fields: {string.Join(", ", problem.Properties().Select(p => $"{p.Name}:{p.Value.Type}"))}");
             detail = problem["detail"]?.ToString() ?? text;
             string fields = ValidationErrors(problem);
             if (fields is not null)
