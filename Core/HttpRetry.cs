@@ -60,9 +60,11 @@ public static class HttpRetry
 
     /// <summary>
     /// Sends a request built fresh by <paramref name="makeRequest"/> for each attempt (a request message cannot be
-    /// resent), retrying transient failures. The caller owns the returned response.
+    /// resent), retrying transient failures. The caller owns the returned response. When not <paramref name="idempotent"/>
+    /// (a request that creates something), only a 429 is retried: after a 5xx or a dropped connection the request may
+    /// already have taken effect, and repeating it could, say, rent a second machine.
     /// </summary>
-    public static async Task<HttpResponseMessage> SendAsync(HttpClient client, Func<HttpRequestMessage> makeRequest, string logPrefix, CancellationToken cancel)
+    public static async Task<HttpResponseMessage> SendAsync(HttpClient client, Func<HttpRequestMessage> makeRequest, string logPrefix, CancellationToken cancel, bool idempotent = true)
     {
         for (int attempt = 1; ; attempt++)
         {
@@ -72,14 +74,15 @@ public static class HttpRetry
                 using HttpRequestMessage request = makeRequest();
                 response = await client.SendAsync(request, cancel);
             }
-            catch (HttpRequestException ex) when (attempt < MaxAttempts)
+            catch (HttpRequestException ex) when (idempotent && attempt < MaxAttempts)
             {
                 TimeSpan wait = DelayFor(attempt, null);
                 Logs.Debug($"{logPrefix} Request failed ({ex.Message}); retrying in {wait.TotalSeconds:0.0}s (attempt {attempt}/{MaxAttempts})");
                 await Task.Delay(wait, cancel);
                 continue;
             }
-            if (!IsTransient(response.StatusCode) || attempt >= MaxAttempts)
+            bool retry = response.StatusCode == HttpStatusCode.TooManyRequests || (idempotent && IsTransient(response.StatusCode));
+            if (!retry || attempt >= MaxAttempts)
             {
                 return response;
             }
