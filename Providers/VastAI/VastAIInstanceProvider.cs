@@ -128,9 +128,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             InstanceId = inst["id"]?.ToString(),
             Status = inst["actual_status"]?.ToString() ?? "unknown",
             GpuName = inst["gpu_name"]?.ToString(),
-            GpuCount = inst["num_gpus"]?.Value<int>() ?? 0,
-            CostPerHour = inst["dph_total"]?.Value<double>() ?? 0,
-            UptimeSeconds = (int)((inst["uptime_mins"]?.Value<double>() ?? 0) * 60),
+            GpuCount = ((int?)inst["num_gpus"]) ?? 0,
+            CostPerHour = ((double?)inst["dph_total"]) ?? 0,
+            UptimeSeconds = (int)((((double?)inst["uptime_mins"]) ?? 0) * 60),
             // Plain HTTP, no TLS: Vast has no proxy domain, just {public_ipaddr}:{mapped_external_port}.
             PublicUrl = (!string.IsNullOrWhiteSpace(ip) && mappedPort is not null) ? $"{(plan.UseTls ? "https" : "http")}://{ip}:{mappedPort}" : null
         };
@@ -174,18 +174,35 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         int clampedPollMs = Math.Clamp(pollIntervalMs, 2000, 15000);
         CloudInstanceStatus liveStatus = null;
+        string lastState = null;
         while (DateTime.UtcNow < deadline)
         {
             cancel.ThrowIfCancellationRequested();
             try
             {
                 liveStatus = await GetStatusAsync(forceRefresh: true, cancel);
-                if (liveStatus?.PublicUrl is not null)
+                // Vast's own progress text (image pull, errors), which says far more than the status word.
+                string message = (await GetInstanceAsync(instanceId, cancel))?["status_msg"]?.ToString()?.Trim();
+                string state = $"{liveStatus?.Status}{(string.IsNullOrWhiteSpace(message) ? "" : $": {message}")}";
+                if (state != lastState)
                 {
-                    Logs.Info($"[VastAI Instances] Instance '{instanceId}' networking is up at {liveStatus.PublicUrl}.");
+                    Logs.Info($"[VastAI Instances] Instance '{instanceId}' {state}");
+                    lastState = state;
+                }
+                if (liveStatus?.Status is "exited" or "offline")
+                {
+                    throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' stopped while starting ({state}). Check the instance's logs in the Vast.ai console.");
+                }
+                // The address is assigned while the container is still loading (pulling the image), so wait for it to run.
+                if (liveStatus?.PublicUrl is not null && liveStatus.Status == "running")
+                {
+                    Logs.Info($"[VastAI Instances] Instance '{instanceId}' is running at {liveStatus.PublicUrl}.");
                     break;
                 }
-                Logs.Verbose($"[VastAI Instances] Instance '{instanceId}' status={liveStatus?.Status}, waiting for public networking...");
+            }
+            catch (SwarmReadableErrorException)
+            {
+                throw;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -193,9 +210,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             }
             await Task.Delay(clampedPollMs, cancel);
         }
-        if (liveStatus?.PublicUrl is null)
+        if (liveStatus?.PublicUrl is null || liveStatus.Status != "running")
         {
-            throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' did not get public networking (an IP and a mapped port {plan.SwarmUIPort}) within {maxWaitSeconds}s.");
+            throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' was not running with public networking (an IP and a mapped port {plan.SwarmUIPort}) within {maxWaitSeconds}s{(lastState is null ? "" : $" (last: {lastState})")}.");
         }
         // Wait for SwarmUI itself, not just the port mapping: the mapped port answers as soon as the
         // container's network namespace exists, well before whatever is inside it has started listening.
@@ -358,7 +375,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         JObject resp = await ApiAsync(HttpMethod.Post, "/api/v0/bundles/", query, cancel) as JObject;
         JArray offers = resp?["offers"] as JArray ?? [];
-        return [.. offers.OrderBy(o => o["dph_total"]?.Value<double>() ?? double.MaxValue)];
+        return [.. offers.OrderBy(o => ((double?)o["dph_total"]) ?? double.MaxValue)];
     }
 
     /// <summary>
@@ -387,7 +404,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
                 {
                     continue;
                 }
-                volumes.Add(new JObject { ["id"] = v["id"]?.ToString(), ["name"] = v["name"]?.ToString(), ["size_gb"] = v["size"]?.Value<int>() });
+                volumes.Add(new JObject { ["id"] = v["id"]?.ToString(), ["name"] = v["name"]?.ToString(), ["size_gb"] = ((int?)v["size"]) });
             }
         }
         catch (CloudApiException ex) when (ex.Status is 401 or 403)
@@ -405,13 +422,13 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             {
                 ["id"] = o["id"]?.ToString(),
                 ["gpu_name"] = o["gpu_name"]?.ToString(),
-                ["num_gpus"] = o["num_gpus"]?.Value<int>(),
+                ["num_gpus"] = ((int?)o["num_gpus"]),
                 // Vast reports gpu_ram in MB (confirmed against the official CLI's own display conversion); converted here so the field means what its name says.
-                ["gpu_ram"] = o["gpu_ram"]?.Value<double>() / 1000,
-                ["disk_space"] = o["disk_space"]?.Value<double>(),
+                ["gpu_ram"] = ((double?)o["gpu_ram"]) / 1000,
+                ["disk_space"] = ((double?)o["disk_space"]),
                 ["geolocation"] = o["geolocation"]?.ToString(),
-                ["reliability"] = o["reliability"]?.Value<double>(),
-                ["dph_total"] = o["dph_total"]?.Value<double>()
+                ["reliability"] = ((double?)o["reliability"]),
+                ["dph_total"] = ((double?)o["dph_total"])
             })),
             ["network_volumes"] = volumes
         };
