@@ -257,6 +257,22 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
 
     // ── Pod lifecycle ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// True if an existing pod runs the configured image (or no image is configured, or it cannot be told). A pod left from
+    /// before the image was changed is not reused: it is left as it is, since removing it is the owner's call.
+    /// </summary>
+    bool RunsConfiguredImage(JObject pod)
+    {
+        string podImage = (pod["image"] ?? pod["imageName"])?.ToString();
+        if (string.IsNullOrWhiteSpace(plan.ImageName) || !string.IsNullOrWhiteSpace(plan.TemplateId) || string.IsNullOrWhiteSpace(podImage)
+            || string.Equals(podImage.Trim(), plan.ImageName.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        Logs.Warning($"[RunPodPods] Not reusing pod '{pod["id"]}': it runs '{podImage}', not the configured '{plan.ImageName}'. It is left as it is; terminate it in the RunPod console if it is no longer needed.");
+        return false;
+    }
+
     /// <summary>Finds the pod to use: an explicit ID, else a previously created pod by name, else creates one.</summary>
     async Task<string> ResolvePodAsync(CancellationToken cancel)
     {
@@ -273,7 +289,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         if (!string.IsNullOrWhiteSpace(plan.PersistedId))
         {
             JObject remembered = await GetPodAsync(plan.PersistedId, cancel);
-            if (remembered is not null && !TerminalStatuses.Contains(remembered["status"]?.ToString() ?? "", StringComparer.OrdinalIgnoreCase))
+            if (remembered is not null && !TerminalStatuses.Contains(remembered["status"]?.ToString() ?? "", StringComparer.OrdinalIgnoreCase) && RunsConfiguredImage(remembered))
             {
                 ActiveInstanceId = plan.PersistedId;
                 Logs.Info($"[RunPodPods] Reattaching remembered pod '{ActiveInstanceId}'.");
@@ -285,7 +301,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         foreach (JToken t in await ListPodsAsync(cancel))
         {
             if (t is JObject p && string.Equals(p["name"]?.ToString(), plan.PodName, StringComparison.OrdinalIgnoreCase)
-                && !TerminalStatuses.Contains(p["status"]?.ToString() ?? "", StringComparer.OrdinalIgnoreCase))
+                && !TerminalStatuses.Contains(p["status"]?.ToString() ?? "", StringComparer.OrdinalIgnoreCase) && RunsConfiguredImage(p))
             {
                 ActiveInstanceId = p["id"]?.ToString();
                 Logs.Info($"[RunPodPods] Reusing existing pod '{ActiveInstanceId}' named '{plan.PodName}'.");
