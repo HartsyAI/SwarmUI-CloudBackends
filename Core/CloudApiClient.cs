@@ -152,8 +152,8 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
     }
 
     /// <summary>
-    /// The field-level reasons in a validation problem ('errors' or 'invalid-params'), as "path: message" pairs. Only paths
-    /// and messages are kept, never the rejected values, which can echo secrets such as a worker token.
+    /// The field-level reasons in a validation problem ('errors' or 'invalid-params'): "path: message" for structured entries,
+    /// the text for plain ones. Rejected values are never included, and token-shaped text is masked, since they can echo secrets.
     /// </summary>
     internal static string ValidationErrors(JObject problem)
     {
@@ -162,8 +162,13 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         {
             return null;
         }
-        IEnumerable<string> items = list.OfType<JObject>().Select(e =>
+        IEnumerable<string> items = list.Select(item =>
         {
+            if (item is not JObject e)
+            {
+                // Plain-text errors may quote the rejected value, so anything shaped like a token is masked.
+                return System.Text.RegularExpressions.Regex.Replace(item.ToString(), "[A-Za-z0-9_-]{32,}", "***");
+            }
             string path = (e["path"] ?? e["location"] ?? e["field"] ?? e["name"])?.ToString(Newtonsoft.Json.Formatting.None).Trim('"');
             string message = (e["message"] ?? e["reason"] ?? e["msg"])?.ToString();
             return string.IsNullOrWhiteSpace(path) ? message : $"{path}: {message}";
