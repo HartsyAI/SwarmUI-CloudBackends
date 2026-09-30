@@ -324,6 +324,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         {
             // Only without a template: the template carries its own image, as RunPod's template path does.
             body["image"] = plan.Image;
+            // Run the image's own entrypoint. Vast's default ('ssh', as in the vastai CLI) replaces it with an SSH server,
+            // so the worker never starts. A template sets its own launch mode, so it is only sent here, as the CLI does.
+            body["runtype"] = "args";
         }
         if (!string.IsNullOrWhiteSpace(plan.Label))
         {
