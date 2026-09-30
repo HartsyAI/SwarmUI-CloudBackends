@@ -471,7 +471,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 else if (acquiring is not null && acquiring.IsCompleted)
                 {
                     // Surfaces a failed lease as this request's error. A good one is now a slot, found on the next pass.
-                    await acquiring;
+                    try
+                    {
+                        await acquiring;
+                    }
+                    catch (WorkerLimitReachedException ex)
+                    {
+                        // The provider holds all the workers it can; this request waits for one of them.
+                        Logs.Debug($"[{CloudProviderName}] {ex.Message}");
+                    }
                     acquiring = null;
                 }
                 else if (acquiring is null && Slots.Length == 0 && PendingAcquires == 0)

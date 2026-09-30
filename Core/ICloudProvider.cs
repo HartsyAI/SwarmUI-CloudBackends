@@ -2,6 +2,11 @@ using Newtonsoft.Json.Linq;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
+/// <summary>The provider can hold no more workers right now; a request should wait for one it already has, not fail.</summary>
+public class WorkerLimitReachedException(string message) : SwarmUI.Utils.SwarmReadableErrorException(message)
+{
+}
+
 /// <summary>What a lease asks the provider for. Mirrors the backend's settings at the time of the request.</summary>
 public class LeaseRequest
 {
