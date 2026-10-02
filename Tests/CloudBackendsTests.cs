@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http;
 using System.Net.Security;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Hartsy.Extensions.CloudBackends.Core;
@@ -263,6 +264,37 @@ public class VastSessionTests
         Assert.That(worker.WorkerId, Is.EqualTo("42"));
         Assert.That(() => VastAIProvider.ApplyLease(new CloudWorkerInfo(), new JObject { ["success"] = true, ["public_url"] = "x", ["token"] = "y" }),
             Throws.TypeOf<SwarmReadableErrorException>().With.Message.Contains("too old"));
+    }
+}
+
+/// <summary>Vast.ai instance host reachability.</summary>
+[TestFixture]
+public class VastPortProbeTests
+{
+    [Test]
+    public async Task ListeningPortIsReachable()
+    {
+        TcpListener listener = new(IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            Assert.That(await VastAIInstanceProvider.WaitForPortAsync($"https://127.0.0.1:{port}", DateTime.UtcNow, CancellationToken.None), Is.True);
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    [Test]
+    public async Task RefusedPortStillProvesTheHostForwards()
+    {
+        TcpListener listener = new(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        Assert.That(await VastAIInstanceProvider.WaitForPortAsync($"http://127.0.0.1:{port}", DateTime.UtcNow, CancellationToken.None), Is.True);
     }
 }
 

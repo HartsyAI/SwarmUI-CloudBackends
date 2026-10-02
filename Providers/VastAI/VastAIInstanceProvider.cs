@@ -2,6 +2,7 @@ using Hartsy.Extensions.CloudBackends.Core;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Utils;
 using System.Net.Http;
+using System.Net.Sockets;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
 
@@ -57,8 +58,8 @@ public class VastAIInstancePlan
 /// (`vastai/api/instances.py`, `vastai/api/offers.py`, `vastai/api/storage.py`,
 /// `vastai/data/instance.py`), not just prose docs - see <see cref="StatusFromInstance"/>.
 ///
-/// Unlike RunPod, Vast has no proxy domain: a port is reached at {public_ipaddr}:{mapped_external_port}
-/// over plain HTTP, and that external port is randomly assigned and only known after creation. Port
+/// Unlike RunPod, Vast has no proxy domain: a port is reached at {public_ipaddr}:{mapped_external_port},
+/// and that external port is randomly assigned and only known after creation. Port
 /// exposure itself is declared inside the `env` dict as a Docker -p flag key ("-p {port}:{port}": "1"),
 /// not a structured ports field the way RunPod's create body has.
 ///
@@ -66,7 +67,7 @@ public class VastAIInstancePlan
 ///   1. Resolve an instance: an explicit instance ID, else a previously created one found by label, else create one.
 ///   2. Issue a start (harmless if it's already running).
 ///   3. Poll until public_ipaddr and the mapped port are both present, which is when networking is real.
-///   4. Build http://{ip}:{port} and confirm SwarmUI itself answers there before trusting it.
+///   4. Check the host forwards the port (else destroy a just-created instance and rent another machine), then confirm SwarmUI itself answers there.
 ///
 /// Instances bill continuously while running, so there is no keepalive to hold; shutdown stops (or
 /// destroys) the instance instead.
@@ -88,6 +89,21 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
 
     /// <summary>Short-lived cache of the instance's status.</summary>
     readonly CloudStatusCache StatusCache = new();
+
+    /// <summary>Fewest direct ports an offer's host may have.</summary>
+    public const int MinDirectPorts = 64;
+
+    /// <summary>How long a running instance's port may refuse to accept connections before its host is judged unreachable.</summary>
+    public const int PortReachSeconds = 180;
+
+    /// <summary>Hosts tried per start: a created instance on an unreachable host is destroyed and another machine rented.</summary>
+    public const int MaxHostAttempts = 3;
+
+    /// <summary>Instance created by the current start attempt, if any. Only those may be destroyed and replaced.</summary>
+    string CreatedInstanceId;
+
+    /// <summary>Machines whose hosts never forwarded the port, skipped when picking an offer.</summary>
+    readonly HashSet<string> SkippedMachines = [];
 
     /// <summary>Gets the instance's live status. Returns null if no instance has been resolved yet.</summary>
     public async Task<CloudInstanceStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default)
@@ -131,7 +147,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             GpuCount = ((int?)inst["num_gpus"]) ?? 0,
             CostPerHour = ((double?)inst["dph_total"]) ?? 0,
             UptimeSeconds = (int)((((double?)inst["uptime_mins"]) ?? 0) * 60),
-            // Plain HTTP, no TLS: Vast has no proxy domain, just {public_ipaddr}:{mapped_external_port}.
+            // Vast has no proxy domain, just {public_ipaddr}:{mapped_external_port}; the worker serves HTTPS with its Vast-signed certificate.
             PublicUrl = (!string.IsNullOrWhiteSpace(ip) && mappedPort is not null) ? $"{(plan.UseTls ? "https" : "http")}://{ip}:{mappedPort}" : null
         };
     }
@@ -157,6 +173,20 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     }
 
     public async Task<CloudInstanceInfo> StartInstanceAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            CreatedInstanceId = null;
+            CloudInstanceInfo started = await StartOnceAsync(maxWaitSeconds, pollIntervalMs, attempt < MaxHostAttempts, cancel);
+            if (started is not null)
+            {
+                return started;
+            }
+        }
+    }
+
+    /// <summary>Starts (creating if needed) and waits for the instance. Returns null if it rented an unreachable host and destroyed it, so the caller can try another.</summary>
+    async Task<CloudInstanceInfo> StartOnceAsync(int maxWaitSeconds, int pollIntervalMs, bool mayRedraw, CancellationToken cancel)
     {
         DateTime deadline = DateTime.UtcNow.AddSeconds(maxWaitSeconds);
         string instanceId = await ResolveInstanceAsync(cancel);
@@ -213,6 +243,24 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         if (liveStatus?.PublicUrl is null || liveStatus.Status != "running")
         {
             throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' was not running with public networking (an IP and a mapped port {plan.SwarmUIPort}) within {maxWaitSeconds}s{(lastState is null ? "" : $" (last: {lastState})")}.");
+        }
+        // Some hosts map the port but never forward traffic to it. The worker's gateway listens within seconds of the
+        // container running, so a port that never accepts a connection means the host, not the worker.
+        if (!await WaitForPortAsync(liveStatus.PublicUrl, Min(deadline, DateTime.UtcNow.AddSeconds(PortReachSeconds)), cancel))
+        {
+            string machineId = (await GetInstanceAsync(instanceId, cancel))?["machine_id"]?.ToString();
+            if (!mayRedraw || CreatedInstanceId != instanceId || !string.IsNullOrWhiteSpace(plan.OfferId))
+            {
+                throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' is running, but its port {liveStatus.PublicUrl} never accepted a connection, so that host's network does not reach it. Destroy the instance and pick a different offer.");
+            }
+            Logs.Warning($"[VastAI Instances] Instance '{instanceId}' (machine {machineId}) never accepted a connection on {liveStatus.PublicUrl}; destroying it and renting a different machine.");
+            if (!string.IsNullOrWhiteSpace(machineId))
+            {
+                SkippedMachines.Add(machineId);
+            }
+            await DestroyInstanceAsync(cancel);
+            ActiveInstanceId = "";
+            return null;
         }
         // Wait for SwarmUI itself, not just the port mapping: the mapped port answers as soon as the
         // container's network namespace exists, well before whatever is inside it has started listening.
@@ -284,6 +332,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             }
         }
         ActiveInstanceId = await CreateInstanceAsync(cancel);
+        CreatedInstanceId = ActiveInstanceId;
         return ActiveInstanceId;
     }
 
@@ -294,7 +343,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         if (string.IsNullOrWhiteSpace(offerId))
         {
             JArray offers = await SearchOffersAsync(cancel);
-            offerId = offers.FirstOrDefault()?["id"]?.ToString()
+            offerId = offers.FirstOrDefault(o => !SkippedMachines.Contains(o["machine_id"]?.ToString() ?? ""))?["id"]?.ToString()
                 ?? throw new SwarmReadableErrorException("No 'OfferId' set and no offers matched the default search. Pick one from the live dropdown, or check your account's region/verification filters.");
         }
         // Port exposure is a Docker -p flag encoded as an env dict key (Vast has no structured ports
@@ -366,7 +415,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             ["rentable"] = new JObject { ["eq"] = true },
             ["rented"] = new JObject { ["eq"] = false },
             ["type"] = "on-demand",
-            ["allocated_storage"] = Math.Max(1, plan.DiskGb)
+            ["allocated_storage"] = Math.Max(1, plan.DiskGb),
+            // Vast's own instance QA requires 64 direct ports; hosts with fewer are often behind a proxy or VPN that never forwards the mapped port.
+            ["direct_port_count"] = new JObject { ["gte"] = MinDirectPorts }
             // No "order" field: Vast's current /bundles/ validation rejects the official CLI's own
             // [[field, direction]] shape (confirmed live: "order.0/order.1: Input should be a valid
             // tuple"), so cheapest-first is done client-side below instead of depending on that contract.
@@ -449,6 +500,44 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     }
 
     /// <summary>Gets an instance by ID, or null if it does not exist.</summary>
+    /// <summary>Waits until the address accepts a TCP connection, or refuses one (which still proves packets reach the container). False if it only timed out until <paramref name="until"/>.</summary>
+    internal static async Task<bool> WaitForPortAsync(string publicUrl, DateTime until, CancellationToken cancel)
+    {
+        Uri uri = new(publicUrl);
+        while (true)
+        {
+            using (CancellationTokenSource attempt = CancellationTokenSource.CreateLinkedTokenSource(cancel))
+            using (TcpClient client = new())
+            {
+                attempt.CancelAfter(TimeSpan.FromSeconds(10));
+                try
+                {
+                    await client.ConnectAsync(uri.Host, uri.Port, attempt.Token);
+                    return true;
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionRefused)
+                {
+                    return true;
+                }
+                catch (Exception ex) when (ex is SocketException || (ex is OperationCanceledException && !cancel.IsCancellationRequested))
+                {
+                    Logs.Verbose($"[VastAI Instances] {uri.Host}:{uri.Port} not reachable yet: {ex.Message}");
+                }
+            }
+            if (DateTime.UtcNow >= until)
+            {
+                return false;
+            }
+            await Task.Delay(5000, cancel);
+        }
+    }
+
+    /// <summary>The earlier of two times.</summary>
+    static DateTime Min(DateTime a, DateTime b)
+    {
+        return a < b ? a : b;
+    }
+
     public async Task<JObject> GetInstanceAsync(string id, CancellationToken cancel = default)
     {
         JToken resp = await ApiAsync(HttpMethod.Get, $"/api/v0/instances/{id}/?owner=me", null, cancel, allowNotFound: true);
