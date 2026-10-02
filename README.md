@@ -128,7 +128,8 @@ The same as pods, with Vast.ai's differences:
 
   <img src="Assets/screenshots/vastai-live-dropdowns.png" width="600" alt="Vast.ai Instances section with a live offer selected">
 
-- Vast.ai has no proxy domain; the instance is reached at its public IP over **HTTPS**, using the certificate Vast.ai issues to every instance. The card checks it against Vast.ai's own root certificate.
+- Vast.ai has no proxy domain; the instance is reached at its public IP over **HTTPS**, using a certificate the worker gets from Vast.ai at startup. The card checks it against Vast.ai's own root certificate.
+- Without an Offer ID, the card rents the cheapest matching host with at least 64 direct ports. If a host it rented never forwards the port, the card destroys that instance and rents a different machine (up to 3 hosts).
 - Attach an existing network volume with **Network Volume ID**. Creating a new named volume is done on Vast.ai's site.
 - To use an instance you created yourself, it must run the Hartsy Vast worker image; put its `SWARMUI_WORKER_TOKEN` in **Worker Token**.
 - When you pick a **Template**, the template's image is used and the Image setting is ignored.
