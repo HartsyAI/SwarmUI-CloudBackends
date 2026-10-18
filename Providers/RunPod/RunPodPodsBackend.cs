@@ -29,8 +29,8 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
         /// <summary>Stop terminates the pod instead of pausing it.</summary>
         public bool DeleteOnStop = true;
 
-        /// <summary>Name for created pods, used to find the pod again. Set by the card, unique per backend and user.</summary>
-        public string PodName = "swarmui-cloudbackends";
+        /// <summary>Name for created pods, used to find the pod again. Always set by the card, unique per backend and user.</summary>
+        public string PodName = "";
 
         /// <summary>Docker image for created pods. Ignored when <see cref="TemplateId"/> is set.</summary>
         public string ImageName = "";

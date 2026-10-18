@@ -92,7 +92,7 @@ You can also see and stop your instances on Vast.ai under **Instances**.
 
 ## Using an instance you made yourself
 
-Pick it under **Instance**. It must run the Hartsy Vast.ai worker image (`kalebbroo/swarmui-worker-vast`) in entrypoint mode, expose port `7801`, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **Worker Token**, which shows once an instance is picked. Turn off **Delete On Stop** unless you want Stop Instance to destroy it. Letting the card rent the instance is simpler, because it handles all of that.
+Pick it under **Instance**. It must run the Hartsy Vast.ai worker image (`kalebbroo/swarmui-worker-vast`) in entrypoint mode, expose port `7801`, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **Worker Token**, which shows once an instance is picked. Stop Instance only pauses an instance you made yourself, whatever **Delete On Stop** says. Letting the card rent the instance is simpler, because it handles all of that.
 
 ## What it costs
 

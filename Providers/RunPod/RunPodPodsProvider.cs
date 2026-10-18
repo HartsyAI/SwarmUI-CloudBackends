@@ -47,7 +47,7 @@ public class RunPodPodPlan
     /// <summary>Gateway token for the pod's SwarmUI worker, injected as SWARMUI_WORKER_TOKEN when creating it.</summary>
     public string WorkerToken = "";
 
-    /// <summary>If true, releasing the pod (Stop, a failsafe, or shutdown) terminates it; if false it is only stopped, so it can resume.</summary>
+    /// <summary>If true, releasing a pod this card found or created (Stop, a failsafe, or shutdown) terminates it; if false it is only stopped, so it can resume. A pod named in <see cref="PodId"/> is the user's own and is only ever stopped.</summary>
     public bool DeleteOnStop = true;
 }
 
@@ -184,7 +184,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 {
                     if (IsRunningWithoutGpu(pod))
                     {
-                        throw new SwarmReadableErrorException($"RunPod pod '{podId}' started without a GPU: its machine's GPU went to someone else while it was stopped. Stop and delete it in the RunPod console (or turn on Delete On Stop) so the next Start creates a fresh pod.");
+                        throw new SwarmReadableErrorException($"RunPod pod '{podId}' started without a GPU: its machine's GPU went to someone else while it was stopped. Delete it in the RunPod console. For a pod the card created, the next Start then creates a fresh one (Delete On Stop avoids this).");
                     }
                     Logs.Info($"[RunPodPods] Pod '{podId}' is running (uptime {runtime["uptime"]}s).");
                     break;
@@ -239,7 +239,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Releases the pod, stopping or terminating it per the plan.</summary>
     public async Task ReleaseInstanceAsync(CancellationToken cancel = default)
     {
-        if (plan.DeleteOnStop)
+        if (plan.DeleteOnStop && string.IsNullOrWhiteSpace(plan.PodId))
         {
             await TerminatePodAsync(cancel);
         }

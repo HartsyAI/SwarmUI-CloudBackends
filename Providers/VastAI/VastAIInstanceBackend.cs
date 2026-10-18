@@ -29,7 +29,7 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         /// <summary>Stop destroys the instance instead of pausing it.</summary>
         public bool DeleteOnStop = true;
 
-        /// <summary>Label for created instances, used to find the instance again. Set by the card, unique per backend and user.</summary>
+        /// <summary>Label for created instances, used to find the instance again. Always set by the card, unique per backend and user.</summary>
         public string Label = "";
 
         /// <summary>Docker image for created instances. Ignored when <see cref="TemplateHashId"/> is set.</summary>

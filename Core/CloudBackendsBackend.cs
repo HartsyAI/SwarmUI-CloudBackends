@@ -52,7 +52,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ConfigComment("Only for a pod you made yourself (shown once you pick one under Pod): the SWARMUI_WORKER_TOKEN it was created with.\nThe card makes its own token for pods it creates. Hidden once saved.")]
         [ValueIsSecret]
         public string RunPodPods_WorkerToken = "";
-        [ConfigComment("What Stop Pod does.\nOn: deletes the pod. Your models stay on the network volume, and the next Start makes a fresh pod.\nOff: pauses the pod. RunPod clears its container disk anyway, and a paused pod can come back without a GPU.")]
+        [ConfigComment("What Stop Pod does.\nOn: deletes a pod the card created. Your models stay on the network volume, and the next Start makes a fresh pod.\nA pod you picked yourself is only ever paused. Off: pauses the pod. RunPod clears its container disk anyway, and a paused pod can come back without a GPU.")]
         public bool RunPodPods_DeleteOnStop = true;
         [SuggestionPlaceholder(Text = "pick an image, or type your own")]
         [ConfigComment("The Docker image the pod runs.\nUse the Hartsy RunPod worker: pick the ComfyUI or HartsyInference version from the list.\nIgnored when a Template is set (under Advanced).")]
@@ -123,7 +123,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ConfigComment("Only for an instance you made yourself (shown once you pick one under Instance): the SWARMUI_WORKER_TOKEN it was created with.\nThe card makes its own token for instances it creates. Hidden once saved.")]
         [ValueIsSecret]
         public string VastAIInstance_WorkerToken = "";
-        [ConfigComment("What Stop Instance does.\nOn: destroys the instance, so nothing bills. Keep models on a network volume.\nOff: pauses it. Its disk keeps billing, and it can only resume once that machine's GPU is free again.")]
+        [ConfigComment("What Stop Instance does.\nOn: destroys an instance the card created, so nothing bills. Keep models on a network volume.\nAn instance you picked yourself is only ever paused. Off: pauses it. Its disk keeps billing, and it can only resume once that machine's GPU is free again.")]
         public bool VastAIInstance_DeleteOnStop = true;
         [SuggestionPlaceholder(Text = "pick an image, or type your own")]
         [ConfigComment("The Docker image the instance runs.\nUse the Hartsy Vast.ai worker: pick the ComfyUI or HartsyInference version from the list.\nIgnored when a Template is set (under Advanced).")]
@@ -351,11 +351,11 @@ public class CloudBackendsBackend : AbstractT2IBackend
             // A name unique to this backend and user, so each user's find-by-name reattaches only their own machine. The local
             // user keeps the original name, so a machine created before per-user names is still found instead of rented again.
             string uniqueName = user.UserID == SessionHandler.LocalUserID ? $"swarmui-cloudbackends-{BackendData.ID}" : $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
-            if (settings is RunPodPodsBackend.Settings pods && string.IsNullOrWhiteSpace(pods.PodName))
+            if (settings is RunPodPodsBackend.Settings pods)
             {
                 pods.PodName = uniqueName;
             }
-            if (settings is VastAIInstanceBackend.Settings vast && string.IsNullOrWhiteSpace(vast.Label))
+            if (settings is VastAIInstanceBackend.Settings vast)
             {
                 vast.Label = uniqueName;
             }

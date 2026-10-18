@@ -45,7 +45,7 @@ public class VastAIInstancePlan
     /// <summary>Reach the instance over HTTPS with Vast's instance certificate (the Hartsy Vast worker serves it).</summary>
     public bool UseTls = true;
 
-    /// <summary>If true, releasing the instance (Stop, a failsafe, or shutdown) destroys it; if false it is only stopped, so it can resume.</summary>
+    /// <summary>If true, releasing an instance this card found or created (Stop, a failsafe, or shutdown) destroys it; if false it is only stopped, so it can resume. An instance named in <see cref="InstanceId"/> is the user's own and is only ever stopped.</summary>
     public bool DeleteOnStop = true;
 }
 
@@ -272,7 +272,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Releases the instance, stopping or destroying it per the plan.</summary>
     public async Task ReleaseInstanceAsync(CancellationToken cancel = default)
     {
-        if (plan.DeleteOnStop)
+        if (plan.DeleteOnStop && string.IsNullOrWhiteSpace(plan.InstanceId))
         {
             await DestroyInstanceAsync(cancel);
         }

@@ -61,7 +61,7 @@ When you pick the volume's data center, check that it has the GPU you want: pods
    | Setting | Value |
    |---|---|
    | Pod | Leave on **(create one for me)**. The card then creates a pod for you, and finds it again next time. |
-   | Delete On Stop | Leave on. Stop Pod then deletes the pod, and the next Start makes a fresh one; your models stay on the network volume. Off only pauses it, but RunPod clears a paused pod's disk anyway, and a paused pod can come back without a GPU. |
+   | Delete On Stop | Leave on. Stop Pod then deletes the pod the card created, and the next Start makes a fresh one; your models stay on the network volume. Off only pauses it, but RunPod clears a paused pod's disk anyway, and a paused pod can come back without a GPU. |
    | Image | Leave the default (the Hartsy RunPod worker with ComfyUI), or pick the HartsyInference version from the suggestions. |
    | GPU | The GPU to rent. **(cheapest available)** takes the cheapest one that's free. 16 GB of VRAM or more; 24 GB for large models like Flux. |
    | Container Disk | `30 GB` or more for the ComfyUI image (`50 GB` is the default). |
@@ -101,7 +101,7 @@ You can also see and stop your pods in the RunPod console under **Pods**.
 
 ## Using a pod you made yourself
 
-Pick that pod under **Pod**. The pod must run the Hartsy RunPod worker image (`kalebbroo/swarmui-worker-runpod`), expose port `7801` as HTTP, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **Worker Token**, which shows once a pod is picked. Turn off **Delete On Stop** unless you want Stop Pod to delete your pod. Letting the card create the pod is simpler, because it handles all of that.
+Pick that pod under **Pod**. The pod must run the Hartsy RunPod worker image (`kalebbroo/swarmui-worker-runpod`), expose port `7801` as HTTP, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **Worker Token**, which shows once a pod is picked. Stop Pod only pauses a pod you made yourself, whatever **Delete On Stop** says. Letting the card create the pod is simpler, because it handles all of that.
 
 ## What it costs
 

@@ -498,6 +498,14 @@ public class SettingsDerivationTests
     }
 
     [Test]
+    public void ChildMachineNamesStartBlankSoTheCardSetsThem()
+    {
+        // The card gives each user's child a unique name; a non-blank default would let users share one machine.
+        Assert.That(new RunPodPodsBackend.Settings().PodName, Is.Empty);
+        Assert.That(new VastAIInstanceBackend.Settings().Label, Is.Empty);
+    }
+
+    [Test]
     public void AdvancedFieldsAreRealSettings()
     {
         HashSet<string> fields = [.. typeof(CloudBackendsBackend.Settings).GetFields().Select(f => f.Name)];
