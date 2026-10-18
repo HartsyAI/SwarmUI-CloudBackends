@@ -80,12 +80,12 @@ Either way the list is remembered per user and endpoint, across restarts. Use th
 
 ## Provider settings
 
-Every setting on the card has a **?** next to it that explains it. The setup guides above walk through the ones that matter, in order:
+Every setting on the card has a **?** next to it that explains it, and each section's header links to its setup guide. Dropdowns are filled from your own account once its API key is saved, and settings only a custom setup needs sit under **Advanced**. The setup guides walk through the ones that matter, in order:
 
-- [RunPod Serverless](docs/setup/runpod-serverless.md): endpoint settings (image, HTTP port 7801, execution timeout, CUDA versions), and the card's Max Workers, Idle Seconds and Max Lease Seconds.
+- [RunPod Serverless](docs/setup/runpod-serverless.md): endpoint settings (image, HTTP port 7801, execution timeout, CUDA versions), and the card's Max Workers and Idle Shutdown.
 - [RunPod GPU Pods](docs/setup/runpod-pods.md): GPU type, network volume, the Start and Stop buttons, and the Max Runtime and Max Spend failsafes.
 - [Vast.ai Serverless](docs/setup/vastai-serverless.md): the worker image, template, endpoint (Min Load 0, an inactivity timeout) and workergroup.
-- [Vast.ai Instances](docs/setup/vastai-instances.md): offers, disk, volumes, and the failsafes.
+- [Vast.ai Instances](docs/setup/vastai-instances.md): GPU, disk, volumes, and the failsafes.
 
 **Already running the version 1 RunPod image (`kalebbroo/swarmui-runpod`)?** It keeps working, in single-worker compatibility mode: one worker at a time, kept alive with keepalive jobs as before, and without an access token on the worker. Move the endpoint to `kalebbroo/swarmui-worker-runpod` when you want scaling and a secured worker; your network volume works with both.
 

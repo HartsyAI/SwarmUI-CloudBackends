@@ -47,8 +47,8 @@ public class RunPodPodPlan
     /// <summary>Gateway token for the pod's SwarmUI worker, injected as SWARMUI_WORKER_TOKEN when creating it.</summary>
     public string WorkerToken = "";
 
-    /// <summary>If true the pod is destroyed on shutdown; if false it is only stopped, so it can resume.</summary>
-    public bool TerminateOnShutdown = false;
+    /// <summary>If true, releasing a pod this card found or created (Stop, a failsafe, or shutdown) terminates it; if false it is only stopped, so it can resume. A pod named in <see cref="PodId"/> is the user's own and is only ever stopped.</summary>
+    public bool DeleteOnStop = true;
 }
 
 /// <summary>
@@ -182,6 +182,10 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 if (status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase)
                     && pod["runtime"] is JObject runtime && (runtime["uptime"]?.Value<int>() ?? 0) > 0)
                 {
+                    if (IsRunningWithoutGpu(pod))
+                    {
+                        throw new SwarmReadableErrorException($"RunPod pod '{podId}' started without a GPU: its machine's GPU went to someone else while it was stopped. Delete it in the RunPod console. For a pod the card created, the next Start then creates a fresh one (Delete On Stop avoids this).");
+                    }
                     Logs.Info($"[RunPodPods] Pod '{podId}' is running (uptime {runtime["uptime"]}s).");
                     break;
                 }
@@ -219,6 +223,13 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         };
     }
 
+    /// <summary>True if RunPod reports the pod with a GPU count of zero, as happens when a stopped pod resumes after its GPU was rented out.</summary>
+    internal static bool IsRunningWithoutGpu(JObject pod)
+    {
+        // "gpu" is JSON null in early states; only a reported count of 0 counts.
+        return pod["gpu"] is JObject gpu && gpu["count"] is JValue count && count.Type == JTokenType.Integer && count.Value<int>() == 0;
+    }
+
     /// <summary>True if the pod's published action list permits the given action.</summary>
     static bool PodAllows(JObject pod, string action)
     {
@@ -228,7 +239,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Releases the pod, stopping or terminating it per the plan.</summary>
     public async Task ReleaseInstanceAsync(CancellationToken cancel = default)
     {
-        if (plan.TerminateOnShutdown)
+        if (plan.DeleteOnStop && string.IsNullOrWhiteSpace(plan.PodId))
         {
             await TerminatePodAsync(cancel);
         }
@@ -405,6 +416,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         {
             env["VOLUME_PATH"] = plan.VolumeMountPath;
         }
+        // The worker's gateway listens on this port, so it matches the port exposed above.
+        env["SWARMUI_PUBLIC_PORT"] ??= $"{plan.SwarmUIPort}";
         if (env.HasValues)
         {
             body["env"] = env;
@@ -540,7 +553,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             JToken tpls = await ApiAsync(HttpMethod.Get, "/templates", null, cancel);
             foreach (JToken t in tpls?["templates"] as JArray ?? tpls as JArray ?? [])
             {
-                if (t is not JObject tpl)
+                // Serverless templates can't create a pod, so they would only clutter the list.
+                if (t is not JObject tpl || (tpl["serverless"] ?? tpl["isServerless"])?.Type == JTokenType.Boolean && (tpl["serverless"] ?? tpl["isServerless"]).Value<bool>())
                 {
                     continue;
                 }

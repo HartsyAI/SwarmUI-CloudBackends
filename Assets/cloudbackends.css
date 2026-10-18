@@ -35,6 +35,40 @@
     padding: 6px 10px 10px 10px;
 }
 
+.cloudbackends-guide-link {
+    font-size: 0.85em;
+    margin-right: 6px;
+}
+
+/* Rarely needed settings, folded away at the bottom of each section. */
+
+.cloudbackends-advanced {
+    margin-top: 6px;
+    border-top: 1px solid rgba(128, 128, 128, 0.25);
+}
+
+.cloudbackends-advanced-header {
+    padding: 4px 0;
+    cursor: pointer;
+    user-select: none;
+    opacity: 0.85;
+}
+
+.cloudbackends-advanced-header:hover {
+    opacity: 1;
+}
+
+/* The worker image field, a one-line input so it can suggest the Hartsy images. */
+.cloudbackends-suggest-input {
+    flex: 1;
+    min-width: 0;
+}
+
+/* A field another setting overrides, such as Data Center once a network volume is picked. */
+.cloudbackends-field-inactive {
+    opacity: 0.45;
+}
+
 .cloudbackends-provider-actions {
     display: flex;
     flex-wrap: wrap;

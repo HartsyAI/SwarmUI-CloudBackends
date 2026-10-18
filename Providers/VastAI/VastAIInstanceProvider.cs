@@ -26,8 +26,8 @@ public class VastAIInstancePlan
     /// <summary>Vast.ai template to create the instance from, instead of an image.</summary>
     public string TemplateHashId = "";
 
-    /// <summary>Offer to create from. Blank picks the cheapest matching on-demand offer at create time.</summary>
-    public string OfferId = "";
+    /// <summary>GPU model to rent (Vast's gpu_name). Blank takes the cheapest single GPU with at least <see cref="VastAIInstanceProvider.DefaultMinGpuRamMb"/> of VRAM.</summary>
+    public string GpuName = "";
 
     /// <summary>Container disk for a created instance, in GB.</summary>
     public int DiskGb = 20;
@@ -45,8 +45,8 @@ public class VastAIInstancePlan
     /// <summary>Reach the instance over HTTPS with Vast's instance certificate (the Hartsy Vast worker serves it).</summary>
     public bool UseTls = true;
 
-    /// <summary>If true the instance is destroyed on shutdown; if false it is only stopped, so it can resume.</summary>
-    public bool TerminateOnShutdown = false;
+    /// <summary>If true, releasing an instance this card found or created (Stop, a failsafe, or shutdown) destroys it; if false it is only stopped, so it can resume. An instance named in <see cref="InstanceId"/> is the user's own and is only ever stopped.</summary>
+    public bool DeleteOnStop = true;
 }
 
 /// <summary>
@@ -244,9 +244,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         if (!await WaitForPortAsync(liveStatus.PublicUrl, Min(deadline, DateTime.UtcNow.AddSeconds(PortReachSeconds)), cancel))
         {
             string machineId = (await GetInstanceAsync(instanceId, cancel))?["machine_id"]?.ToString();
-            if (!mayRedraw || CreatedInstanceId != instanceId || !string.IsNullOrWhiteSpace(plan.OfferId))
+            if (!mayRedraw || CreatedInstanceId != instanceId)
             {
-                throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' is running, but its port {liveStatus.PublicUrl} never accepted a connection, so that host's network does not reach it. Destroy the instance and pick a different offer.");
+                throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' is running, but its port {liveStatus.PublicUrl} never accepted a connection, so that host's network does not reach it. Destroy the instance and start again to rent a different machine.");
             }
             Logs.Warning($"[VastAI Instances] Instance '{instanceId}' (machine {machineId}) never accepted a connection on {liveStatus.PublicUrl}; destroying it and renting a different machine.");
             if (!string.IsNullOrWhiteSpace(machineId))
@@ -272,7 +272,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Releases the instance, stopping or destroying it per the plan.</summary>
     public async Task ReleaseInstanceAsync(CancellationToken cancel = default)
     {
-        if (plan.TerminateOnShutdown)
+        if (plan.DeleteOnStop && string.IsNullOrWhiteSpace(plan.InstanceId))
         {
             await DestroyInstanceAsync(cancel);
         }
@@ -330,16 +330,18 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Creates an instance from the configured offer (or the cheapest matching one if none is set).</summary>
     public async Task<string> CreateInstanceAsync(CancellationToken cancel = default)
     {
-        string offerId = plan.OfferId?.Trim();
-        if (string.IsNullOrWhiteSpace(offerId))
-        {
-            JArray offers = await SearchOffersAsync(cancel);
-            offerId = offers.FirstOrDefault(o => !SkippedMachines.Contains(o["machine_id"]?.ToString() ?? ""))?["id"]?.ToString()
-                ?? throw new SwarmReadableErrorException("No 'OfferId' set and no offers matched the default search. Pick one from the live dropdown, or check your account's region/verification filters.");
-        }
+        string gpuName = plan.GpuName?.Trim() ?? "";
+        // A specific offer is one machine's slot and goes stale within minutes, so the cheapest one is picked at create time.
+        JArray offers = await SearchOffersAsync(gpuName, gpuName.Length > 0 ? 0 : DefaultMinGpuRamMb, cancel);
+        string offerId = offers.FirstOrDefault(o => !SkippedMachines.Contains(o["machine_id"]?.ToString() ?? ""))?["id"]?.ToString()
+            ?? throw new SwarmReadableErrorException(gpuName.Length > 0
+                ? $"No Vast.ai machine with a {gpuName} is available to rent right now. Pick another GPU, or '(cheapest available)'."
+                : "No Vast.ai machine matched the default search (one GPU with at least 16 GB of VRAM). Pick a GPU from the list, or try again later.");
         // Port exposure is a Docker -p flag encoded as an env dict key (Vast has no structured ports
         // field on create), so it's merged into the same object as any user-supplied env vars.
         JObject env = CloudApiClient.ParseEnv(plan.Env);
+        // The worker's gateway listens on this port, so it matches the port opened below.
+        env["SWARMUI_PUBLIC_PORT"] ??= $"{plan.SwarmUIPort}";
         if (!string.IsNullOrWhiteSpace(plan.WorkerToken))
         {
             env["SWARMUI_WORKER_TOKEN"] = plan.WorkerToken;
@@ -398,11 +400,19 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         return id;
     }
 
-    /// <summary>Searches on-demand offers, cheapest first, filtered to rentable/verified/non-external listings.</summary>
-    public async Task<JArray> SearchOffersAsync(CancellationToken cancel = default)
+    /// <summary>Least VRAM, in MB as Vast reports it, for '(cheapest available)': enough for a 16 GB card, which most models need.</summary>
+    public const double DefaultMinGpuRamMb = 15000;
+
+    /// <summary>
+    /// Searches on-demand single-GPU offers, cheapest first, filtered to rentable/verified/non-external listings, and to
+    /// <paramref name="gpuName"/> and <paramref name="minGpuRamMb"/> when given. One GPU, since the worker uses only one.
+    /// </summary>
+    public async Task<JArray> SearchOffersAsync(string gpuName = null, double minGpuRamMb = 0, CancellationToken cancel = default)
     {
         JObject query = new()
         {
+            ["num_gpus"] = new JObject { ["eq"] = 1 },
+            ["limit"] = 500,
             ["verified"] = new JObject { ["eq"] = true },
             ["external"] = new JObject { ["eq"] = false },
             ["rentable"] = new JObject { ["eq"] = true },
@@ -420,22 +430,32 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             // Hosts whose driver cannot load the backend's kernels would rent fine and then never start it.
             query["cuda_max_good"] = new JObject { ["gte"] = 13.0 };
         }
+        if (!string.IsNullOrWhiteSpace(gpuName))
+        {
+            query["gpu_name"] = new JObject { ["eq"] = gpuName };
+        }
+        if (minGpuRamMb > 0)
+        {
+            query["gpu_ram"] = new JObject { ["gte"] = minGpuRamMb };
+        }
         JObject resp = await ApiAsync(HttpMethod.Post, "/api/v0/bundles/", query, cancel) as JObject;
         JArray offers = resp?["offers"] as JArray ?? [];
-        return [.. offers.OrderBy(o => ((double?)o["dph_total"]) ?? double.MaxValue)];
+        // Checked here too, so a filter the search ignored can never rent the wrong GPU.
+        return [.. offers.Where(o => string.IsNullOrWhiteSpace(gpuName) || string.Equals(o["gpu_name"]?.ToString(), gpuName, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(o => ((double?)o["dph_total"]) ?? double.MaxValue)];
     }
 
     /// <summary>
-    /// Gathers everything the settings form needs to offer real choices: rentable offers (GPU, price,
-    /// location) and the account's own network volumes. Individual sections degrade to empty rather
-    /// than failing the whole call, matching RunPodPodsProvider.ListAccountOptionsAsync.
+    /// Gathers everything the settings form needs to offer real choices: the GPU models on offer (with their lowest price),
+    /// the account's instances, templates and network volumes. Each part degrades to empty rather than failing the whole
+    /// call, matching RunPodPodsProvider.ListAccountOptionsAsync.
     /// </summary>
     public async Task<JObject> ListAccountOptionsAsync(CancellationToken cancel = default)
     {
-        JArray offers = [];
+        JArray gpus = [];
         try
         {
-            offers = await SearchOffersAsync(cancel);
+            gpus = GroupOffersByGpu(await SearchOffersAsync(cancel: cancel));
         }
         catch (Exception ex)
         {
@@ -463,22 +483,88 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         {
             Logs.Warning($"[VastAI Instances] Could not list network volumes: {ex.Message}");
         }
+        JArray instances = [];
+        try
+        {
+            foreach (JObject inst in await ListInstancesAsync(cancel))
+            {
+                instances.Add(new JObject
+                {
+                    ["id"] = inst["id"]?.ToString(),
+                    ["label"] = inst["label"]?.ToString(),
+                    ["status"] = (inst["actual_status"] ?? inst["cur_state"])?.ToString(),
+                    ["gpu"] = inst["gpu_name"]?.ToString(),
+                    ["num_gpus"] = ((int?)inst["num_gpus"])
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[VastAI Instances] Could not list instances: {ex.Message}");
+        }
+        JArray templates = [];
+        try
+        {
+            templates = await ListOwnTemplatesAsync(cancel);
+        }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[VastAI Instances] Could not list templates: {ex.Message}");
+        }
         return new JObject
         {
-            ["offers"] = new JArray(offers.Select(o => new JObject
-            {
-                ["id"] = o["id"]?.ToString(),
-                ["gpu_name"] = o["gpu_name"]?.ToString(),
-                ["num_gpus"] = ((int?)o["num_gpus"]),
-                // Vast reports gpu_ram in MB (confirmed against the official CLI's own display conversion); converted here so the field means what its name says.
-                ["gpu_ram"] = ((double?)o["gpu_ram"]) / 1000,
-                ["disk_space"] = ((double?)o["disk_space"]),
-                ["geolocation"] = o["geolocation"]?.ToString(),
-                ["reliability"] = ((double?)o["reliability"]),
-                ["dph_total"] = ((double?)o["dph_total"])
-            })),
-            ["network_volumes"] = volumes
+            ["gpus"] = gpus,
+            ["network_volumes"] = volumes,
+            ["instances"] = instances,
+            ["templates"] = templates
         };
+    }
+
+    /// <summary>One entry per GPU model in <paramref name="offers"/> (sorted cheapest first): its name, VRAM in GB, lowest price per hour and how many machines offer it.</summary>
+    internal static JArray GroupOffersByGpu(JArray offers)
+    {
+        JArray gpus = [];
+        foreach (IGrouping<string, JToken> group in offers.Where(o => !string.IsNullOrWhiteSpace(o["gpu_name"]?.ToString())).GroupBy(o => o["gpu_name"].ToString()))
+        {
+            gpus.Add(new JObject
+            {
+                ["name"] = group.Key,
+                // Vast reports gpu_ram in MB (confirmed against the official CLI's own display conversion).
+                ["gpu_ram"] = Math.Round((group.Max(o => (double?)o["gpu_ram"]) ?? 0) / 1000),
+                ["min_price"] = group.Min(o => (double?)o["dph_total"]),
+                ["offers"] = group.Count()
+            });
+        }
+        return gpus;
+    }
+
+    /// <summary>The account's own templates (Vast's template search also returns public ones, so it is filtered to this user).</summary>
+    public async Task<JArray> ListOwnTemplatesAsync(CancellationToken cancel = default)
+    {
+        string userId = (await ApiAsync(HttpMethod.Get, "/api/v0/users/current/", null, cancel))?["id"]?.ToString();
+        if (!long.TryParse(userId, out long userNumber))
+        {
+            return [];
+        }
+        string filters = Uri.EscapeDataString(new JObject { ["creator_id"] = new JObject { ["eq"] = userNumber } }.ToString(Newtonsoft.Json.Formatting.None));
+        JToken resp = await ApiAsync(HttpMethod.Get, $"/api/v0/template/?select_filters={filters}", null, cancel);
+        JArray templates = [];
+        foreach (JObject tpl in (resp?["templates"] as JArray ?? resp as JArray ?? []).OfType<JObject>())
+        {
+            if (!string.Equals(tpl["creator_id"]?.ToString(), userId, StringComparison.Ordinal) || string.IsNullOrWhiteSpace(tpl["hash_id"]?.ToString()))
+            {
+                continue;
+            }
+            string image = tpl["image"]?.ToString();
+            string tag = tpl["tag"]?.ToString();
+            templates.Add(new JObject
+            {
+                ["id"] = tpl["hash_id"].ToString(),
+                ["name"] = tpl["name"]?.ToString(),
+                ["image"] = string.IsNullOrWhiteSpace(tag) || (image?.Contains(':') ?? false) ? image : $"{image}:{tag}"
+            });
+        }
+        return templates;
     }
 
     /// <summary>Lists the account's instances (one page - plenty for a personal account's find-by-label use).</summary>

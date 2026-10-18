@@ -17,67 +17,55 @@ namespace Hartsy.Extensions.CloudBackends.Providers.RunPod;
 /// </summary>
 public class RunPodPodsBackend : CloudInstanceBackendBase
 {
+    /// <summary>Settings copied in from the card's RunPod GPU Pods section; the card's <see cref="CloudBackendsBackend.Settings"/> documents them.</summary>
     public class Settings : InstanceSettings
     {
-        [SuggestionPlaceholder(Text = "leave blank to create one")]
-        [ConfigComment("Existing RunPod pod ID to use.\nLeave blank to have Swarm find a pod by name, or create one.")]
-        [ManualSettingsOptions(Vals = [""])]
+        /// <summary>Existing pod to use, or blank to find or create one by <see cref="PodName"/>.</summary>
         public string PodId = "";
 
-        [ConfigComment("Port SwarmUI listens on inside the pod.\nThe pod must expose this as an http port so RunPod's proxy can reach it.")]
+        /// <summary>Port SwarmUI listens on inside the pod.</summary>
         public int SwarmUIPort = 7801;
 
-        [ConfigComment("Destroy the pod when this backend shuts down, instead of just stopping it.\nStopping keeps the container disk (and keeps billing for that storage) so the pod can resume quickly.\nTerminating deletes it, which is only sensible when a network volume holds everything worth keeping.")]
-        public bool TerminateOnShutdown = false;
+        /// <summary>Stop terminates the pod instead of pausing it.</summary>
+        public bool DeleteOnStop = true;
 
-        [SuggestionPlaceholder(Text = "swarmui-cloudbackends")]
-        [ConfigComment("Name given to pods this backend creates, and used to find that pod again later so a restart reuses it rather than creating another.")]
-        public string PodName = "swarmui-cloudbackends";
+        /// <summary>Name for created pods, used to find the pod again. Always set by the card, unique per backend and user.</summary>
+        public string PodName = "";
 
-        [SuggestionPlaceholder(Text = "docker image with SwarmUI")]
-        [ConfigComment("Docker image to create the pod from, for example 'kalebbroo/swarmui-worker-runpod:2.0.0-comfyui'.\nIgnored when TemplateId is set.")]
+        /// <summary>Docker image for created pods. Ignored when <see cref="TemplateId"/> is set.</summary>
         public string ImageName = "";
 
-        [SuggestionPlaceholder(Text = "RunPod template id")]
-        [ConfigComment("RunPod template to create the pod from, instead of naming an image directly.")]
-        [ManualSettingsOptions(Vals = [""])]
+        /// <summary>RunPod template to create pods from instead of an image.</summary>
         public string TemplateId = "";
 
-        [SuggestionPlaceholder(Text = "pick a GPU, or leave blank for cheapest available")]
-        [ConfigComment("GPU type for created pods.\nLeave blank to use whatever is available, cheapest first.\nRunPod places exactly one GPU type per request and does not fall back on its own, so naming a busy type simply fails.")]
-        [ManualSettingsOptions(Vals = [""])]
+        /// <summary>GPU type for created pods, or blank for the cheapest available.</summary>
         public string GpuTypeId = "";
 
-        [ConfigComment("Number of GPUs attached to a created pod.")]
+        /// <summary>GPUs per created pod.</summary>
         public int GpuCount = 1;
 
-        [ConfigComment("Container disk size in GB for a created pod. This is wiped when the pod is terminated.")]
+        /// <summary>Container disk size in GB.</summary>
         public int ContainerDiskGb = 50;
 
-        [SuggestionPlaceholder(Text = "network volume id")]
-        [ConfigComment("Network volume to attach, which is normally where SwarmUI and your models live.\nThe pod is automatically placed in that volume's data center.")]
-        [ManualSettingsOptions(Vals = [""])]
+        /// <summary>Network volume to attach.</summary>
         public string NetworkVolumeId = "";
 
-        [ConfigComment("Path the volume is mounted at inside the pod.")]
+        /// <summary>Where the volume is mounted inside the pod.</summary>
         public string VolumeMountPath = "/runpod-volume";
 
-        [ConfigComment("Pod volume size in GB, used only when no network volume is attached. Zero for none.")]
+        /// <summary>Pod volume size in GB, used only without a network volume.</summary>
         public int VolumeGb = 0;
 
-        [ManualSettingsOptions(Vals = ["SECURE", "COMMUNITY"])]
-        [ConfigComment("Which RunPod cloud to create pods in. Secure is more reliable, Community is cheaper.")]
+        /// <summary>SECURE or COMMUNITY.</summary>
         public string CloudType = "SECURE";
 
-        [SuggestionPlaceholder(Text = "leave blank to let RunPod choose")]
-        [ConfigComment("Restrict created pods to one data center.\nIgnored when a network volume is attached, since the volume fixes the data center.")]
-        [ManualSettingsOptions(Vals = [""])]
+        /// <summary>Data center for created pods, used only without a network volume.</summary>
         public string DataCenterId = "";
 
-        [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
+        /// <summary>Extra KEY=VALUE environment variables, one per line.</summary>
         public string PodEnv = "";
 
-        [ConfigComment("Only for a pod you created yourself (set in Pod ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let this backend create the pod with a token of its own. Hidden once saved.")]
+        /// <summary>SWARMUI_WORKER_TOKEN of a pod the user created, or blank to let this backend make one.</summary>
         [ValueIsSecret]
         public string WorkerToken = "";
     }
@@ -107,7 +95,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
             DataCenterId = config.DataCenterId?.Trim() ?? "",
             Env = config.PodEnv ?? "",
             WorkerToken = WorkerToken ?? "",
-            TerminateOnShutdown = config.TerminateOnShutdown
+            DeleteOnStop = config.DeleteOnStop
         });
     }
 

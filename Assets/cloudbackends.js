@@ -1,8 +1,10 @@
 /**
  * Enhances the "Cloud Backends" card on top of core's rendering, without replacing any core code:
- * - Groups the fields into one collapsible section per provider, with an Enabled toggle in each header.
- * - Turns GPU type, network volume, offer and similar fields into dropdowns filled from the user's own account
+ * - Groups the fields into one collapsible section per provider, with an Enabled toggle and a setup guide link in each
+ *   header, plain labels, and the rarely needed fields folded into an Advanced group.
+ * - Turns endpoint, GPU, network volume and similar fields into dropdowns filled from the user's own account
  *   (same id and data-name, so core's Edit and Save keep working). Without a key they stay text boxes.
+ * - Keeps a saved value that a dropdown doesn't list, and greys out or hides fields that don't apply.
  * - Adds Start/Stop and a status line to instance sections, and Discover, Validate and a worker list to serverless ones.
  * Core rebuilds cards on add, save and status polls, so a MutationObserver re-runs enhancement; it makes no DOM
  * writes on an already-enhanced card, so it cannot loop.
@@ -14,7 +16,7 @@ class CloudBackendsHelper {
         this.typeId = 'cloud_backends';
         /** Provider entries from CloudListProviders, or null until fetched. */
         this.providers = null;
-        /** Fetched account options per source id ('runpod:SECURE', 'runpod:COMMUNITY', 'vast'). */
+        /** Fetched account options per source id ('runpod:SECURE', 'runpod:COMMUNITY', 'vast', 'endpoints:RunPodServerless_', 'endpoints:VastAI_'). */
         this.accountOptions = {};
         /** Source ids with an options request in flight. */
         this.optionsPending = {};
@@ -25,14 +27,34 @@ class CloudBackendsHelper {
         /** Presentation details per provider prefix - everything else about a provider comes from the server. */
         this.presentation = {
             'RunPodPods_': {
-                article: 'a', noItemMessage: 'no pod yet - Start Pod will create one.', hasAllowedActions: true,
-                pickerField: 'RunPodPods_GpuTypeId', priceSource: 'runpod', priceListKey: 'gpus', priceField: 'price_per_hr', nameField: 'name'
+                article: 'a', noItemMessage: 'not created yet. Press Start Pod to create one.', hasAllowedActions: true,
+                pickerField: 'RunPodPods_GpuTypeId', priceSource: 'runpod', priceListKey: 'gpus', idField: 'id', priceField: 'price_per_hr', nameField: 'name'
             },
             'VastAIInstance_': {
-                article: 'an', noItemMessage: 'no instance yet - Start Instance will create one.', hasAllowedActions: false,
-                pickerField: 'VastAIInstance_OfferId', priceSource: 'vast', priceListKey: 'offers', priceField: 'dph_total', nameField: 'gpu_name'
+                article: 'an', noItemMessage: 'not created yet. Press Start Instance to create one.', hasAllowedActions: false,
+                pickerField: 'VastAIInstance_GpuName', priceSource: 'vast', priceListKey: 'gpus', idField: 'name', priceField: 'min_price', nameField: 'name'
             }
         };
+        /** Plain labels for settings, by name without the provider prefix. The saved field names don't change. */
+        this.labels = {
+            Enabled: 'Enabled', EndpointId: 'Endpoint', MaxWorkers: 'Max Workers', IdleSeconds: 'Idle Shutdown', StartupTimeoutSec: 'Startup Timeout',
+            PodId: 'Pod', InstanceId: 'Instance', WorkerToken: 'Worker Token', DeleteOnStop: 'Delete On Stop', ImageName: 'Image', Image: 'Image',
+            GpuTypeId: 'GPU', GpuName: 'GPU', ContainerDiskGb: 'Container Disk', DiskGb: 'Container Disk', NetworkVolumeId: 'Network Volume',
+            CloudType: 'Cloud', DataCenterId: 'Data Center', MaxRuntimeMinutes: 'Max Runtime', MaxSpendUsd: 'Max Spend',
+            TemplateId: 'Template', TemplateHashId: 'Template', GpuCount: 'GPU Count', VolumeGb: 'Pod Volume (GB)', VolumeMountPath: 'Volume Mount Path',
+            SwarmUIPort: 'SwarmUI Port', PodEnv: 'Environment Variables', Env: 'Environment Variables'
+        };
+        /**
+         * Fields that only matter when another field is set. 'hide' removes the row; 'dim' greys it out, for a field the
+         * other one overrides. 'whenSet' applies the rule while the other field has a value, otherwise while it is empty.
+         */
+        this.conditions = [
+            { field: 'RunPodPods_WorkerToken', on: 'RunPodPods_PodId', whenSet: false, effect: 'hide' },
+            { field: 'VastAIInstance_WorkerToken', on: 'VastAIInstance_InstanceId', whenSet: false, effect: 'hide' },
+            { field: 'RunPodPods_DataCenterId', on: 'RunPodPods_NetworkVolumeId', whenSet: true, effect: 'dim' },
+            { field: 'RunPodPods_ImageName', on: 'RunPodPods_TemplateId', whenSet: true, effect: 'dim' },
+            { field: 'VastAIInstance_Image', on: 'VastAIInstance_TemplateHashId', whenSet: true, effect: 'dim' }
+        ];
     }
 
     /** Called once at session ready: fetches the provider table, then hooks re-render points. Account options load when the Backends tab opens. */
@@ -45,10 +67,22 @@ class CloudBackendsHelper {
                 new MutationObserver(() => this.onListMutated()).observe(list, { childList: true, subtree: true });
             }
             let tabButton = document.getElementById('serverbackendstabbutton');
-            // A card switched to another RunPod cloud type needs that type's prices and availability.
             document.addEventListener('change', e => {
-                if (e.target?.dataset?.name == 'RunPodPods_CloudType') {
+                let name = e.target?.dataset?.name;
+                if (!name || !this.providers.some(p => name.startsWith(p.prefix))) {
+                    return;
+                }
+                // A card switched to another RunPod cloud type needs that type's prices and availability.
+                if (name == 'RunPodPods_CloudType') {
                     this.refreshAllOptions();
+                }
+                // A different endpoint has a different worker limit, and other fields show or hide with this one.
+                this.enhanceAllCards();
+            });
+            document.addEventListener('input', e => {
+                let name = e.target?.dataset?.name;
+                if (name && this.providers.some(p => name.startsWith(p.prefix))) {
+                    this.applyConditions(e.target.closest('.card-body'));
                 }
             });
             if (tabButton) {
@@ -72,6 +106,9 @@ class CloudBackendsHelper {
             this.refreshOptions(`runpod:${cloudType}`, 'CloudListRunPodOptions', { 'cloud_type': cloudType });
         }
         this.refreshOptions('vast', 'VastAIListInstanceOptions', {});
+        for (let prefix of ['RunPodServerless_', 'VastAI_']) {
+            this.refreshOptions(`endpoints:${prefix}`, 'CloudListEndpoints', { 'provider': prefix });
+        }
     }
 
     /** The fetched account options of one provider ('runpod' or 'vast') that apply to a card. */
@@ -131,10 +168,54 @@ class CloudBackendsHelper {
                 this.optionsRequested = true;
                 this.refreshAllOptions();
             }
-            this.applyDropdowns(cardBody, backend.id);
             if (!cardBody.classList.contains('cloudbackends-organized')) {
                 cardBody.classList.add('cloudbackends-organized');
+                this.keepSavedValues(cardBody, backend);
                 this.reorganizeCard(cardBody, backend.id);
+            }
+            this.applyDropdowns(cardBody, backend.id);
+            this.applyConditions(cardBody);
+        }
+    }
+
+    /**
+     * Core renders a dropdown whose saved value isn't one of its options with the first option selected, which the next
+     * Save would write back. Adds the saved value as its own entry instead, so nothing changes unless the user picks.
+     */
+    keepSavedValues(cardBody, backend) {
+        for (let select of cardBody.querySelectorAll('select[data-name]')) {
+            let saved = backend.settings?.[select.dataset.name];
+            if (saved == null || saved === '') {
+                continue;
+            }
+            let value = `${saved}`;
+            if (![...select.options].some(o => o.value == value)) {
+                let option = document.createElement('option');
+                option.value = value;
+                option.innerText = `${value} (saved value)`;
+                select.appendChild(option);
+            }
+            select.value = value;
+        }
+    }
+
+    /** Hides or greys out the fields listed in this.conditions, by the current value of the field each depends on. */
+    applyConditions(cardBody) {
+        if (!cardBody) {
+            return;
+        }
+        for (let rule of this.conditions) {
+            let target = cardBody.querySelector(`[data-name="${rule.field}"]`)?.closest('.auto-input');
+            let on = cardBody.querySelector(`[data-name="${rule.on}"]`);
+            if (!target || !on) {
+                continue;
+            }
+            let applies = (on.value || '').trim() != '' ? rule.whenSet : !rule.whenSet;
+            if (rule.effect == 'hide') {
+                target.style.display = applies ? 'none' : '';
+            }
+            else {
+                target.classList.toggle('cloudbackends-field-inactive', applies);
             }
         }
     }
@@ -167,36 +248,59 @@ class CloudBackendsHelper {
             choices['RunPodPods_DataCenterId'] = this.withBlank(runpod.data_centers, '(let RunPod choose)',
                 d => d.id,
                 d => d.name && d.name != d.id ? `${d.id} · ${d.name}` : d.id);
-            choices['RunPodPods_TemplateId'] = this.withBlank(runpod.templates, '(none, use an image)',
+            choices['RunPodPods_TemplateId'] = this.withBlank(runpod.templates, '(none, use the image)',
                 t => t.id,
                 t => t.image ? `${t.name || t.id} · ${t.image}` : (t.name || t.id));
-            choices['RunPodPods_PodId'] = this.withBlank(runpod.pods, '(create or reuse by name)',
+            choices['RunPodPods_PodId'] = this.withBlank(runpod.pods, '(create one for me)',
                 p => p.id,
                 p => `${p.name || p.id} · ${p.status || '?'}${p.gpu ? ' · ' + p.gpu : ''}`);
         }
         let vast = this.optionsFor('vast', backendId);
         if (vast) {
-            choices['VastAIInstance_OfferId'] = this.withBlank(vast.offers, '(cheapest available)',
-                o => o.id,
-                o => {
-                    let bits = [`${o.num_gpus || 1}x ${o.gpu_name || o.id}`];
-                    if (o.gpu_ram) {
-                        bits.push(`${o.gpu_ram}GB`);
+            choices['VastAIInstance_GpuName'] = this.withBlank(vast.gpus, '(cheapest available)',
+                g => g.name,
+                g => {
+                    let bits = [g.name];
+                    if (g.gpu_ram) {
+                        bits.push(`${g.gpu_ram}GB`);
                     }
-                    if (o.dph_total) {
-                        bits.push(`$${o.dph_total.toFixed(2)}/hr`);
+                    if (g.min_price) {
+                        bits.push(`from $${g.min_price.toFixed(2)}/hr`);
                     }
-                    if (o.geolocation) {
-                        bits.push(o.geolocation);
-                    }
-                    if (o.reliability) {
-                        bits.push(`${Math.round(o.reliability * 100)}% reliable`);
+                    if (g.offers) {
+                        bits.push(`${g.offers} available`);
                     }
                     return bits.join(' · ');
                 });
+            choices['VastAIInstance_InstanceId'] = this.withBlank(vast.instances, '(create one for me)',
+                i => i.id,
+                i => `${i.label || i.id} · ${i.status || '?'}${i.gpu ? ` · ${i.num_gpus || 1}x ${i.gpu}` : ''}`);
+            choices['VastAIInstance_TemplateHashId'] = this.withBlank(vast.templates, '(none, use the image)',
+                t => t.id,
+                t => t.image ? `${t.name || t.id} · ${t.image}` : (t.name || t.id));
             choices['VastAIInstance_NetworkVolumeId'] = this.withBlank(vast.network_volumes, '(no network volume)',
                 v => v.id,
                 v => `${v.name || v.id} · ${v.size_gb || '?'}GB`);
+        }
+        for (let prefix of ['RunPodServerless_', 'VastAI_']) {
+            let endpoints = this.accountOptions[`endpoints:${prefix}`]?.endpoints;
+            if (!endpoints) {
+                continue;
+            }
+            choices[`${prefix}EndpointId`] = this.withBlank(endpoints, '(pick an endpoint)',
+                e => e.id,
+                e => e.name && e.name != e.id ? `${e.name} · ${e.id}` : e.id);
+            // Offer only as many workers as the chosen endpoint allows.
+            let chosen = document.getElementById(`setting_${backendId}_${prefix}EndpointId`)?.value;
+            let max = endpoints.find(e => e.id == chosen)?.max_workers;
+            if (max > 0) {
+                let workers = { values: [], names: [] };
+                for (let i = 1; i <= Math.min(max, 20); i++) {
+                    workers.values.push(`${i}`);
+                    workers.names.push(i == max ? `${i} (the endpoint's max)` : `${i}`);
+                }
+                choices[`${prefix}MaxWorkers`] = workers;
+            }
         }
         return choices;
     }
@@ -221,7 +325,7 @@ class CloudBackendsHelper {
         for (let [field, choice] of Object.entries(choices)) {
             // Leave the field as-is when the account has nothing to offer, so it stays typeable
             // rather than becoming a dropdown whose only entry is "none".
-            if (!choice || choice.values.length <= 1) {
+            if (!choice || choice.values.filter(v => v != '').length == 0) {
                 continue;
             }
             let element = cardBody.querySelector(`#setting_${backendId}_${field}`);
@@ -272,17 +376,51 @@ class CloudBackendsHelper {
     showUnprefixedName(div, prefix) {
         let fullName = div.querySelector('[data-name]').dataset.name;
         let shortName = fullName.substring(prefix.length);
+        let label = this.labels[shortName] || shortName;
         for (let span of div.querySelectorAll('.auto-input-name .translate')) {
             if (span.dataset.pretranslated == fullName) {
-                span.dataset.pretranslated = shortName;
-                span.innerText = translate(shortName);
+                span.dataset.pretranslated = label;
+                span.innerText = translate(label);
             }
         }
         for (let bold of div.querySelectorAll('.sui-popover b')) {
             if (bold.innerText == fullName) {
-                bold.innerText = shortName;
+                bold.innerText = label;
             }
         }
+    }
+
+    /** Gives a text field a list of suggestions it still lets the user type past (used for the worker image). */
+    addSuggestions(div, items) {
+        let field = div.querySelector('[data-name]');
+        if (!field || !items?.length) {
+            return;
+        }
+        // Core renders text settings as a textarea, which can't take a suggestion list; a one-line input with the same id,
+        // data-name and value saves the same way.
+        let input = field;
+        if (field.tagName == 'TEXTAREA') {
+            input = document.createElement('input');
+            input.type = 'text';
+            input.id = field.id;
+            input.dataset.name = field.dataset.name;
+            input.className = 'auto-text cloudbackends-suggest-input';
+            input.placeholder = field.placeholder;
+            input.value = field.value;
+            input.disabled = field.disabled;
+            input.autocomplete = 'off';
+            field.replaceWith(input);
+        }
+        let list = document.createElement('datalist');
+        list.id = `${input.id}_suggestions`;
+        for (let item of items) {
+            let option = document.createElement('option');
+            option.value = item.image;
+            option.label = item.label;
+            list.appendChild(option);
+        }
+        input.setAttribute('list', list.id);
+        div.appendChild(list);
     }
 
     /**
@@ -311,6 +449,17 @@ class CloudBackendsHelper {
             title.innerText = provider.label;
             header.appendChild(caret);
             header.appendChild(title);
+            if (provider.guide_url) {
+                let guide = document.createElement('a');
+                guide.className = 'cloudbackends-guide-link';
+                guide.href = provider.guide_url;
+                guide.target = '_blank';
+                guide.rel = 'noopener noreferrer';
+                guide.innerText = 'Setup guide';
+                guide.title = `Step-by-step ${provider.label} setup, from a new account to generating`;
+                guide.addEventListener('click', e => e.stopPropagation());
+                header.appendChild(guide);
+            }
             let body = createDiv(null, 'cloudbackends-provider-body');
             body.style.display = 'none';
             if (toggleDiv) {
@@ -326,6 +475,8 @@ class CloudBackendsHelper {
                 headerToggle.addEventListener('change', () => { toggleInput.checked = headerToggle.checked; });
                 toggleInput.addEventListener('change', () => { headerToggle.checked = toggleInput.checked; });
                 header.appendChild(headerToggle);
+                // The header toggle replaces the row; the row stays in the page so Save still reads it.
+                toggleDiv.style.display = 'none';
             }
             let actions = createDiv(null, `cloudbackends-provider-actions cloudbackends-actions-${provider.prefix.slice(0, -1).toLowerCase()}`);
             let instanceControls = provider.is_instance ? this.setupInstanceActions(actions, backendId, provider) : this.setupServerlessActions(actions, backendId, provider);
@@ -346,8 +497,33 @@ class CloudBackendsHelper {
             // Anchor the section at the first matched field's original position BEFORE moving anything -
             // once a match is re-parented into `body` it is no longer in `cardBody` to anchor against.
             matches[0].before(section);
+            let advancedFields = provider.advanced_fields || [];
+            let advanced = createDiv(null, 'cloudbackends-advanced');
+            let advancedHeader = createDiv(null, 'cloudbackends-advanced-header');
+            advancedHeader.innerText = '▶ Advanced';
+            let advancedBody = createDiv(null, 'cloudbackends-advanced-body');
+            advancedBody.style.display = 'none';
+            advancedHeader.addEventListener('click', () => {
+                let opening = advancedBody.style.display == 'none';
+                advancedBody.style.display = opening ? 'block' : 'none';
+                advancedHeader.innerText = `${opening ? '▼' : '▶'} Advanced`;
+            });
+            advanced.appendChild(advancedHeader);
+            advanced.appendChild(advancedBody);
             for (let div of matches) {
-                body.appendChild(div);
+                let input = div.querySelector('[data-name]');
+                let name = input.dataset.name;
+                if (name.endsWith('_SwarmUIPort')) {
+                    input.min = 1;
+                    input.max = 65535;
+                }
+                if (name.endsWith('_ImageName') || name.endsWith('_Image')) {
+                    this.addSuggestions(div, provider.images);
+                }
+                (advancedFields.includes(name) ? advancedBody : body).appendChild(div);
+            }
+            if (advancedBody.children.length > 0) {
+                body.appendChild(advanced);
             }
             body.appendChild(actions);
         }
@@ -382,7 +558,7 @@ class CloudBackendsHelper {
         let itemLabel = provider.item_label || 'Instance';
         let pickedValue = pres ? document.getElementById(`setting_${backendId}_${pres.pickerField}`)?.value : null;
         let catalog = pres ? this.optionsFor(pres.priceSource, backendId)?.[pres.priceListKey] : null;
-        let match = pickedValue && catalog ? catalog.find(entry => entry.id == pickedValue) : null;
+        let match = pickedValue && catalog ? catalog.find(entry => entry[pres.idField] == pickedValue) : null;
         let price = match ? match[pres.priceField] : null;
         if (match && price) {
             return `This will start ${pres.article} ${itemLabel} on ${match[pres.nameField] || pickedValue} at roughly $${(+price).toFixed(2)}/hr.`;

@@ -42,7 +42,7 @@ In SwarmUI, open **User ▸ User Info ▸ API Keys**, paste the key into the **V
 
    ![Add new backend row with Show Advanced on and the Cloud Backends button highlighted](../images/swarmui/add-backend.png)
 
-2. Open the **Vast.ai Instances** section and turn on **Enabled**. With your API key saved, **OfferId** becomes a dropdown of machines you can rent right now, with prices.
+2. Turn on the switch in the **Vast.ai Instances** header and open the section. With your API key saved, **GPU** becomes a dropdown of the GPUs you can rent right now, with their lowest price.
 
    ![Vast.ai Instances section showing InstanceId, image, offer, disk and volume settings](../images/swarmui/vast-instances-card-1.png)
 
@@ -50,19 +50,21 @@ In SwarmUI, open **User ▸ User Info ▸ API Keys**, paste the key into the **V
 
    | Setting | Value |
    |---|---|
-   | InstanceId | Leave blank. The card then rents an instance for you, and finds it again next time. |
-   | Image | Leave the default (the Hartsy Vast.ai worker, pinned to a release). |
-   | OfferId | Leave on **(cheapest available)**, or pick a machine from the dropdown. |
-   | DiskGb | Room for the image plus any models it downloads. `30` or more. |
-   | TerminateOnShutdown | Off keeps the instance (stopped) when you stop it, so its disk and anything on it survive, but storage bills a little while stopped. On destroys it. |
-   | NetworkVolumeId | Optional: a Vast.ai volume you already created, holding your models (in a `Models` folder). It's mounted at `/workspace`. |
+   | Instance | Leave on **(create one for me)**. The card then rents an instance for you, and finds it again next time. |
+   | Delete On Stop | On (the default) destroys the instance when you stop it, so nothing bills. Off pauses it: its disk and anything on it survive, but storage keeps billing, and it can only resume once that machine's GPU is free again. |
+   | Image | Leave the default (the Hartsy Vast.ai worker with HartsyInference), or pick the ComfyUI version from the suggestions. |
+   | GPU | Leave on **(cheapest available)** (the cheapest single GPU with at least 16 GB of VRAM), or pick a GPU. Start rents the cheapest machine with it at that moment. |
+   | Container Disk | Room for the image plus any models it downloads. `30 GB` or more. |
+   | Network Volume | Optional: a Vast.ai volume you already created, holding your models (in a `Models` folder). It's mounted at `/workspace`. |
 
-4. Set the failsafes, so an instance you forgot about stops by itself:
+4. Check the failsafes, so an instance you forgot about stops by itself:
 
    | Setting | Value |
    |---|---|
-   | MaxRuntimeMinutes | Stop the instance after this many minutes running. `0` turns it off. |
-   | MaxSpendUsd | Stop the instance once it has cost about this many dollars. `0` turns it off. |
+   | Max Runtime | Stop the instance after it has run this long. `4 hours` by default; **Off** turns it off. |
+   | Max Spend | Stop the instance once it has cost about this much. `$10` by default; **Off** turns it off. |
+
+   **Advanced** holds settings only a custom setup needs: a Vast.ai template, the volume mount path, the SwarmUI port, extra environment variables, and the startup timeout.
 
 5. Press **Save** at the top of the card. Saving never rents anything.
 
@@ -72,7 +74,7 @@ Press **Start Instance** at the bottom of the section. SwarmUI shows the price p
 
 ![Bottom of the Vast.ai Instances section, with the failsafe settings and the Start Instance and Stop Instance buttons](../images/swarmui/vast-instances-card-2.png)
 
-Without an OfferId, the card rents the cheapest matching machine that has enough open ports. If a machine it rented never becomes reachable, the card destroys it and rents a different one (up to 3 tries).
+The card rents the cheapest machine with your GPU that has enough open ports. If a machine it rented never becomes reachable, the card destroys it and rents a different one (up to 3 tries).
 
 The connection is encrypted and checked against Vast.ai's own certificate, and the card gives the instance a private access token, so nobody else can use it.
 
@@ -90,7 +92,7 @@ You can also see and stop your instances on Vast.ai under **Instances**.
 
 ## Using an instance you made yourself
 
-Set **InstanceId** to its ID. It must run the Hartsy Vast.ai worker image (`kalebbroo/swarmui-worker-vast`) in entrypoint mode, expose port `7801`, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **WorkerToken** on the card. Letting the card rent the instance is simpler, because it handles all of that.
+Pick it under **Instance**. It must run the Hartsy Vast.ai worker image (`kalebbroo/swarmui-worker-vast`) in entrypoint mode, expose port `7801`, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **Worker Token**, which shows once an instance is picked. Stop Instance only pauses an instance you made yourself, whatever **Delete On Stop** says. Letting the card rent the instance is simpler, because it handles all of that.
 
 ## What it costs
 
@@ -104,8 +106,8 @@ Set **InstanceId** to its ID. It must run the Hartsy Vast.ai worker image (`kale
 
 | Problem | What to do |
 |---|---|
-| OfferId stays a plain text box | Save your Vast.ai API key (Step 3), then reopen the section. |
-| Start fails because the offer is gone | Someone else rented that machine. Pick another, or use **(cheapest available)**. |
-| The instance starts but never connects | The card retries on another machine. If it keeps failing, raise **StartupTimeoutSec**, and check the instance's logs on Vast.ai. |
+| GPU stays a plain text box | Save your Vast.ai API key (Step 3), then reopen the section. |
+| Start says no machine with your GPU is available | Every machine with it is rented right now. Pick another GPU, or use **(cheapest available)**. |
+| The instance starts but never connects | The card retries on another machine. If it keeps failing, raise **Startup Timeout** (under **Advanced**), and check the instance's logs on Vast.ai. |
 
 More fixes are in the [README's troubleshooting section](../../README.md#troubleshooting).

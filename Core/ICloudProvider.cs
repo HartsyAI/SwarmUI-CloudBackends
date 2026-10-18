@@ -71,6 +71,12 @@ public interface ICloudProvider : IDisposable
     Task<JArray> CheckEndpointAsync(LeaseRequest request, int maxWorkers, CancellationToken cancel) => Task.FromResult(new JArray());
 
     /// <summary>
+    /// The account's serverless endpoints, for the card's endpoint dropdown: each <c>{ "id", "name", "image", "max_workers" }</c>,
+    /// where <c>id</c> is the value the EndpointId setting takes. Needs only the API key, not an endpoint.
+    /// </summary>
+    Task<JArray> ListEndpointsAsync(CancellationToken cancel) => Task.FromResult(new JArray());
+
+    /// <summary>
     /// The URL this extension should use to reach a leased worker's gateway. Usually <see cref="CloudWorkerInfo.PublicUrl"/>;
     /// Vast.ai returns a loopback relay that verifies Vast's own certificate authority.
     /// </summary>

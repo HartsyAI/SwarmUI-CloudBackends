@@ -52,7 +52,7 @@ When you pick the volume's data center, check that it has the GPU you want: pods
 
    ![Add new backend row with Show Advanced on and the Cloud Backends button highlighted](../images/swarmui/add-backend.png)
 
-2. Open the **RunPod GPU Pods** section and turn on **Enabled**. With your API key saved, the GPU type, network volume, data center and template boxes turn into dropdowns filled from your account, with live prices.
+2. Turn on the switch in the **RunPod GPU Pods** header and open the section. With your API key saved, the pod, GPU, network volume, data center and template boxes turn into dropdowns filled from your account, with live prices.
 
    ![RunPod GPU Pods section showing PodId, image, GPU type, network volume and other settings](../images/swarmui/runpod-pods-card-1.png)
 
@@ -60,20 +60,22 @@ When you pick the volume's data center, check that it has the GPU you want: pods
 
    | Setting | Value |
    |---|---|
-   | PodId | Leave on **(create or reuse by name)**. The card then creates a pod for you, and finds it again next time. |
-   | ImageName | Leave the default (the Hartsy RunPod worker, pinned to a release). |
-   | GpuTypeId | The GPU to rent. **(cheapest available)** takes the cheapest one that's free. 16 GB of VRAM or more; 24 GB for large models like Flux. |
-   | NetworkVolumeId | Your volume from Step 4. |
-   | ContainerDiskGb | `30` for the default ComfyUI image. |
-   | CloudType | **Secure Cloud** is more reliable; **Community Cloud** is cheaper. |
-   | TerminateOnShutdown | Off keeps the pod (stopped) when you stop it, so it starts faster next time but its disk bills a little while stopped. On deletes it, which is fine when everything worth keeping is on the network volume. |
+   | Pod | Leave on **(create one for me)**. The card then creates a pod for you, and finds it again next time. |
+   | Delete On Stop | Leave on. Stop Pod then deletes the pod the card created, and the next Start makes a fresh one; your models stay on the network volume. Off only pauses it, but RunPod clears a paused pod's disk anyway, and a paused pod can come back without a GPU. |
+   | Image | Leave the default (the Hartsy RunPod worker with ComfyUI), or pick the HartsyInference version from the suggestions. |
+   | GPU | The GPU to rent. **(cheapest available)** takes the cheapest one that's free. 16 GB of VRAM or more; 24 GB for large models like Flux. |
+   | Container Disk | `30 GB` or more for the ComfyUI image (`50 GB` is the default). |
+   | Network Volume | Your volume from Step 4. The pod is created in its data center, so **Data Center** greys out. |
+   | Cloud | **Secure Cloud** is more reliable; **Community Cloud** is cheaper. |
 
-4. Set the failsafes, so a pod you forgot about stops by itself:
+4. Check the failsafes, so a pod you forgot about stops by itself:
 
    | Setting | Value |
    |---|---|
-   | MaxRuntimeMinutes | Stop the pod after this many minutes running. `0` turns it off. |
-   | MaxSpendUsd | Stop the pod once it has cost about this many dollars. `0` turns it off. |
+   | Max Runtime | Stop the pod after it has run this long. `4 hours` by default; **Off** turns it off. |
+   | Max Spend | Stop the pod once it has cost about this much. `$10` by default; **Off** turns it off. |
+
+   **Advanced** holds settings only a custom setup needs: a RunPod template, GPU count, a pod volume, the volume mount path, the SwarmUI port, extra environment variables, and the startup timeout.
 
 5. Press **Save** at the top of the card. Saving never starts a pod.
 
@@ -99,7 +101,7 @@ You can also see and stop your pods in the RunPod console under **Pods**.
 
 ## Using a pod you made yourself
 
-Set **PodId** to that pod's ID. The pod must run the Hartsy RunPod worker image (`kalebbroo/swarmui-worker-runpod`), expose port `7801` as HTTP, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **WorkerToken** on the card. Letting the card create the pod is simpler, because it handles all of that.
+Pick that pod under **Pod**. The pod must run the Hartsy RunPod worker image (`kalebbroo/swarmui-worker-runpod`), expose port `7801` as HTTP, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **Worker Token**, which shows once a pod is picked. Stop Pod only pauses a pod you made yourself, whatever **Delete On Stop** says. Letting the card create the pod is simpler, because it handles all of that.
 
 ## What it costs
 
@@ -115,7 +117,7 @@ Set **PodId** to that pod's ID. The pod must run the Hartsy RunPod worker image 
 |---|---|
 | The dropdowns stay as plain text boxes | Save your RunPod API key (Step 3), then reopen the section. |
 | Start fails because no GPU is available | The GPU you chose is out of stock in that data center. Pick another GPU type, or **(cheapest available)**. |
-| The pod starts but never connects | Check the status line and the pod's logs in the RunPod console. Raise **StartupTimeoutSec** if it's still downloading the image. |
-| Models are missing | Check they're under `Models/...` on the network volume, and that the volume is attached (**NetworkVolumeId**). |
+| The pod starts but never connects | Check the status line and the pod's logs in the RunPod console. Raise **Startup Timeout** (under **Advanced**) if it's still downloading the image. |
+| Models are missing | Check they're under `Models/...` on the network volume, and that the volume is attached (**Network Volume**). |
 
 More fixes are in the [README's troubleshooting section](../../README.md#troubleshooting).

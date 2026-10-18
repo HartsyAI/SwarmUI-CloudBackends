@@ -457,3 +457,58 @@ public class HttpRetryRuleTests
         Assert.That(CloudApiClient.ValidationErrors(problem), Is.EqualTo("value *** rejected; env: bad"));
     }
 }
+
+[TestFixture]
+public class SettingsDerivationTests
+{
+    [Test]
+    public void LeaseEndsBeforeTheEndpointTimeout()
+    {
+        Assert.That(RunPodServerlessProvider.LeaseSecondsFor(0, 3600), Is.EqualTo(3600));
+        Assert.That(RunPodServerlessProvider.LeaseSecondsFor(7200, 3600), Is.EqualTo(3600));
+        Assert.That(RunPodServerlessProvider.LeaseSecondsFor(1800, 3600), Is.EqualTo(1500));
+        Assert.That(RunPodServerlessProvider.LeaseSecondsFor(200, 3600), Is.EqualTo(60));
+    }
+
+    [Test]
+    public void GroupsVastOffersByGpuWithLowestPrice()
+    {
+        JArray offers =
+        [
+            new JObject { ["gpu_name"] = "RTX 3090", ["gpu_ram"] = 24576.0, ["dph_total"] = 0.20 },
+            new JObject { ["gpu_name"] = "RTX 4090", ["gpu_ram"] = 24564.0, ["dph_total"] = 0.31 },
+            new JObject { ["gpu_name"] = "RTX 3090", ["gpu_ram"] = 24576.0, ["dph_total"] = 0.25 },
+            new JObject { ["gpu_name"] = null, ["dph_total"] = 0.01 }
+        ];
+        JArray gpus = VastAIInstanceProvider.GroupOffersByGpu(offers);
+        Assert.That(gpus.Count, Is.EqualTo(2));
+        Assert.That(gpus[0]["name"]?.ToString(), Is.EqualTo("RTX 3090"));
+        Assert.That((double)gpus[0]["min_price"], Is.EqualTo(0.20));
+        Assert.That((int)gpus[0]["offers"], Is.EqualTo(2));
+        Assert.That((double)gpus[0]["gpu_ram"], Is.EqualTo(25));
+    }
+
+    [Test]
+    public void DetectsAPodResumedWithoutAGpu()
+    {
+        Assert.That(RunPodPodsProvider.IsRunningWithoutGpu(new JObject { ["gpu"] = new JObject { ["id"] = "NVIDIA RTX A5000", ["count"] = 0 } }), Is.True);
+        Assert.That(RunPodPodsProvider.IsRunningWithoutGpu(new JObject { ["gpu"] = new JObject { ["id"] = "NVIDIA RTX A5000", ["count"] = 1 } }), Is.False);
+        Assert.That(RunPodPodsProvider.IsRunningWithoutGpu(new JObject { ["gpu"] = null }), Is.False);
+        Assert.That(RunPodPodsProvider.IsRunningWithoutGpu(new JObject()), Is.False);
+    }
+
+    [Test]
+    public void ChildMachineNamesStartBlankSoTheCardSetsThem()
+    {
+        // The card gives each user's child a unique name; a non-blank default would let users share one machine.
+        Assert.That(new RunPodPodsBackend.Settings().PodName, Is.Empty);
+        Assert.That(new VastAIInstanceBackend.Settings().Label, Is.Empty);
+    }
+
+    [Test]
+    public void AdvancedFieldsAreRealSettings()
+    {
+        HashSet<string> fields = [.. typeof(CloudBackendsBackend.Settings).GetFields().Select(f => f.Name)];
+        Assert.That(CloudBackendsBackend.AdvancedFields.Where(f => !fields.Contains(f)), Is.Empty);
+    }
+}

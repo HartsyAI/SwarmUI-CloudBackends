@@ -153,7 +153,7 @@ The easiest way to fill it is a short-lived pod that has the volume attached.
    | Active workers | `0` | Anything above 0 keeps workers running, and billing, all the time. |
    | Idle timeout | `5` sec (the default) | The worker already waits for its own idle time before it lets go. |
    | Enable FlashBoot | On | Faster cold starts, at no extra cost. |
-   | Enable execution timeout | On, `4200` sec | Must be longer than **Max Lease Seconds** on the SwarmUI card (3600 by default). |
+   | Enable execution timeout | On, `4200` sec | Each worker lease ends 5 minutes before this, up to an hour. Shorter works, but a busy worker is handed back and leased again more often. |
 
    ![Advanced settings with Active workers 0, Idle timeout 5, FlashBoot on and Execution timeout 4200](../images/runpod/endpoint-advanced.png)
 
@@ -180,16 +180,15 @@ Open the new endpoint. Its **Endpoint ID** is shown on the **Overview** tab (it'
 
    ![Add new backend row with Show Advanced on and the Cloud Backends button highlighted](../images/swarmui/add-backend.png)
 
-2. The new card opens ready to edit. Open the **RunPod Serverless** section and set:
+2. The new card opens ready to edit. Turn on the switch in the **RunPod Serverless** header, open the section, and set:
 
    | Setting | Value |
    |---|---|
-   | Enabled | On |
-   | EndpointId | The endpoint ID from Step 7 |
-   | MaxWorkers | How many workers SwarmUI may run at once. `1` means never more than one. At most the endpoint's Max workers. |
-   | IdleSeconds | How long a worker waits with nothing to do before it shuts down. Lower costs less; higher avoids waiting for a cold start between bursts. `120` is a good default. |
-   | MaxLeaseSeconds | Leave at `3600`. Must stay below the endpoint's execution timeout. |
-   | StartupTimeoutSec | Leave at `800`. |
+   | Endpoint | Your endpoint from Step 7. With your API key saved, it's a dropdown of your endpoints; otherwise paste the endpoint ID. |
+   | Max Workers | How many workers SwarmUI may run at once. `1` means never more than one. The list stops at the endpoint's own Max workers. |
+   | Idle Shutdown | How long a worker waits with nothing to do before it shuts down. Shorter costs less; longer avoids waiting for a cold start between bursts. `2 minutes` is a good default. |
+
+   Each worker lease ends 5 minutes before the endpoint's execution timeout, up to an hour, so there is nothing to set for it. **Advanced** holds **Startup Timeout**, which you only need to raise if a new image takes longer than 15 minutes to start. The **Setup guide** link in the section header opens this guide.
 
 3. Press **Save** at the top of the card. To change settings later, press **✎** on the card, edit, and press **Save** again.
 
@@ -212,8 +211,8 @@ Then generate as usual. What to expect:
 
 - **The first generation waits for a worker to start.** That's from under a minute up to a few minutes, the first time an image is pulled onto a machine. Later generations go straight to the running worker.
 - **The Workers line** in the section shows each running worker, with a **Stop** button.
-- **After IdleSeconds with no generation, the worker shuts down** and billing stops. The next generation starts one again.
-- **When you're busy, more workers start**, up to MaxWorkers.
+- **After the Idle Shutdown time with no generation, the worker shuts down** and billing stops. The next generation starts one again.
+- **When you're busy, more workers start**, up to Max Workers.
 
 ## What it costs
 
