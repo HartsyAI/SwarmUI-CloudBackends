@@ -327,8 +327,9 @@ public class CloudBackendsBackend : AbstractT2IBackend
                 await RemoveChild(existing.BackendData.ID, key);
             }
             AutoConfiguration settings = BuildChildSettings(def);
-            // A name unique to this backend and user, so each user's find-by-name reattaches only their own machine.
-            string uniqueName = $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
+            // A name unique to this backend and user, so each user's find-by-name reattaches only their own machine. The local
+            // user keeps the original name, so a machine created before per-user names is still found instead of rented again.
+            string uniqueName = user.UserID == SessionHandler.LocalUserID ? $"swarmui-cloudbackends-{BackendData.ID}" : $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
             if (settings is RunPodPodsBackend.Settings pods && string.IsNullOrWhiteSpace(pods.PodName))
             {
                 pods.PodName = uniqueName;
