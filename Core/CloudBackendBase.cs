@@ -82,26 +82,27 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     // ── Config ────────────────────────────────────────────────────────────────
 
     /// <summary>Settings every serverless provider shares.</summary>
+    /// <summary>Settings copied in from the card's section; the card's <see cref="CloudBackendsBackend.Settings"/> documents them.</summary>
     public class BaseSettings : AutoConfiguration
     {
-        [ConfigComment("Cloud endpoint identifier (RunPod endpoint ID, or Vast.ai endpoint name).")]
+        /// <summary>RunPod endpoint ID, or Vast.ai endpoint name.</summary>
         public string EndpointId = "";
 
-        [ConfigComment("Most workers this backend may run at once. When every running worker is busy, another one is started, up to this many.")]
+        /// <summary>Most workers this backend may run at once.</summary>
         public int MaxWorkers = 1;
 
-        [ConfigComment("How long a worker may sit with no generation before it shuts down, in seconds.")]
+        /// <summary>Seconds a worker may sit with no generation before it is released.</summary>
         public int IdleSeconds = 120;
 
-        [ConfigComment("Longest a single worker lease may last, in seconds (RunPod only; the endpoint's execution timeout must be longer).")]
-        public int MaxLeaseSeconds = 3600;
-
-        [ConfigComment("How long to wait for a worker to start and answer, in seconds.")]
-        public int StartupTimeoutSec = 800;
-
-        [ConfigComment("How often to poll while waiting for a worker, in milliseconds.")]
-        public int PollIntervalMs = 2000;
+        /// <summary>Seconds to wait for a worker to start and answer.</summary>
+        public int StartupTimeoutSec = 900;
     }
+
+    /// <summary>Longest a single lease may last, in seconds. RunPod shortens it to fit the endpoint's execution timeout.</summary>
+    public const int MaxLeaseSeconds = 3600;
+
+    /// <summary>How often to poll while waiting for a worker, in milliseconds.</summary>
+    public const int PollIntervalMs = 2000;
 
     /// <summary>Returns the subclass's settings cast to <see cref="BaseSettings"/>.</summary>
     public abstract BaseSettings BaseConfig { get; }
@@ -117,9 +118,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             IdleSeconds = Math.Clamp(BaseConfig.IdleSeconds, 5, 3600),
             // The worker must wait long enough for this side to attach and for its own backend to load.
             StartupGraceSeconds = Math.Clamp(BaseConfig.StartupTimeoutSec, 60, 3600),
-            MaxLeaseSeconds = Math.Max(60, BaseConfig.MaxLeaseSeconds),
+            MaxLeaseSeconds = MaxLeaseSeconds,
             StartupTimeoutSec = Math.Max(30, BaseConfig.StartupTimeoutSec),
-            PollIntervalMs = Math.Clamp(BaseConfig.PollIntervalMs, 250, 15000)
+            PollIntervalMs = PollIntervalMs
         };
     }
 

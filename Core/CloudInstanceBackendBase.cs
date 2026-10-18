@@ -56,20 +56,21 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     }
 
     /// <summary>Settings every instance-renting provider shares.</summary>
+    /// <summary>Settings shared by instance sections, copied in from the card; the card's <see cref="CloudBackendsBackend.Settings"/> documents them.</summary>
     public class InstanceSettings : AutoConfiguration
     {
-        [ConfigComment("How long to wait for the instance to boot and for SwarmUI on it to answer, in seconds.\nA cold start that installs SwarmUI can take many minutes.")]
+        /// <summary>Seconds to wait for the instance to boot and for SwarmUI on it to answer.</summary>
         public int StartupTimeoutSec = 900;
 
-        [ConfigComment("How often to poll the provider while waiting for the instance to start, in milliseconds.")]
-        public int PollIntervalMs = 5000;
-
-        [ConfigComment("Failsafe: auto-stop the instance after it has been running this many minutes, in case you forgot to turn it off. Zero disables this check.")]
+        /// <summary>Failsafe: stop after this many minutes running. Zero disables it.</summary>
         public int MaxRuntimeMinutes = 0;
 
-        [ConfigComment("Failsafe: auto-stop the instance once its estimated spend reaches this many US dollars.\nEstimated as (the provider's own reported hourly rate) x (time running) - not exact billing, and only checked for providers that report a rate (see GetCostPerHourAsync). Zero disables this check.")]
+        /// <summary>Failsafe: stop once the estimated spend (the provider's hourly rate times time running) reaches this many US dollars. Zero disables it.</summary>
         public double MaxSpendUsd = 0;
     }
+
+    /// <summary>How often to poll the provider while an instance starts, in milliseconds.</summary>
+    const int PollIntervalMs = 5000;
 
     /// <summary>Returns the subclass's settings cast to <see cref="InstanceSettings"/>.</summary>
     public abstract InstanceSettings InstanceConfig { get; }
@@ -373,7 +374,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             InstanceStartedAt = DateTime.UtcNow;
             try
             {
-                CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, InstanceConfig.PollIntervalMs, cancel.Token);
+                CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, PollIntervalMs, cancel.Token);
             }
             catch (Exception)
             {

@@ -21,6 +21,13 @@ public static class CloudBackendTypes
     /// <summary>Default worker image for Vast.ai instances: the Hartsy Vast.ai worker, pinned to the release this version was tested with.</summary>
     public const string DefaultVastImage = "kalebbroo/swarmui-worker-vast:1.0.0-hartsyinference";
 
+    /// <summary>The Hartsy worker images the card suggests for each instance section's image field.</summary>
+    public static readonly Dictionary<string, (string Image, string Label)[]> WorkerImages = new()
+    {
+        ["RunPodPods_"] = [(DefaultRunPodImage, "Hartsy worker, ComfyUI"), ("kalebbroo/swarmui-worker-runpod:2.0.0-hartsyinference", "Hartsy worker, HartsyInference (needs a CUDA 13 GPU host)")],
+        ["VastAIInstance_"] = [(DefaultVastImage, "Hartsy worker, HartsyInference (needs a CUDA 13 GPU host)"), ("kalebbroo/swarmui-worker-vast:1.0.0-comfyui", "Hartsy worker, ComfyUI")]
+    };
+
     /// <summary>True for worker images whose backend needs a CUDA 13 driver: HartsyInference's GPU kernels are PTX 9.0.</summary>
     public static bool NeedsCuda13(string image)
     {

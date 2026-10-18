@@ -34,6 +34,8 @@ public static class CloudBackendsWebAPI
         API.RegisterAPICall(CloudListOrphans, false, CloudBackends.PermCloudStatus);
         API.RegisterAPICall(CloudStopOrphan, true, CloudBackends.PermCloudStatus);
         API.RegisterAPICall(VastAIListInstanceOptions, false, CloudBackends.PermUseVastAIInstances);
+        // Gated per provider inside, by that provider's serverless permission.
+        API.RegisterAPICall(CloudListEndpoints, false, Permissions.ViewBackendsList);
     }
 
     /// <summary>True if the session's user may act on this backend (each provider defines its own permission).</summary>
@@ -161,7 +163,7 @@ public static class CloudBackendsWebAPI
             CloudInstanceStatus status = await backend.Provider.GetStatusAsync(force_refresh);
             if (status is null)
             {
-                return new JObject { ["has_instance"] = false, ["message"] = string.IsNullOrWhiteSpace(backend.Provider.ActiveInstanceId) ? "No instance yet: Start creates one." : $"Instance '{backend.Provider.ActiveInstanceId}' was not found on the provider. Start creates a new one." };
+                return new JObject { ["has_instance"] = false, ["message"] = string.IsNullOrWhiteSpace(backend.Provider.ActiveInstanceId) ? "Not created yet. Press Start to create one." : $"'{backend.Provider.ActiveInstanceId}' was not found on {backend.Provider.ProviderName}. Press Start to create a new one." };
             }
             return new JObject
             {
@@ -402,7 +404,7 @@ public static class CloudBackendsWebAPI
             "cloud": "SECURE",
             "gpus": [{"id": "...", "name": "...", "memory_gb": 24, "price_per_hr": 0.44, "max_count": 8, "availability": "HIGH", "data_centers": ["..."]}],
             "network_volumes": [{"id": "...", "name": "...", "size_gb": 100, "data_center": "..."}],
-            "templates": [{"id": "...", "name": "...", "image": "..."}],
+            "templates": [{"id": "...", "name": "...", "image": "..."}], // pod templates only
             "data_centers": [{"id": "...", "name": "..."}],
             "pods": [{"id": "...", "name": "...", "status": "...", "gpu": "...", "cost_per_hr": 0.44}]
         """)]
@@ -419,10 +421,12 @@ public static class CloudBackendsWebAPI
         return await provider.ListAccountOptionsAsync(cloud);
     }
 
-    [API.APIDescription("Lists what the user's Vast.ai account can actually rent right now: on-demand offers (GPU, price, location) and the account's own network volumes. Same purpose as CloudListRunPodOptions.",
+    [API.APIDescription("Lists what the user's Vast.ai account can use right now: the GPU models on offer (single-GPU on-demand machines) with their lowest price, and the account's own instances, templates and network volumes. Same purpose as CloudListRunPodOptions.",
         """
-            "offers": [{"id": "...", "gpu_name": "RTX 4090", "num_gpus": 1, "gpu_ram": 24, "disk_space": 100, "geolocation": "US", "reliability": 0.99, "dph_total": 0.31}],
-            "network_volumes": [{"id": "...", "name": "...", "size_gb": 100}]
+            "gpus": [{"name": "RTX 4090", "gpu_ram": 24, "min_price": 0.31, "offers": 42}],
+            "network_volumes": [{"id": "...", "name": "...", "size_gb": 100}],
+            "instances": [{"id": "...", "label": "...", "status": "running", "gpu": "RTX 4090", "num_gpus": 1}],
+            "templates": [{"id": "<template hash>", "name": "...", "image": "..."}]
         """)]
     public static async Task<JObject> VastAIListInstanceOptions(Session session)
     {
@@ -435,7 +439,37 @@ public static class CloudBackendsWebAPI
         return await provider.ListAccountOptionsAsync();
     }
 
-    [API.APIDescription("Lists the cloud providers this extension supports, with their settings prefixes and (for instance-renting providers) their start/stop/status route names - so a UI can build its provider table from the server instead of hardcoding it.",
+    [API.APIDescription("Lists the user's serverless endpoints on one provider, for the card's endpoint dropdown. 'id' is the value the EndpointId setting takes (the endpoint ID on RunPod, the endpoint name on Vast.ai).",
+        """
+            "endpoints": [{"id": "...", "name": "...", "image": "...", "max_workers": 3}]
+        """)]
+    public static async Task<JObject> CloudListEndpoints(Session session,
+        [API.APIParameter("The serverless provider's settings prefix: 'RunPodServerless_' or 'VastAI_'.")] string provider)
+    {
+        (string keyType, string keyName, PermInfo perm) = provider switch
+        {
+            "RunPodServerless_" => ("runpod_api", "RunPod", CloudBackends.PermUseRunPodServerless),
+            "VastAI_" => ("vastai_api", "Vast.ai", CloudBackends.PermUseVastAI),
+            _ => (null, null, null)
+        };
+        if (keyType is null)
+        {
+            return Error($"Unknown serverless provider '{provider}'.", "unknown_provider");
+        }
+        if (!session.User.HasPermission(perm))
+        {
+            return Error($"You do not have permission to use {keyName} serverless backends.", "no_permission");
+        }
+        string key = session.User.GetGenericData(keyType, "key")?.Trim();
+        if (string.IsNullOrEmpty(key))
+        {
+            return Error($"No {keyName} API key set. Add one in User Settings, API Keys, {keyName}, then reopen this form.", "no_api_key");
+        }
+        using ICloudProvider cloud = provider == "VastAI_" ? new VastAIProvider(key, "") : new RunPodServerlessProvider(key, "");
+        return new JObject { ["endpoints"] = await cloud.ListEndpointsAsync(Program.GlobalProgramCancel) };
+    }
+
+    [API.APIDescription("Lists the cloud providers this extension supports, with their settings prefixes, setup guide links, which settings belong in the card's Advanced group, and (for instance-renting providers) their start/stop/status route names - so a UI can build its provider table from the server instead of hardcoding it.",
         """
             "providers":
             [
@@ -444,6 +478,9 @@ public static class CloudBackendsWebAPI
                     "label": "RunPod GPU Pods",
                     "key_type": "runpod_api",
                     "is_instance": true,
+                    "guide_url": "https://github.com/HartsyAI/SwarmUI-CloudBackends/blob/main/docs/setup/runpod-pods.md",
+                    "advanced_fields": ["RunPodPods_TemplateId", "..."],
+                    "images": [{"image": "kalebbroo/swarmui-worker-runpod:2.0.0-comfyui", "label": "Hartsy worker, ComfyUI"}], // only for instance providers
                     "item_label": "Pod", // only for instance providers
                     "start_call": "CloudStartPod",
                     "start_call_ws": "CloudStartPodWS",
@@ -462,8 +499,14 @@ public static class CloudBackendsWebAPI
                 ["prefix"] = def.Prefix,
                 ["label"] = def.Label,
                 ["key_type"] = def.KeyType,
-                ["is_instance"] = def.IsInstance
+                ["is_instance"] = def.IsInstance,
+                ["guide_url"] = CloudBackendsBackend.GuideBaseUrl + def.Guide,
+                ["advanced_fields"] = new JArray(CloudBackendsBackend.AdvancedFields.Where(f => f.StartsWith(def.Prefix)))
             };
+            if (CloudBackendTypes.WorkerImages.TryGetValue(def.Prefix, out (string Image, string Label)[] images))
+            {
+                entry["images"] = new JArray(images.Select(i => new JObject { ["image"] = i.Image, ["label"] = i.Label }));
+            }
             if (def.Prefix == "RunPodPods_")
             {
                 entry["item_label"] = "Pod";

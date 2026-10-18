@@ -405,6 +405,23 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         return await ReadJsonAsync(response, "route");
     }
 
+    /// <inheritdoc/>
+    public async Task<JArray> ListEndpointsAsync(CancellationToken cancel)
+    {
+        JToken result = await ConsoleApiAsync(HttpMethod.Get, "/api/v0/endptjobs/", cancel);
+        JArray endpoints = [];
+        // Only the fields the dropdown needs: each entry also carries the endpoint's own API key.
+        foreach (JObject endpoint in (result?["results"] as JArray ?? result as JArray ?? []).OfType<JObject>())
+        {
+            string name = endpoint["endpoint_name"]?.ToString();
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                endpoints.Add(new JObject { ["id"] = name, ["name"] = name, ["max_workers"] = (int?)endpoint["max_workers"] });
+            }
+        }
+        return endpoints;
+    }
+
     /// <summary>Finds this backend's endpoint in the account's endpoint list.</summary>
     async Task<JObject> FindEndpointAsync(CancellationToken cancel)
     {

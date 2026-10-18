@@ -17,48 +17,43 @@ namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
 /// </summary>
 public class VastAIInstanceBackend : CloudInstanceBackendBase
 {
+    /// <summary>Settings copied in from the card's Vast.ai Instances section; the card's <see cref="CloudBackendsBackend.Settings"/> documents them.</summary>
     public class Settings : InstanceSettings
     {
-        [SuggestionPlaceholder(Text = "leave blank to create one")]
-        [ConfigComment("Existing Vast.ai instance ID to use.\nLeave blank to have Swarm find an instance by label, or create one.")]
+        /// <summary>Existing instance to use, or blank to find or create one by <see cref="Label"/>.</summary>
         public string InstanceId = "";
 
-        [ConfigComment("Port SwarmUI listens on inside the instance.\nDeclared to Vast as a Docker '-p' flag, so the instance's own SwarmUI must actually bind this port.")]
+        /// <summary>Port SwarmUI listens on inside the instance.</summary>
         public int SwarmUIPort = 7801;
 
-        [ConfigComment("Destroy the instance when this backend shuts down, instead of just stopping it.\nStopping keeps the container disk (and keeps billing for that storage) so the instance can resume quickly.\nDestroying deletes it, which is only sensible when a network volume holds everything worth keeping.")]
-        public bool TerminateOnShutdown = false;
+        /// <summary>Stop destroys the instance instead of pausing it.</summary>
+        public bool DeleteOnStop = true;
 
-        [SuggestionPlaceholder(Text = "blank = a label unique to this backend")]
-        [ConfigComment("Label given to instances this backend creates, and used to find that instance again later.\nLeave blank to use a label unique to this backend (recommended) - a shared literal label across two or more Cloud Backends instances would make each backend's find-by-label step liable to attach to the other's instance instead of creating its own.")]
+        /// <summary>Label for created instances, used to find the instance again. Set by the card, unique per backend and user.</summary>
         public string Label = "";
 
-        [SuggestionPlaceholder(Text = "docker image with SwarmUI")]
-        [ConfigComment("Docker image to create the instance from. Ignored when TemplateHashId is set.")]
+        /// <summary>Docker image for created instances. Ignored when <see cref="TemplateHashId"/> is set.</summary>
         public string Image = "";
 
-        [SuggestionPlaceholder(Text = "Vast.ai template hash")]
-        [ConfigComment("Vast.ai template to create the instance from, instead of naming an image directly.")]
+        /// <summary>Vast.ai template to create instances from instead of an image.</summary>
         public string TemplateHashId = "";
 
-        [SuggestionPlaceholder(Text = "pick an offer, or leave blank for cheapest available")]
-        [ConfigComment("Specific rentable offer to create the instance from.\nLeave blank to search on-demand offers and take the cheapest match. Unlike RunPod's GPU-type retry, an offer is a specific host slot - if it's gone by the time Swarm tries to use it, pick another rather than expecting an automatic fallback.")]
-        public string OfferId = "";
+        /// <summary>GPU model to rent (Vast's gpu_name, e.g. "RTX 4090"), or blank for the cheapest suitable one.</summary>
+        public string GpuName = "";
 
-        [ConfigComment("Container disk size in GB for a created instance. This is wiped when the instance is destroyed.")]
-        public int DiskGb = 20;
+        /// <summary>Container disk size in GB.</summary>
+        public int DiskGb = 30;
 
-        [SuggestionPlaceholder(Text = "network volume id")]
-        [ConfigComment("Existing network volume to attach, which is normally where SwarmUI and your models live.\nCreating a brand new named volume isn't supported here yet - attach one you already created on Vast.ai.")]
+        /// <summary>Existing network volume to attach.</summary>
         public string NetworkVolumeId = "";
 
-        [ConfigComment("Path the volume is mounted at inside the instance.")]
+        /// <summary>Where the volume is mounted inside the instance.</summary>
         public string VolumeMountPath = "/workspace";
 
-        [ConfigComment("Extra environment variables for a created instance, as KEY=VALUE, one per line.\nThe SwarmUI port mapping is added automatically - no need to include it here.")]
+        /// <summary>Extra KEY=VALUE environment variables, one per line.</summary>
         public string Env = "";
 
-        [ConfigComment("Only for an instance you created yourself (set in Instance ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let this backend create the instance with a token of its own. Hidden once saved.")]
+        /// <summary>SWARMUI_WORKER_TOKEN of an instance the user created, or blank to let this backend make one.</summary>
         [ValueIsSecret]
         public string WorkerToken = "";
     }
@@ -78,13 +73,13 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
             Label = string.IsNullOrWhiteSpace(config.Label) ? "swarmui-cloudbackends" : config.Label.Trim(),
             Image = config.Image?.Trim() ?? "",
             TemplateHashId = config.TemplateHashId?.Trim() ?? "",
-            OfferId = config.OfferId?.Trim() ?? "",
+            GpuName = config.GpuName?.Trim() ?? "",
             DiskGb = config.DiskGb,
             NetworkVolumeId = config.NetworkVolumeId?.Trim() ?? "",
             VolumeMountPath = config.VolumeMountPath?.Trim() ?? "/workspace",
             Env = config.Env ?? "",
             WorkerToken = WorkerToken ?? "",
-            TerminateOnShutdown = config.TerminateOnShutdown
+            DeleteOnStop = config.DeleteOnStop
         });
     }
 

@@ -82,7 +82,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             ["action"] = "lease",
             ["idle_seconds"] = request.IdleSeconds,
             ["startup_grace_seconds"] = request.StartupGraceSeconds,
-            ["max_lease_seconds"] = request.MaxLeaseSeconds
+            ["max_lease_seconds"] = await LeaseSecondsAsync(request.MaxLeaseSeconds, cancel)
         };
         string jobId = await SubmitJobAsync(input, CancellationToken.None);
         Logs.Info($"{Tag} Lease job {jobId} submitted for endpoint {endpointId}.");
@@ -503,6 +503,69 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         return CancelJobAsync(worker.LeaseId);
     }
 
+    // ── Lease length ──────────────────────────────────────────────────────────
+
+    /// <summary>Seconds a lease stops short of the endpoint's execution timeout, so RunPod never kills a lease job mid-generation.</summary>
+    public const int LeaseTimeoutMargin = 300;
+
+    /// <summary>The endpoint's execution timeout in seconds (0 if it has none), or -1 until read.</summary>
+    int ExecutionTimeoutSec = -1;
+
+    /// <summary>When <see cref="ExecutionTimeoutSec"/> was read; it is re-read after a while in case the endpoint was edited.</summary>
+    DateTime ExecutionTimeoutReadAt;
+
+    /// <summary>How long a new lease may last: <paramref name="cap"/>, shortened to fit the endpoint's execution timeout.</summary>
+    async Task<int> LeaseSecondsAsync(int cap, CancellationToken cancel)
+    {
+        if (ExecutionTimeoutSec < 0 || DateTime.UtcNow - ExecutionTimeoutReadAt > TimeSpan.FromMinutes(10))
+        {
+            try
+            {
+                JObject endpoint = await GetJsonAsync($"https://api.runpod.io/v2/serverless/{endpointId}", cancel);
+                ExecutionTimeoutSec = (int)(((long?)endpoint["timeout"] ?? 0) / 1000);
+                ExecutionTimeoutReadAt = DateTime.UtcNow;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Not fatal: the lease asks for the cap, and Validate reports a timeout that is too short.
+                Logs.Debug($"{Tag} Could not read endpoint {endpointId}'s execution timeout: {ex.Message}");
+                return ExecutionTimeoutSec < 0 ? cap : LeaseSecondsFor(ExecutionTimeoutSec, cap);
+            }
+        }
+        return LeaseSecondsFor(ExecutionTimeoutSec, cap);
+    }
+
+    /// <summary>A lease length that ends <see cref="LeaseTimeoutMargin"/> before an execution timeout of <paramref name="timeoutSec"/> (0 = none), at most <paramref name="cap"/> and at least 60 seconds.</summary>
+    internal static int LeaseSecondsFor(int timeoutSec, int cap)
+    {
+        return timeoutSec <= 0 ? cap : Math.Clamp(timeoutSec - LeaseTimeoutMargin, 60, cap);
+    }
+
+    // ── Endpoints ─────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public async Task<JArray> ListEndpointsAsync(CancellationToken cancel)
+    {
+        JObject list = await GetJsonAsync("https://api.runpod.io/v2/serverless", cancel);
+        JArray endpoints = [];
+        foreach (JObject endpoint in (list["endpoints"] as JArray ?? []).OfType<JObject>())
+        {
+            // Load-balancing endpoints have no job queue, so they cannot run leases.
+            if (string.Equals(endpoint["type"]?.ToString(), "LOAD_BALANCER", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            endpoints.Add(new JObject
+            {
+                ["id"] = endpoint["id"]?.ToString(),
+                ["name"] = endpoint["name"]?.ToString(),
+                ["image"] = endpoint["image"]?.ToString(),
+                ["max_workers"] = (int?)(endpoint["workers"] as JObject)?["max"]
+            });
+        }
+        return endpoints;
+    }
+
     // ── Validation ────────────────────────────────────────────────────────────
 
     /// <inheritdoc/>
@@ -533,12 +596,20 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             findings.Add(Finding("error", $"The endpoint does not expose port {WorkerPort} as HTTP, so RunPod's proxy cannot reach the worker's SwarmUI and workers never become usable. Edit the endpoint and add {WorkerPort} under Container configuration, Expose HTTP ports."));
         }
         bool version1Image = image.Contains("swarmui-runpod", StringComparison.OrdinalIgnoreCase);
-        // The longest single job this backend runs: a lease, or on the version 1 image one keepalive.
-        int longestJob = version1Image ? Math.Max(60, request.IdleSeconds) : request.MaxLeaseSeconds;
-        if (executionTimeoutMs > 0 && executionTimeoutMs / 1000 <= longestJob)
+        int timeoutSec = (int)(executionTimeoutMs / 1000);
+        if (version1Image)
         {
-            string what = version1Image ? $"a keepalive job ({longestJob}s, from Idle Seconds)" : $"Max Lease Seconds ({longestJob}s)";
-            findings.Add(Finding("error", $"The endpoint's execution timeout ({executionTimeoutMs / 1000}s) must be longer than {what}, or RunPod will stop workers mid-job. Raise it on the endpoint to at least {longestJob + 300}s."));
+            // On the version 1 image the longest job is one keepalive, as long as Idle Seconds.
+            int keepalive = Math.Max(60, request.IdleSeconds);
+            if (timeoutSec > 0 && timeoutSec <= keepalive)
+            {
+                findings.Add(Finding("error", $"The endpoint's execution timeout ({timeoutSec}s) must be longer than a keepalive job ({keepalive}s, from Idle Seconds), or RunPod will stop workers mid-job. Raise it on the endpoint to at least {keepalive + LeaseTimeoutMargin}s."));
+            }
+        }
+        else if (timeoutSec > 0 && timeoutSec - LeaseTimeoutMargin < 600)
+        {
+            // Leases end 5 minutes before the timeout; a short one means a busy worker is handed back and leased again often.
+            findings.Add(Finding(timeoutSec - LeaseTimeoutMargin < 60 ? "error" : "warning", $"The endpoint's execution timeout is only {timeoutSec}s, so each worker lease lasts at most {LeaseSecondsFor(timeoutSec, request.MaxLeaseSeconds)}s. Raise it on the endpoint to {request.MaxLeaseSeconds + LeaseTimeoutMargin}s."));
         }
         if (workersMax > 0 && workersMax < maxWorkers)
         {

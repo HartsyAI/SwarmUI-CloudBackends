@@ -32,7 +32,7 @@ Workers run Hartsy's worker images, built on [SwarmUI-Worker-Base](https://githu
 | | RunPod | Vast.ai |
 |---|---|---|
 | Lease | A `lease` job on a queue endpoint, handled by an async-generator handler. Its first streamed output (`/stream/<job>`) is `{public_url, token, protocol: 2, ...}`; the job keeps running while the worker is in use. | A native PyWorker **session** (`/route/`, then `/session/create` on the worker, cost 100, `max_sessions = 1`), then the worker's `/lease` route for `{public_url, token}`. |
-| Who ends it | The worker, after `IdleSeconds` with no activity (or at `MaxLeaseSeconds`). | The session's TTL, unless renewed while in use. |
+| Who ends it | The worker, after `IdleSeconds` with no activity (or at the lease cap: an hour, or 5 minutes before the endpoint's execution timeout if that is sooner). | The session's TTL, unless renewed while in use. |
 | Renewal | None needed. | Each request made with the session adds a whole lifetime (`expiration += lifetime`), so `RenewLeaseAsync` renews only when less than half a lifetime (+15 s) remains. |
 | Scale-out signal | A running lease occupies its worker, so a queued lease is real queue pressure for RunPod's scaler. | An open session counts as a full worker's load (the worker's benchmark is calibrated so cost 100 equals its capacity), so the next session routes to, or recruits, another worker. |
 | Explicit release | Cancel the job (RunPod stops the worker running it). | `/session/end`. |

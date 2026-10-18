@@ -20,148 +20,169 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 /// </summary>
 public class CloudBackendsBackend : AbstractT2IBackend
 {
+    /// <summary>
+    /// Every setting the card shows. The extension's script groups them into one section per provider by prefix, gives them
+    /// plain labels, and moves the fields in <see cref="AdvancedFields"/> into a collapsed Advanced group.
+    /// Each child backend gets its section's values copied in by name (see <see cref="BuildChildSettings"/>).
+    /// </summary>
     public class Settings : AutoConfiguration
     {
         // ── RunPod Serverless ────────────────────────────────────────────────
-        [ConfigComment("Enable RunPod Serverless.")]
+        [ConfigComment("Turn RunPod Serverless on or off.")]
         public bool RunPodServerless_Enabled = false;
-        [ConfigComment("RunPod serverless endpoint ID.")]
+        [SuggestionPlaceholder(Text = "pick an endpoint, or paste its ID")]
+        [ConfigComment("Your RunPod serverless endpoint.\nPick it from the list (filled from your RunPod account once your API key is saved),\nor paste the endpoint ID from RunPod's Serverless page.")]
         public string RunPodServerless_EndpointId = "";
-        [ConfigComment("Most workers this backend may run at once. When every running worker is busy, another one is started, up to this many.\nAlso limited by the endpoint's own maximum. 1 means never more than one worker.")]
+        [ManualSettingsOptions(Vals = ["1", "2", "3", "4", "5", "6", "8", "10"])]
+        [ConfigComment("Most workers SwarmUI may run at once.\nWhen every running worker is busy, another one starts, up to this many.\nThe endpoint's own Max Workers must be at least this high.")]
         public int RunPodServerless_MaxWorkers = 1;
-        [ConfigComment("How long a worker may sit with no generation before it shuts down, in seconds.\nLower costs less; higher avoids a cold start between bursts of work.")]
+        [ManualSettingsOptions(Vals = ["30", "60", "120", "300", "600", "900", "1800"], ManualNames = ["30 seconds", "1 minute", "2 minutes", "5 minutes", "10 minutes", "15 minutes", "30 minutes"])]
+        [ConfigComment("How long a worker waits with nothing to do before it shuts down.\nShorter costs less; longer avoids waiting for a new worker between bursts.")]
         public int RunPodServerless_IdleSeconds = 120;
-        [ConfigComment("Longest a single worker lease may last, in seconds. The endpoint's execution timeout must be longer.\nA worker still in use when its lease ends is simply leased again.")]
-        public int RunPodServerless_MaxLeaseSeconds = 3600;
-        [ConfigComment("How long to wait for a worker to start and answer, in seconds.")]
-        public int RunPodServerless_StartupTimeoutSec = 800;
-        [ConfigComment("How often to poll while waiting for a worker, in milliseconds.")]
-        public int RunPodServerless_PollIntervalMs = 2000;
+        [ManualSettingsOptions(Vals = ["300", "600", "900", "1200", "1800"], ManualNames = ["5 minutes", "10 minutes", "15 minutes", "20 minutes", "30 minutes"])]
+        [ConfigComment("How long to wait for a worker to start before giving up.\nRaise it if a new or large worker image takes long to download.")]
+        public int RunPodServerless_StartupTimeoutSec = 900;
 
         // ── RunPod GPU Pods ──────────────────────────────────────────────────
-        [ConfigComment("Enable a RunPod GPU Pod.")]
+        [ConfigComment("Turn RunPod GPU Pods on or off.")]
         public bool RunPodPods_Enabled = false;
         [SuggestionPlaceholder(Text = "leave blank to create one")]
-        [ConfigComment("Existing RunPod pod ID to use.\nLeave blank to have Swarm find a pod by name, or create one.")]
+        [ConfigComment("Which pod to use.\nLeave on '(create one for me)' and Start Pod creates a pod, and finds it again next time.\nOr pick a pod you already made (it must run the Hartsy RunPod worker, see Worker Token).")]
         public string RunPodPods_PodId = "";
-        [ConfigComment("Port SwarmUI listens on inside the pod.")]
-        public int RunPodPods_SwarmUIPort = 7801;
-        [ConfigComment("Destroy the pod when this backend shuts down, instead of just stopping it.")]
-        public bool RunPodPods_TerminateOnShutdown = false;
-        [SuggestionPlaceholder(Text = "blank = a name unique to this backend")]
-        [ConfigComment("Name given to pods this backend creates, and used to find that pod again later.\nLeave blank (recommended) for a name unique to this backend and user.")]
-        public string RunPodPods_PodName = "";
-        [ConfigComment("Docker image to create the pod from. Ignored when TemplateId is set.\nUse the Hartsy RunPod worker image (pinned to a release), which secures the pod with a token this backend manages.")]
-        public string RunPodPods_ImageName = CloudBackendTypes.DefaultRunPodImage;
-        [SuggestionPlaceholder(Text = "RunPod template id")]
-        [ConfigComment("RunPod template to create the pod from, instead of naming an image directly.")]
-        public string RunPodPods_TemplateId = "";
-        [SuggestionPlaceholder(Text = "pick a GPU, or leave blank for cheapest available")]
-        [ConfigComment("GPU type for created pods. Leave blank to use whatever is available, cheapest first.")]
-        public string RunPodPods_GpuTypeId = "";
-        [ManualSettingsOptions(Vals = ["1", "2", "4", "8"])]
-        [ConfigComment("Number of GPUs attached to a created pod.")]
-        public int RunPodPods_GpuCount = 1;
-        [ConfigComment("Container disk size in GB for a created pod.")]
-        public int RunPodPods_ContainerDiskGb = 50;
-        [SuggestionPlaceholder(Text = "network volume id")]
-        [ConfigComment("Network volume to attach, which is normally where SwarmUI and your models live.")]
-        public string RunPodPods_NetworkVolumeId = "";
-        [ConfigComment("Path the volume is mounted at inside the pod.")]
-        public string RunPodPods_VolumeMountPath = "/runpod-volume";
-        [ConfigComment("Pod volume size in GB, used only when no network volume is attached. Zero for none.")]
-        public int RunPodPods_VolumeGb = 0;
-        [ManualSettingsOptions(Vals = ["SECURE", "COMMUNITY"], ManualNames = ["Secure Cloud", "Community Cloud"])]
-        [ConfigComment("Which RunPod cloud to create pods in. Secure is more reliable, Community is cheaper.")]
-        public string RunPodPods_CloudType = "SECURE";
-        [SuggestionPlaceholder(Text = "leave blank to let RunPod choose")]
-        [ConfigComment("Restrict created pods to one data center. Ignored when a network volume is attached.")]
-        public string RunPodPods_DataCenterId = "";
-        [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
-        public string RunPodPods_PodEnv = "";
-        [ConfigComment("Only for a pod you created yourself (set in Pod ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let Cloud Backends create the pod with a token of its own. Hidden once saved.")]
+        [ConfigComment("Only for a pod you made yourself (shown once you pick one under Pod): the SWARMUI_WORKER_TOKEN it was created with.\nThe card makes its own token for pods it creates. Hidden once saved.")]
         [ValueIsSecret]
         public string RunPodPods_WorkerToken = "";
-        [ConfigComment("How long to wait for the pod to boot and for SwarmUI on it to answer, in seconds.")]
+        [ConfigComment("What Stop Pod does.\nOn: deletes the pod. Your models stay on the network volume, and the next Start makes a fresh pod.\nOff: pauses the pod. RunPod clears its container disk anyway, and a paused pod can come back without a GPU.")]
+        public bool RunPodPods_DeleteOnStop = true;
+        [SuggestionPlaceholder(Text = "pick an image, or type your own")]
+        [ConfigComment("The Docker image the pod runs.\nUse the Hartsy RunPod worker: pick the ComfyUI or HartsyInference version from the list.\nIgnored when a Template is set (under Advanced).")]
+        public string RunPodPods_ImageName = CloudBackendTypes.DefaultRunPodImage;
+        [SuggestionPlaceholder(Text = "pick a GPU, or leave blank for cheapest available")]
+        [ConfigComment("The GPU to rent, with its VRAM, price per hour and stock.\n'(cheapest available)' takes the cheapest GPU that's free when you press Start.\nPick 16 GB of VRAM or more; 24 GB for large models like Flux.")]
+        public string RunPodPods_GpuTypeId = "";
+        [ManualSettingsOptions(Vals = ["20", "30", "50", "75", "100", "150", "200"], ManualNames = ["20 GB", "30 GB", "50 GB", "75 GB", "100 GB", "150 GB", "200 GB"])]
+        [ConfigComment("Size of the pod's own disk. It holds the worker image, so it must be well above the image size:\n30 GB or more for the ComfyUI image, 20 GB for HartsyInference. It's wiped when the pod stops.")]
+        public int RunPodPods_ContainerDiskGb = 50;
+        [SuggestionPlaceholder(Text = "network volume id")]
+        [ConfigComment("The network volume with your models. It survives the pod being deleted.\nThe pod is created in the volume's data center.")]
+        public string RunPodPods_NetworkVolumeId = "";
+        [ManualSettingsOptions(Vals = ["SECURE", "COMMUNITY"], ManualNames = ["Secure Cloud", "Community Cloud"])]
+        [ConfigComment("Which RunPod cloud to rent from. Secure Cloud is more reliable; Community Cloud is cheaper.\nThe GPU list shows the prices for the cloud picked here.")]
+        public string RunPodPods_CloudType = "SECURE";
+        [SuggestionPlaceholder(Text = "leave blank to let RunPod choose")]
+        [ConfigComment("Restrict new pods to one data center.\nOnly used without a network volume, since the volume decides the data center.")]
+        public string RunPodPods_DataCenterId = "";
+        [ManualSettingsOptions(Vals = ["0", "30", "60", "120", "240", "480", "720", "1440"], ManualNames = ["Off", "30 minutes", "1 hour", "2 hours", "4 hours", "8 hours", "12 hours", "24 hours"])]
+        [ConfigComment("Safety stop: stops the pod after it has run this long, in case you forget it.")]
+        public int RunPodPods_MaxRuntimeMinutes = 240;
+        [ManualSettingsOptions(Vals = ["0", "1", "2", "5", "10", "20", "50", "100"], ManualNames = ["Off", "$1", "$2", "$5", "$10", "$20", "$50", "$100"])]
+        [ConfigComment("Safety stop: stops the pod once it has cost about this much (price per hour times time running).")]
+        public double RunPodPods_MaxSpendUsd = 10;
+        // Advanced:
+        [SuggestionPlaceholder(Text = "RunPod template id")]
+        [ConfigComment("Create the pod from one of your RunPod pod templates instead of the image above.\nThe template must run the Hartsy RunPod worker.")]
+        public string RunPodPods_TemplateId = "";
+        [ManualSettingsOptions(Vals = ["1", "2", "4", "8"])]
+        [ConfigComment("GPUs per pod. The Hartsy worker uses one GPU, so more only helps a custom image that uses them all.")]
+        public int RunPodPods_GpuCount = 1;
+        [ConfigComment("Extra disk, in GB, that survives a paused pod. Only used without a network volume,\nand deleted with the pod. 0 for none.")]
+        public int RunPodPods_VolumeGb = 0;
+        [ConfigComment("Where the network volume (or the extra disk) is mounted inside the pod.\nThe Hartsy worker finds models at /runpod-volume or /workspace; change it only for a custom image.")]
+        public string RunPodPods_VolumeMountPath = "/runpod-volume";
+        [ConfigComment("The port SwarmUI listens on inside the pod. The card passes it to the Hartsy worker.\nChange it only for a custom image that listens elsewhere.")]
+        public int RunPodPods_SwarmUIPort = 7801;
+        [ConfigComment("Extra environment variables for new pods, one KEY=VALUE per line.")]
+        public string RunPodPods_PodEnv = "";
+        [ManualSettingsOptions(Vals = ["300", "600", "900", "1200", "1800"], ManualNames = ["5 minutes", "10 minutes", "15 minutes", "20 minutes", "30 minutes"])]
+        [ConfigComment("How long to wait for the pod to boot and SwarmUI on it to answer.\nRaise it if the first start of a large image times out.")]
         public int RunPodPods_StartupTimeoutSec = 900;
-        [ConfigComment("How often to poll RunPod while waiting for the pod to start, in milliseconds.")]
-        public int RunPodPods_PollIntervalMs = 5000;
-        [ConfigComment("Failsafe: auto-stop the pod after it has been running this many minutes, in case you forgot to turn it off. Zero disables this check.")]
-        public int RunPodPods_MaxRuntimeMinutes = 0;
-        [ConfigComment("Failsafe: auto-stop the pod once its estimated spend (hourly rate x time running) reaches this many US dollars. Zero disables this check.")]
-        public double RunPodPods_MaxSpendUsd = 0;
 
         // ── Vast.ai Serverless ───────────────────────────────────────────────
-        [ConfigComment("Enable Vast.ai Serverless.")]
+        [ConfigComment("Turn Vast.ai Serverless on or off.")]
         public bool VastAI_Enabled = false;
-        [ConfigComment("Vast.ai serverless endpoint name.")]
+        [SuggestionPlaceholder(Text = "pick an endpoint, or type its name")]
+        [ConfigComment("Your Vast.ai serverless endpoint.\nPick it from the list (filled from your Vast.ai account once your API key is saved),\nor type the endpoint's name from Vast's Serverless page.")]
         public string VastAI_EndpointId = "";
-        [ConfigComment("Most workers this backend may run at once. When every running worker is busy, another one is started, up to this many.\nAlso limited by the endpoint's own maximum. 1 means never more than one worker.")]
+        [ManualSettingsOptions(Vals = ["1", "2", "3", "4", "5", "6", "8", "10"])]
+        [ConfigComment("Most workers SwarmUI may run at once.\nWhen every running worker is busy, another one starts, up to this many.\nThe endpoint's own Max Workers must be at least this high.")]
         public int VastAI_MaxWorkers = 1;
-        [ConfigComment("How long a worker may sit with no generation before it shuts down, in seconds.\nLower costs less; higher avoids a cold start between bursts of work.\nVast.ai workers are kept at least 60 seconds, so a session cannot lapse between renewals.")]
+        [ManualSettingsOptions(Vals = ["60", "120", "300", "600", "900", "1800"], ManualNames = ["1 minute", "2 minutes", "5 minutes", "10 minutes", "15 minutes", "30 minutes"])]
+        [ConfigComment("How long a worker waits with nothing to do before SwarmUI lets it go.\nShorter costs less; longer avoids waiting for a new worker between bursts.")]
         public int VastAI_IdleSeconds = 120;
-        [ConfigComment("How long to wait for a worker to start and answer, in seconds.")]
-        public int VastAI_StartupTimeoutSec = 800;
-        [ConfigComment("How often to poll while waiting for a worker, in milliseconds.")]
-        public int VastAI_PollIntervalMs = 2000;
+        [ManualSettingsOptions(Vals = ["300", "600", "900", "1200", "1800"], ManualNames = ["5 minutes", "10 minutes", "15 minutes", "20 minutes", "30 minutes"])]
+        [ConfigComment("How long to wait for a worker to start before giving up.\nRaise it if a new or large worker image takes long to download.")]
+        public int VastAI_StartupTimeoutSec = 900;
 
         // ── Vast.ai Instances ────────────────────────────────────────────────
         // Prefixed VastAIInstance_ (not VastAI_, which the Serverless section above already owns).
-        [ConfigComment("Enable a Vast.ai rented instance.")]
+        [ConfigComment("Turn Vast.ai Instances on or off.")]
         public bool VastAIInstance_Enabled = false;
         [SuggestionPlaceholder(Text = "leave blank to create one")]
-        [ConfigComment("Existing Vast.ai instance ID to use.\nLeave blank to have Swarm find an instance by label, or create one.")]
+        [ConfigComment("Which instance to use.\nLeave on '(create one for me)' and Start Instance rents one, and finds it again next time.\nOr pick an instance you already made (it must run the Hartsy Vast.ai worker, see Worker Token).")]
         public string VastAIInstance_InstanceId = "";
-        [ConfigComment("Port SwarmUI listens on inside the instance.\nDeclared to Vast as a Docker '-p' flag, so the instance's own SwarmUI must actually bind this port.")]
-        public int VastAIInstance_SwarmUIPort = 7801;
-        [ConfigComment("Destroy the instance when this backend shuts down, instead of just stopping it.")]
-        public bool VastAIInstance_TerminateOnShutdown = false;
-        [SuggestionPlaceholder(Text = "blank = a label unique to this backend")]
-        [ConfigComment("Label given to instances this backend creates, and used to find that instance again later.\nLeave blank (recommended) for a label unique to this backend and user.")]
-        public string VastAIInstance_Label = "";
-        [ConfigComment("Docker image to create the instance from. Ignored when TemplateHashId is set.\nUse the Hartsy Vast.ai worker image (pinned to a release), which serves HTTPS and is secured with a token this backend manages.")]
-        public string VastAIInstance_Image = CloudBackendTypes.DefaultVastImage;
-        [SuggestionPlaceholder(Text = "Vast.ai template hash")]
-        [ConfigComment("Vast.ai template to create the instance from, instead of naming an image directly.")]
-        public string VastAIInstance_TemplateHashId = "";
-        [SuggestionPlaceholder(Text = "pick an offer, or leave blank for cheapest available")]
-        [ConfigComment("Specific rentable offer (machine) to create the instance from.\nLeave blank to take the cheapest matching offer. If a chosen offer is gone by the time you start, pick another.")]
-        public string VastAIInstance_OfferId = "";
-        [ConfigComment("Container disk size in GB for a created instance. This is wiped when the instance is destroyed.")]
-        public int VastAIInstance_DiskGb = 20;
-        [SuggestionPlaceholder(Text = "network volume id")]
-        [ConfigComment("Existing network volume to attach, which is normally where SwarmUI and your models live.\nCreating a brand new named volume isn't supported here yet - attach one you already created on Vast.ai.")]
-        public string VastAIInstance_NetworkVolumeId = "";
-        [ConfigComment("Path the volume is mounted at inside the instance.")]
-        public string VastAIInstance_VolumeMountPath = "/workspace";
-        [ConfigComment("Extra environment variables for a created instance, as KEY=VALUE, one per line.\nThe SwarmUI port mapping is added automatically - no need to include it here.")]
-        public string VastAIInstance_Env = "";
-        [ConfigComment("Only for an instance you created yourself (set in Instance ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let Cloud Backends create the instance with a token of its own. Hidden once saved.")]
+        [ConfigComment("Only for an instance you made yourself (shown once you pick one under Instance): the SWARMUI_WORKER_TOKEN it was created with.\nThe card makes its own token for instances it creates. Hidden once saved.")]
         [ValueIsSecret]
         public string VastAIInstance_WorkerToken = "";
-        [ConfigComment("How long to wait for the instance to boot and for SwarmUI on it to answer, in seconds.")]
+        [ConfigComment("What Stop Instance does.\nOn: destroys the instance, so nothing bills. Keep models on a network volume.\nOff: pauses it. Its disk keeps billing, and it can only resume once that machine's GPU is free again.")]
+        public bool VastAIInstance_DeleteOnStop = true;
+        [SuggestionPlaceholder(Text = "pick an image, or type your own")]
+        [ConfigComment("The Docker image the instance runs.\nUse the Hartsy Vast.ai worker: pick the ComfyUI or HartsyInference version from the list.\nIgnored when a Template is set (under Advanced).")]
+        public string VastAIInstance_Image = CloudBackendTypes.DefaultVastImage;
+        [SuggestionPlaceholder(Text = "pick a GPU, or leave blank for cheapest available")]
+        [ConfigComment("The GPU to rent, with its VRAM and lowest current price.\nStart rents the cheapest machine with that GPU at that moment.\n'(cheapest available)' takes the cheapest single GPU with at least 16 GB of VRAM.")]
+        public string VastAIInstance_GpuName = "";
+        [ManualSettingsOptions(Vals = ["20", "30", "50", "75", "100", "150", "200"], ManualNames = ["20 GB", "30 GB", "50 GB", "75 GB", "100 GB", "150 GB", "200 GB"])]
+        [ConfigComment("Size of the instance's own disk. It holds the worker image, so it must be well above the image size:\n30 GB or more for the ComfyUI image, 20 GB for HartsyInference. It's lost when the instance is destroyed.")]
+        public int VastAIInstance_DiskGb = 30;
+        [SuggestionPlaceholder(Text = "network volume id")]
+        [ConfigComment("The network volume with your models. It survives the instance being destroyed.\nCreate it on Vast.ai first; it then shows in this list.")]
+        public string VastAIInstance_NetworkVolumeId = "";
+        [ManualSettingsOptions(Vals = ["0", "30", "60", "120", "240", "480", "720", "1440"], ManualNames = ["Off", "30 minutes", "1 hour", "2 hours", "4 hours", "8 hours", "12 hours", "24 hours"])]
+        [ConfigComment("Safety stop: stops the instance after it has run this long, in case you forget it.")]
+        public int VastAIInstance_MaxRuntimeMinutes = 240;
+        [ManualSettingsOptions(Vals = ["0", "1", "2", "5", "10", "20", "50", "100"], ManualNames = ["Off", "$1", "$2", "$5", "$10", "$20", "$50", "$100"])]
+        [ConfigComment("Safety stop: stops the instance once it has cost about this much (price per hour times time running).")]
+        public double VastAIInstance_MaxSpendUsd = 10;
+        // Advanced:
+        [SuggestionPlaceholder(Text = "Vast.ai template hash")]
+        [ConfigComment("Create the instance from one of your Vast.ai templates instead of the image above.\nThe template must run the Hartsy Vast.ai worker.")]
+        public string VastAIInstance_TemplateHashId = "";
+        [ConfigComment("Where the network volume is mounted inside the instance.\nThe Hartsy worker looks in /workspace; change it only for a custom image.")]
+        public string VastAIInstance_VolumeMountPath = "/workspace";
+        [ConfigComment("The port SwarmUI listens on inside the instance. The card opens it and passes it to the Hartsy worker.\nChange it only for a custom image that listens elsewhere.")]
+        public int VastAIInstance_SwarmUIPort = 7801;
+        [ConfigComment("Extra environment variables for new instances, one KEY=VALUE per line.")]
+        public string VastAIInstance_Env = "";
+        [ManualSettingsOptions(Vals = ["300", "600", "900", "1200", "1800"], ManualNames = ["5 minutes", "10 minutes", "15 minutes", "20 minutes", "30 minutes"])]
+        [ConfigComment("How long to wait for the instance to boot and SwarmUI on it to answer.\nRaise it if the first start of a large image times out.")]
         public int VastAIInstance_StartupTimeoutSec = 900;
-        [ConfigComment("How often to poll Vast.ai while waiting for the instance to start, in milliseconds.")]
-        public int VastAIInstance_PollIntervalMs = 5000;
-        [ConfigComment("Failsafe: auto-stop the instance after it has been running this many minutes, in case you forgot to turn it off. Zero disables this check.")]
-        public int VastAIInstance_MaxRuntimeMinutes = 0;
-        [ConfigComment("Failsafe: auto-stop the instance once its estimated spend (hourly rate x time running) reaches this many US dollars. Zero disables this check.")]
-        public double VastAIInstance_MaxSpendUsd = 0;
     }
+
+    /// <summary>Settings the card folds into each section's collapsed Advanced group.</summary>
+    public static readonly HashSet<string> AdvancedFields =
+    [
+        "RunPodServerless_StartupTimeoutSec",
+        "RunPodPods_TemplateId", "RunPodPods_GpuCount", "RunPodPods_VolumeGb", "RunPodPods_VolumeMountPath", "RunPodPods_SwarmUIPort", "RunPodPods_PodEnv", "RunPodPods_StartupTimeoutSec",
+        "VastAI_StartupTimeoutSec",
+        "VastAIInstance_TemplateHashId", "VastAIInstance_VolumeMountPath", "VastAIInstance_SwarmUIPort", "VastAIInstance_Env", "VastAIInstance_StartupTimeoutSec"
+    ];
 
     /// <summary>This backend's settings.</summary>
     Settings Config => (Settings)SettingsRaw;
 
-    /// <summary>One provider section of the parent settings: its field prefix, display label, which API key it bills, whether it rents whole instances, and its hidden backend type.</summary>
-    public record ProviderDef(string Prefix, string Label, string KeyType, bool IsInstance, Func<BackendHandler.BackendType> Type);
+    /// <summary>One provider section of the parent settings: its field prefix, display label, which API key it bills, whether it rents whole instances, its hidden backend type, and its setup guide in docs/setup.</summary>
+    public record ProviderDef(string Prefix, string Label, string KeyType, bool IsInstance, Func<BackendHandler.BackendType> Type, string Guide);
+
+    /// <summary>Where the setup guides are published, for the links on the card.</summary>
+    public const string GuideBaseUrl = "https://github.com/HartsyAI/SwarmUI-CloudBackends/blob/main/docs/setup/";
 
     /// <summary>Every provider section this backend can manage, in settings-declaration order.</summary>
     public static readonly ProviderDef[] Providers =
     [
-        new("RunPodServerless_", "RunPod Serverless", "runpod_api", IsInstance: false, () => CloudBackendTypes.RunPodServerless),
-        new("RunPodPods_", "RunPod GPU Pods", "runpod_api", IsInstance: true, () => CloudBackendTypes.RunPodPods),
-        new("VastAI_", "Vast.ai Serverless", "vastai_api", IsInstance: false, () => CloudBackendTypes.VastAI),
-        new("VastAIInstance_", "Vast.ai Instances", "vastai_api", IsInstance: true, () => CloudBackendTypes.VastAIInstance)
+        new("RunPodServerless_", "RunPod Serverless", "runpod_api", IsInstance: false, () => CloudBackendTypes.RunPodServerless, "runpod-serverless.md"),
+        new("RunPodPods_", "RunPod GPU Pods", "runpod_api", IsInstance: true, () => CloudBackendTypes.RunPodPods, "runpod-pods.md"),
+        new("VastAI_", "Vast.ai Serverless", "vastai_api", IsInstance: false, () => CloudBackendTypes.VastAI, "vastai-serverless.md"),
+        new("VastAIInstance_", "Vast.ai Instances", "vastai_api", IsInstance: true, () => CloudBackendTypes.VastAIInstance, "vastai-instances.md")
     ];
 
     /// <summary>Looks up a provider definition by its settings prefix (e.g. "RunPodPods_").</summary>

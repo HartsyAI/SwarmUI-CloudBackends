@@ -106,7 +106,7 @@ The template tells Vast which image to run and how.
    |---|---|---|
    | Endpoint Name | For example `swarmui-vast`. You'll enter this name in SwarmUI. | |
    | Minimum Workers | `0` | Anything above 0 keeps that many workers loaded and stopped, which bills for their storage. |
-   | Max Workers | The most workers you want running at once, for example `2`. At least the **MaxWorkers** on the SwarmUI card. | |
+   | Max Workers | The most workers you want running at once, for example `2`. At least the **Max Workers** on the SwarmUI card. | |
    | Minimum Load | `0` | Anything above 0 keeps a worker running all the time, so the endpoint never scales to zero. Vast's default is 1. |
    | Target Utilization | `0.9` (the default) | |
    | Advanced ▸ Set the timeout for inactivity | On, `300` seconds | Lets the endpoint scale to zero after this many idle seconds. |
@@ -148,14 +148,13 @@ To change the template later, edit the workergroup on this page. Saving a templa
 
    ![Add new backend row with Show Advanced on and the Cloud Backends button highlighted](../images/swarmui/add-backend.png)
 
-2. Open the **Vast.ai Serverless** section and set:
+2. Turn on the switch in the **Vast.ai Serverless** header, open the section, and set:
 
    | Setting | Value |
    |---|---|
-   | Enabled | On |
-   | EndpointId | The endpoint's **name** from Step 6 (not a number) |
-   | MaxWorkers | How many workers SwarmUI may run at once. At most the endpoint's Max Workers. |
-   | IdleSeconds | How long a worker waits with nothing to do before it's let go. `120` is a good default. Vast.ai workers are always kept at least 60 seconds. |
+   | Endpoint | Your endpoint from Step 6. With your API key saved, it's a dropdown of your endpoints; otherwise type the endpoint's **name** (not a number). |
+   | Max Workers | How many workers SwarmUI may run at once. The list stops at the endpoint's own Max Workers. |
+   | Idle Shutdown | How long a worker waits with nothing to do before it's let go. `2 minutes` is a good default. |
 
 3. Press **Save** at the top of the card.
 
@@ -171,7 +170,7 @@ SwarmUI only lets you pick models it knows about. If the model isn't in your loc
 
 - **The first generation waits for a worker to start.** The first time a machine runs your image it has to download it, which can take several minutes for a large image. Later starts are faster.
 - **The Workers line** in the section shows each running worker, with a **Stop** button.
-- **After IdleSeconds with no generation, the worker is let go**, and Vast scales it down after the inactivity timeout.
+- **After the Idle Shutdown time with no generation, the worker is let go**, and Vast scales it down after the inactivity timeout.
 
 ## What it costs
 
@@ -187,7 +186,7 @@ SwarmUI only lets you pick models it knows about. If the model isn't in your loc
 |---|---|
 | "Serverless requires a credit balance of at least $5" | Add credit (Step 1). |
 | Validate says the API key was rejected | Check the key under **User ▸ User Info ▸ API Keys**, or create a new one. |
-| "No Vast.ai worker became available" | No machine matched your workergroup in time. Loosen the GPU filter, or raise **StartupTimeoutSec** on the card while a new image downloads. |
+| "No Vast.ai worker became available" | No machine matched your workergroup in time. Loosen the GPU filter, or raise **Startup Timeout** (under **Advanced** on the card) while a new image downloads. |
 | Workers start and fail without a clear error | Raise the template's container disk size (Step 5), and check the launch mode is Docker ENTRYPOINT. |
 | Workers keep running after you stop | Check **Minimum Load** is `0` and the inactivity timeout is on (Step 6). |
 

@@ -9,6 +9,7 @@ API routes for managing cloud GPU backends (RunPod, Vast.ai) added by the Cloud 
 - HTTP Route [CloudClearModelCache](#http-route-apicloudclearmodelcache)
 - HTTP Route [CloudGetPodStatus](#http-route-apicloudgetpodstatus)
 - HTTP Route [CloudGetStatus](#http-route-apicloudgetstatus)
+- HTTP Route [CloudListEndpoints](#http-route-apicloudlistendpoints)
 - HTTP Route [CloudListOrphans](#http-route-apicloudlistorphans)
 - HTTP Route [CloudListProviders](#http-route-apicloudlistproviders)
 - HTTP Route [CloudListRunPodOptions](#http-route-apicloudlistrunpodoptions)
@@ -113,6 +114,28 @@ Gets status for every running cloud backend the user may access, across all prov
     "total": 1
 ```
 
+## HTTP Route /API/CloudListEndpoints
+
+#### Description
+
+Lists the user's serverless endpoints on one provider, for the card's endpoint dropdown. 'id' is the value the EndpointId setting takes (the endpoint ID on RunPod, the endpoint name on Vast.ai).
+
+#### Permission Flag
+
+`view_backends_list` - `View Backends List` in group `Backends Admin`
+
+#### Parameters
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| provider | String | The serverless provider's settings prefix: 'RunPodServerless_' or 'VastAI_'. | **(REQUIRED)** |
+
+#### Return Format
+
+```js
+    "endpoints": [{"id": "...", "name": "...", "image": "...", "max_workers": 3}]
+```
+
 ## HTTP Route /API/CloudListOrphans
 
 #### Description
@@ -141,7 +164,7 @@ Lists running pods and instances on the user's own RunPod and Vast.ai accounts t
 
 #### Description
 
-Lists the cloud providers this extension supports, with their settings prefixes and (for instance-renting providers) their start/stop/status route names - so a UI can build its provider table from the server instead of hardcoding it.
+Lists the cloud providers this extension supports, with their settings prefixes, setup guide links, which settings belong in the card's Advanced group, and (for instance-renting providers) their start/stop/status route names - so a UI can build its provider table from the server instead of hardcoding it.
 
 #### Permission Flag
 
@@ -161,6 +184,9 @@ Lists the cloud providers this extension supports, with their settings prefixes 
             "label": "RunPod GPU Pods",
             "key_type": "runpod_api",
             "is_instance": true,
+            "guide_url": "https://github.com/HartsyAI/SwarmUI-CloudBackends/blob/main/docs/setup/runpod-pods.md",
+            "advanced_fields": ["RunPodPods_TemplateId", "..."],
+            "images": [{"image": "kalebbroo/swarmui-worker-runpod:2.0.0-comfyui", "label": "Hartsy worker, ComfyUI"}], // only for instance providers
             "item_label": "Pod", // only for instance providers
             "start_call": "CloudStartPod",
             "start_call_ws": "CloudStartPodWS",
@@ -192,7 +218,7 @@ Lists what the user's RunPod account can actually use right now: GPU types with 
     "cloud": "SECURE",
     "gpus": [{"id": "...", "name": "...", "memory_gb": 24, "price_per_hr": 0.44, "max_count": 8, "availability": "HIGH", "data_centers": ["..."]}],
     "network_volumes": [{"id": "...", "name": "...", "size_gb": 100, "data_center": "..."}],
-    "templates": [{"id": "...", "name": "...", "image": "..."}],
+    "templates": [{"id": "...", "name": "...", "image": "..."}], // pod templates only
     "data_centers": [{"id": "...", "name": "..."}],
     "pods": [{"id": "...", "name": "...", "status": "...", "gpu": "...", "cost_per_hr": 0.44}]
 ```
@@ -444,7 +470,7 @@ Live status of the instance behind a Vast.ai Instances backend - state, GPU, cos
 
 #### Description
 
-Lists what the user's Vast.ai account can actually rent right now: on-demand offers (GPU, price, location) and the account's own network volumes. Same purpose as CloudListRunPodOptions.
+Lists what the user's Vast.ai account can use right now: the GPU models on offer (single-GPU on-demand machines) with their lowest price, and the account's own instances, templates and network volumes. Same purpose as CloudListRunPodOptions.
 
 #### Permission Flag
 
@@ -457,8 +483,10 @@ Lists what the user's Vast.ai account can actually rent right now: on-demand off
 #### Return Format
 
 ```js
-    "offers": [{"id": "...", "gpu_name": "RTX 4090", "num_gpus": 1, "gpu_ram": 24, "disk_space": 100, "geolocation": "US", "reliability": 0.99, "dph_total": 0.31}],
-    "network_volumes": [{"id": "...", "name": "...", "size_gb": 100}]
+    "gpus": [{"name": "RTX 4090", "gpu_ram": 24, "min_price": 0.31, "offers": 42}],
+    "network_volumes": [{"id": "...", "name": "...", "size_gb": 100}],
+    "instances": [{"id": "...", "label": "...", "status": "running", "gpu": "RTX 4090", "num_gpus": 1}],
+    "templates": [{"id": "<template hash>", "name": "...", "image": "..."}]
 ```
 
 ## HTTP Route /API/VastAIStartInstance
