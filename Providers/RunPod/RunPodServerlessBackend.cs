@@ -38,7 +38,7 @@ public class RunPodServerlessBackend : CloudBackendBase
         {
             return;
         }
-        if (!session.User.HasPermission(CloudBackendsExtension.PermUseRunPodServerless))
+        if (!session.User.HasPermission(CloudBackends.PermUseRunPodServerless))
         {
             throw new SwarmReadableErrorException("You do not have permission to use RunPod Serverless backends.");
         }

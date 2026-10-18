@@ -127,7 +127,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
         {
             return;
         }
-        if (!session.User.HasPermission(CloudBackendsExtension.PermUseRunPodPods))
+        if (!session.User.HasPermission(CloudBackends.PermUseRunPodPods))
         {
             throw new SwarmReadableErrorException("You do not have permission to use RunPod GPU Pod backends.");
         }

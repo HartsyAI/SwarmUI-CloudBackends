@@ -40,7 +40,7 @@ public class VastAIBackend : CloudBackendBase
         {
             return;
         }
-        if (!session.User.HasPermission(CloudBackendsExtension.PermUseVastAI))
+        if (!session.User.HasPermission(CloudBackends.PermUseVastAI))
         {
             throw new SwarmReadableErrorException("You do not have permission to use Vast.ai backends.");
         }
