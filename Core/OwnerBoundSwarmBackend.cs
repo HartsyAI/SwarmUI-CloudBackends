@@ -13,13 +13,7 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 /// </summary>
 public class OwnerBoundSwarmBackend : SwarmSwarmBackend
 {
-    /// <summary>
-    /// Walks up to the cloud backend this tree hangs off: <see cref="SwarmSwarmBackend.Parent"/> links a
-    /// generating child to its control swarm, whose backend-data parent (set in
-    /// <see cref="CloudChildBackend.Attach"/>) is the cloud backend. Either cloud shape can be the root -
-    /// instances attach a child for as long as one is rented, serverless while a worker is awake - so this
-    /// returns the shared interface rather than one of them. Null if detached.
-    /// </summary>
+    /// <summary>The cloud backend (serverless or instance) this tree hangs off, through the control swarm's parent. Null if detached.</summary>
     public ICloudBackend FindCloudRoot()
     {
         return TopControl().BackendData?.AbstractParent?.AbstractBackend as ICloudBackend;

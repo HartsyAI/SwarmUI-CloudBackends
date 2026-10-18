@@ -64,9 +64,6 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     public string ProviderName => "RunPod Serverless";
 
     /// <inheritdoc/>
-    public string ApiKeyType => "runpod_api";
-
-    /// <inheritdoc/>
     public void Dispose()
     {
     }
@@ -192,7 +189,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         string token = output["token"]?.ToString();
         if (protocol < RequiredProtocol || string.IsNullOrWhiteSpace(publicUrl) || string.IsNullOrWhiteSpace(token))
         {
-            throw new SwarmReadableErrorException($"The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at kalebbroo/swarmui-worker-runpod 2.0.0 or later.");
+            throw new SwarmReadableErrorException(ImageTooOldMessage);
         }
         Logs.Info($"{Tag} Lease {jobId} holds worker {output["worker_id"]}.");
         return new CloudWorkerInfo
@@ -233,13 +230,28 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         return error is not null && error.Contains("Unknown action: lease", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// True for the version 2 worker refusing a version 1 wakeup. RunPod's SDK keeps only the error text of a failed
+    /// generator job ("Unknown action 'wakeup'..."), dropping its error_id.
+    /// </summary>
+    internal static bool IsVersion2WakeupRefusal(string error)
+    {
+        return error is not null && error.Contains("Unknown action 'wakeup'", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Told to the user when an endpoint moved from the version 1 to the version 2 image while in use.</summary>
+    const string Version2ChangedMessage = "The RunPod endpoint's worker image changed to version 2 while in use. Generate again to lease a worker from it.";
+
+    /// <summary>Told to the user when an endpoint runs an image that answers neither protocol.</summary>
+    const string ImageTooOldMessage = "The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at kalebbroo/swarmui-worker-runpod 2.0.0 or later.";
+
     /// <summary>Builds a readable error for a lease job that ended before streaming a worker.</summary>
     static Exception DescribeEndedJob(string jobId, string status, JObject job)
     {
         string error = job["error"]?.ToString() ?? EndedOutput(job)?["error"]?.ToString();
         if (error is not null && error.Contains("Unknown action", StringComparison.OrdinalIgnoreCase))
         {
-            return new SwarmReadableErrorException("The RunPod worker image is too old for this version of Cloud Backends. Point the endpoint at kalebbroo/swarmui-worker-runpod 2.0.0 or later.");
+            return new SwarmReadableErrorException(ImageTooOldMessage);
         }
         return new SwarmReadableErrorException($"RunPod lease job {jobId} ended ({status}) before a worker was ready{(error is null ? "." : $": {error}")}");
     }
@@ -288,11 +300,11 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             worker.LeaseId = await SubmitJobAsync(new JObject { ["action"] = "wakeup" }, CancellationToken.None);
             Logs.Info($"{Tag} Wakeup job {worker.LeaseId} submitted for endpoint {endpointId} (version 1 worker).");
             JObject output = await WaitForWakeupAsync(worker.LeaseId, request, cancel);
-            if (output["error_id"]?.ToString() == "unknown_action")
+            if (output["error_id"]?.ToString() == "unknown_action" || IsVersion2WakeupRefusal(output["error"]?.ToString()))
             {
                 // The endpoint has since moved to the version 2 image: go back to leases.
                 Version1 = false;
-                throw new SwarmReadableErrorException("The RunPod endpoint's worker image changed to version 2 while in use. Generate again to lease a worker from it.");
+                throw new SwarmReadableErrorException(Version2ChangedMessage);
             }
             if (output["success"]?.Value<bool>() is not true)
             {
@@ -355,6 +367,11 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
             }
             if (status is "FAILED" or "CANCELLED" or "TIMED_OUT")
             {
+                if (IsVersion2WakeupRefusal(job["error"]?.ToString() ?? EndedOutput(job)?["error"]?.ToString()))
+                {
+                    Version1 = false;
+                    throw new SwarmReadableErrorException(Version2ChangedMessage);
+                }
                 throw DescribeEndedJob(jobId, status, job);
             }
             if (cancel.IsCancellationRequested && status == "IN_QUEUE" && await CancelJobAsync(jobId))
@@ -503,14 +520,14 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
     public async Task<JArray> CheckEndpointAsync(LeaseRequest request, int maxWorkers, CancellationToken cancel)
     {
         JArray findings = [];
-        JObject endpoint = await GetJsonAsync($"https://rest.runpod.io/v1/endpoints/{endpointId}?includeTemplate=true", cancel);
-        int workersMax = endpoint["workersMax"]?.Value<int>() ?? 0;
-        long executionTimeoutMs = endpoint["executionTimeoutMs"]?.Value<long>() ?? 0;
-        JObject template = endpoint["template"] as JObject ?? await GetTemplateAsync(endpoint["templateId"]?.ToString(), cancel);
-        string image = template?["imageName"]?.ToString() ?? "";
-        List<string> ports = TemplatePorts(template?["ports"]);
-        Logs.Debug($"{Tag} Endpoint {endpointId} template: image '{image}', ports [{string.Join(", ", ports)}].");
-        if (template is not null && !ports.Any(p => p.Equals($"{WorkerPort}/http", StringComparison.OrdinalIgnoreCase)))
+        // REST v2 (v1 retires 2026-11-15): the endpoint carries its container settings itself, template or not.
+        JObject endpoint = await GetJsonAsync($"https://api.runpod.io/v2/serverless/{endpointId}", cancel);
+        int workersMax = endpoint["workers"]?["max"]?.Value<int>() ?? 0;
+        long executionTimeoutMs = endpoint["timeout"]?.Value<long>() ?? 0;
+        string image = endpoint["image"]?.ToString() ?? "";
+        List<string> ports = TemplatePorts(endpoint["ports"]);
+        Logs.Debug($"{Tag} Endpoint {endpointId}: image '{image}', ports [{string.Join(", ", ports)}].");
+        if (!ports.Any(p => p.Equals($"{WorkerPort}/http", StringComparison.OrdinalIgnoreCase)))
         {
             findings.Add(Finding("error", $"The endpoint does not expose port {WorkerPort} as HTTP, so RunPod's proxy cannot reach the worker's SwarmUI and workers never become usable. Edit the endpoint and add {WorkerPort} under Container configuration, Expose HTTP ports."));
         }
@@ -526,7 +543,7 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         {
             findings.Add(Finding("warning", $"Max Workers is {maxWorkers}, but the endpoint allows only {workersMax}. Scaling will stop at {workersMax}."));
         }
-        if (CloudBackendTypes.NeedsCuda13(image) && AllowsCudaBelow(endpoint["allowedCudaVersions"], 13.0))
+        if (CloudBackendTypes.NeedsCuda13(image) && AllowsCudaBelow(endpoint["gpu"]?["allowedCudaVersions"], endpoint["gpu"]?["minCudaVersion"]?.ToString(), 13.0))
         {
             findings.Add(Finding("error", "The endpoint runs the HartsyInference image but allows hosts older than CUDA 13.0. Its GPU kernels need a CUDA 13 driver, so workers on older hosts cannot start their backend. Edit the endpoint and set the minimum CUDA version to 13.0."));
         }
@@ -545,38 +562,27 @@ public class RunPodServerlessProvider(string apiKey, string endpointId) : ICloud
         return findings;
     }
 
-    /// <summary>
-    /// An endpoint's template. The endpoint API documents includeTemplate but in practice returns only templateId, so it is
-    /// fetched by ID. Null if it cannot be read, which only skips the checks that need it.
-    /// </summary>
-    async Task<JObject> GetTemplateAsync(string templateId, CancellationToken cancel)
+    /// <summary>True if an endpoint can place workers on a CUDA version below <paramref name="minimum"/>: its minimum is lower or unset, and its allowed list (none listed means any) includes a lower one.</summary>
+    internal static bool AllowsCudaBelow(JToken allowed, string minCudaVersion, double minimum)
     {
-        if (string.IsNullOrWhiteSpace(templateId))
+        if (ParseCuda(minCudaVersion) >= minimum)
         {
-            return null;
+            return false;
         }
-        try
-        {
-            return await GetJsonAsync($"https://rest.runpod.io/v1/templates/{templateId}?includeEndpointBoundTemplates=true", cancel);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            Logs.Debug($"{Tag} Could not read template {templateId}: {ex.Message}");
-            return null;
-        }
+        List<double> versions = [.. TemplatePorts(allowed).Select(ParseCuda)];
+        return versions.Count == 0 || versions.Any(v => v < minimum);
     }
 
-    /// <summary>True if an endpoint's allowed CUDA versions (none listed means any) include one below <paramref name="minimum"/>.</summary>
-    internal static bool AllowsCudaBelow(JToken allowed, double minimum)
+    /// <summary>A "major.minor" CUDA version as a number, or 0 if missing or unreadable.</summary>
+    static double ParseCuda(string version)
     {
-        List<double> versions = [.. TemplatePorts(allowed).Select(v => double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) ? d : 0)];
-        return versions.Count == 0 || versions.Any(v => v < minimum);
+        return double.TryParse(version, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double d) ? d : 0;
     }
 
     /// <summary>The worker's gateway port, which the endpoint must expose as HTTP for RunPod's proxy to reach it.</summary>
     public const int WorkerPort = 7801;
 
-    /// <summary>A template's exposed ports, e.g. "7801/http", whether the API sends them as a list or one comma-separated string.</summary>
+    /// <summary>A list field of the endpoint (exposed ports such as "7801/http", or CUDA versions), whether sent as a list or one comma-separated string.</summary>
     internal static List<string> TemplatePorts(JToken ports)
     {
         IEnumerable<string> raw = ports is JArray list ? list.Select(p => p.ToString()) : (ports?.ToString() ?? "").Split(',');

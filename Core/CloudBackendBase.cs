@@ -317,7 +317,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         {
             await RemoveSlotAsync(slot, "backend shutting down");
         }
-        Provider?.Dispose();
+        // A lease still starting releases itself through the provider, so it is only disposed once none are left.
+        if (PendingAcquires == 0)
+        {
+            Provider?.Dispose();
+        }
         Provider = null;
         Status = BackendStatus.DISABLED;
     }
@@ -325,27 +329,37 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     public override IEnumerable<string> SupportedFeatures => RemoteFeatureCombo.IsEmpty ? ["text2image"] : RemoteFeatureCombo.Keys;
 
     /// <summary>
-    /// Rebuilds the provider if the owner's API key changed, releasing every lease taken under the old key.
-    /// Must be called under <see cref="SlotLock"/>.
+    /// Rebuilds the provider if the owner's API key changed, and releases every lease taken under the old key.
+    /// The swap happens under <see cref="SlotLock"/>; the slow releases run after it, so claims are never stalled.
     /// </summary>
     async Task RefreshProviderIfKeyChangedAsync()
     {
         User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend's owner user ('{OwnerUserId}') no longer exists.");
         string currentKey = GetApiKey(owner);
-        if (currentKey == ProviderApiKey)
+        WorkerSlot[] old;
+        ICloudProvider oldProvider;
+        await SlotLock.WaitAsync(Program.GlobalProgramCancel);
+        try
         {
-            return;
+            if (currentKey == ProviderApiKey)
+            {
+                return;
+            }
+            Logs.Info($"[{Provider?.ProviderName}] API key changed for user '{OwnerUserId}'; releasing workers and rebuilding the provider for backend #{BackendData?.ID}.");
+            old = Slots;
+            Slots = [];
+            oldProvider = Provider;
+            Provider = CreateProvider(currentKey);
+            ProviderApiKey = currentKey;
         }
-        Logs.Info($"[{Provider?.ProviderName}] API key changed for user '{OwnerUserId}'; releasing workers and rebuilding the provider for backend #{BackendData?.ID}.");
-        WorkerSlot[] old = Slots;
-        Slots = [];
+        finally
+        {
+            SlotLock.Release();
+        }
         foreach (WorkerSlot slot in old)
         {
             await DetachAndReleaseAsync(slot, "API key changed");
         }
-        ICloudProvider oldProvider = Provider;
-        Provider = CreateProvider(currentKey);
-        ProviderApiKey = currentKey;
         oldProvider?.Dispose();
     }
 
@@ -381,15 +395,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         using CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(cancel, Lifetime.Token);
         try
         {
-            await SlotLock.WaitAsync(Program.GlobalProgramCancel);
-            try
-            {
-                await RefreshProviderIfKeyChangedAsync();
-            }
-            finally
-            {
-                SlotLock.Release();
-            }
+            await RefreshProviderIfKeyChangedAsync();
             provider = Provider ?? throw new SwarmReadableErrorException("This cloud backend is shutting down.");
             worker = await provider.AcquireWorkerAsync(MakeLeaseRequest(), linked.Token);
             WorkerSlot slot = new() { Worker = worker, Provider = provider, ConnectUrl = await provider.GetConnectUrlAsync(worker) };
@@ -445,7 +451,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     {
         LeaseRequest request = MakeLeaseRequest();
         DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec + 60);
-        using CancellationTokenSource withdraw = new();
+        // Interrupting the generation withdraws a lease still waiting for a worker, so it never starts one.
+        using CancellationTokenSource withdraw = CancellationTokenSource.CreateLinkedTokenSource(input.InterruptToken, Program.GlobalProgramCancel);
         Task<WorkerSlot> acquiring = null;
         DateTime? refusedSince = null;
         try
@@ -486,7 +493,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} could not get a worker for this request.");
                 }
-                await Task.Delay(request.PollIntervalMs, Program.GlobalProgramCancel);
+                await Task.Delay(request.PollIntervalMs, withdraw.Token);
             }
             throw new SwarmReadableErrorException($"{CloudProviderName ?? "Cloud"} had no worker able to take this request within {request.StartupTimeoutSec}s.");
         }
@@ -501,7 +508,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
-    /// <summary>Picks and claims a mirrored backend that can serve the request, atomically. Null if none is available.</summary>
     /// <summary>
     /// Why the attached workers refuse a request, when at least one of their backends is running and idle and none will take
     /// it; null when some could, or when every backend is simply busy or starting (worth waiting for).
@@ -521,6 +527,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         return reason;
     }
 
+    /// <summary>Picks and claims a mirrored backend that can serve the request, atomically. Null if none is available.</summary>
     async Task<T2IBackendAccess> TryClaimAsync(T2IParamInput input, bool allowBusy)
     {
         await SlotLock.WaitAsync(Program.GlobalProgramCancel);
@@ -626,7 +633,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             if (slot.InUse && now >= slot.NextRenewTick)
             {
                 slot.NextRenewTick = now + 15_000;
-                await RenewQuietlyAsync(slot.Provider, slot);
+                await RenewQuietlyAsync(slot);
             }
             if (now < slot.NextLeaseCheckTick)
             {
@@ -650,16 +657,16 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     }
 
     /// <summary>Renews a lease, logging rather than throwing on failure (the lease check will notice a real loss).</summary>
-    static async Task RenewQuietlyAsync(ICloudProvider provider, WorkerSlot slot)
+    static async Task RenewQuietlyAsync(WorkerSlot slot)
     {
         try
         {
             using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(30));
-            await provider.RenewLeaseAsync(slot.Worker, cancel.Token);
+            await slot.Provider.RenewLeaseAsync(slot.Worker, cancel.Token);
         }
         catch (Exception ex)
         {
-            Logs.Debug($"[{provider.ProviderName}] Renewing worker {slot.Worker.WorkerId} failed: {ex.Message}");
+            Logs.Debug($"[{slot.Provider.ProviderName}] Renewing worker {slot.Worker.WorkerId} failed: {ex.Message}");
         }
     }
 
@@ -673,7 +680,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         {
             return;
         }
-        await RenewQuietlyAsync(slot.Provider, slot);
+        await RenewQuietlyAsync(slot);
     }
 
     // ── Talking to a worker ───────────────────────────────────────────────────
@@ -728,10 +735,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     {
     }
 
-    /// <summary>
-    /// Waits until the worker's SwarmUI has at least one backend running and none still loading. A worker that
-    /// answers but has no backend at all is a broken image, reported promptly rather than after the full timeout.
-    /// </summary>
     /// <summary>The worker's own latest error log lines, so a failed start can say why. Null if they cannot be read.</summary>
     async Task<string> RecentWorkerErrorsAsync(WorkerSlot slot)
     {
@@ -753,6 +756,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
+    /// <summary>
+    /// Waits until the worker's SwarmUI has at least one backend running and none still loading. A worker that
+    /// answers but has no backend at all is a broken image, reported promptly rather than after the full timeout.
+    /// </summary>
     async Task WaitForWorkerBackendsLoadedAsync(WorkerSlot slot, ICloudProvider provider)
     {
         LeaseRequest request = MakeLeaseRequest();
@@ -829,7 +836,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                     throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} was assigned but never answered at {slot.ConnectUrl} (last error: {lastError}). On RunPod, the endpoint must expose port 7801 as HTTP; Validate checks this.");
                 }
             }
-            await RenewQuietlyAsync(provider, slot);
+            await RenewQuietlyAsync(slot);
             await Task.Delay(request.PollIntervalMs, Program.GlobalProgramCancel);
         }
         throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} did not bring up a usable backend within {request.StartupTimeoutSec}s{(lastError is null ? "." : $" (last error: {lastError}).")}");
@@ -1020,7 +1027,14 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         Owner?.DeleteGenericData("cloudbackends", ModelCacheKey);
         RemoteModels = null;
         Models = null;
-        Program.ModelRefreshEvent?.Invoke();
+        try
+        {
+            Program.ModelRefreshEvent?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            Logs.Debug($"[{CloudProviderName}] Model refresh after clearing the model list failed: {ex.Message}");
+        }
     }
 
     /// <summary>

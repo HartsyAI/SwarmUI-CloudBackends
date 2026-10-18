@@ -55,11 +55,6 @@ public interface ICloudInstanceProvider : IDisposable
     /// </summary>
     Task<CloudInstanceStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default);
 
-    /// <summary>
-    /// Current hourly billing rate for the running instance, if the provider can report one. Used only
-    /// for the optional spend-cap failsafe in <see cref="CloudInstanceBackendBase"/> - return null if
-    /// unknown, not yet available, or the provider doesn't bill this way (the failsafe simply skips the
-    /// spend check in that case; the runtime-based cap still works regardless).
-    /// </summary>
+    /// <summary>The running instance's hourly price, for the spend failsafe, or null if unknown.</summary>
     Task<double?> GetCostPerHourAsync(CancellationToken cancel = default);
 }

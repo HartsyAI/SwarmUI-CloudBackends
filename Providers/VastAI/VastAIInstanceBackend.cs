@@ -58,7 +58,8 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         [ConfigComment("Extra environment variables for a created instance, as KEY=VALUE, one per line.\nThe SwarmUI port mapping is added automatically - no need to include it here.")]
         public string Env = "";
 
-        [ConfigComment("Only for an instance you created yourself (set in Instance ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let this backend create the instance with a token of its own. Stored in the backend settings, so admins can see it.")]
+        [ConfigComment("Only for an instance you created yourself (set in Instance ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let this backend create the instance with a token of its own. Hidden once saved.")]
+        [ValueIsSecret]
         public string WorkerToken = "";
     }
 
@@ -74,7 +75,6 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
             InstanceId = config.InstanceId?.Trim() ?? "",
             PersistedId = PersistedInstanceId ?? "",
             SwarmUIPort = config.SwarmUIPort,
-            AutoCreate = true,
             Label = string.IsNullOrWhiteSpace(config.Label) ? "swarmui-cloudbackends" : config.Label.Trim(),
             Image = config.Image?.Trim() ?? "",
             TemplateHashId = config.TemplateHashId?.Trim() ?? "",

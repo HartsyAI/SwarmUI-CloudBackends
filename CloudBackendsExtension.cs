@@ -17,45 +17,47 @@ namespace Hartsy.Extensions.CloudBackends;
 
 /// <summary>
 /// Entry point for the SwarmUI Cloud Backends extension.
-/// Registers one user-facing backend type, "Cloud Backends" (<see cref="CloudBackendsBackend"/>), which
-/// internally spins up hidden children for whichever of RunPod Serverless, RunPod GPU Pods, Vast.ai
-/// Serverless, and Vast.ai Instances its settings have enabled. See <see cref="CloudBackendTypes"/> for
-/// how those providers stay fully functional without being independently addable.
+/// Registers one user-facing backend type, "Cloud Backends" (<see cref="CloudBackendsBackend"/>), which creates hidden
+/// per-user children for whichever of RunPod Serverless, RunPod GPU Pods, Vast.ai Serverless and Vast.ai Instances its
+/// settings enable.
 ///
-/// To add a future provider (e.g. Massed Compute):
-///   1. Create Providers/MassedCompute/MassedComputeProvider.cs implementing ICloudProvider.
-///   2. Create Providers/MassedCompute/MassedComputeBackend.cs extending CloudBackendBase.
-///   3. Register it in CloudBackendTypes.Init(), add its enabled/settings fields to
-///      CloudBackendsBackend.Settings, and add the branch in CloudBackendsBackend.Init().
+/// To add a provider: implement <see cref="ICloudProvider"/> (or <see cref="ICloudInstanceProvider"/>) and a backend on
+/// <see cref="CloudBackendBase"/> (or <see cref="CloudInstanceBackendBase"/>), register its type in
+/// <see cref="CloudBackendTypes"/>, then add its prefixed fields to <see cref="CloudBackendsBackend.Settings"/> and its
+/// entries to <see cref="CloudBackendsBackend.Providers"/> and <see cref="CloudBackendsBackend.IsProviderEnabled"/>.
 /// </summary>
 public class CloudBackendsExtension : Extension
 {
     // ── Permissions ───────────────────────────────────────────────────────────
-    // One permission per provider so admins can grant access selectively.
 
     /// <summary>Permission group for everything this extension adds.</summary>
     public static readonly PermInfoGroup CloudPermGroup = new("CloudBackends", "Permissions related to cloud GPU backends.");
 
+    /// <summary>Generating on RunPod Serverless workers.</summary>
     public static readonly PermInfo PermUseRunPodServerless = Permissions.Register(new PermInfo(
         "use_runpod_serverless", "Use RunPod Serverless",
         "Allows using RunPod's serverless GPU endpoints for image generation.",
         PermissionDefault.POWERUSERS, CloudPermGroup));
 
+    /// <summary>Starting, stopping and generating on RunPod pods.</summary>
     public static readonly PermInfo PermUseRunPodPods = Permissions.Register(new PermInfo(
         "use_runpod_pods", "Use RunPod GPU Pods",
         "Allows using RunPod on-demand GPU pods for image generation.",
         PermissionDefault.POWERUSERS, CloudPermGroup));
 
+    /// <summary>Generating on Vast.ai Serverless workers.</summary>
     public static readonly PermInfo PermUseVastAI = Permissions.Register(new PermInfo(
         "use_vastai", "Use Vast.ai",
         "Allows using Vast.ai's serverless GPU endpoints for image generation.",
         PermissionDefault.POWERUSERS, CloudPermGroup));
 
+    /// <summary>Starting, stopping and generating on Vast.ai instances.</summary>
     public static readonly PermInfo PermUseVastAIInstances = Permissions.Register(new PermInfo(
         "use_vastai_instances", "Use Vast.ai Instances",
         "Allows using Vast.ai on-demand rented instances for image generation.",
         PermissionDefault.POWERUSERS, CloudPermGroup));
 
+    /// <summary>Viewing workers and status, discovering models, validating, and stopping workers and orphans.</summary>
     public static readonly PermInfo PermCloudStatus = Permissions.Register(new PermInfo(
         "cloudbackends_status", "Cloud Backends Status/Refresh",
         "Allows viewing status of, and refreshing models from, cloud GPU backends (each backend still requires its own provider permission).",
@@ -76,8 +78,7 @@ public class CloudBackendsExtension : Extension
     public override void OnPreInit()
     {
         Logs.Init("Initializing Hartsy's Cloud Backends Extension...");
-        // Fills the RunPod Pods section with live GPU/volume/pod choices, and regroups the single
-        // "Cloud Backends" settings card into one collapsible section per provider.
+        // Groups the card into one section per provider, with live provider dropdowns and the action buttons.
         ScriptFiles.Add("Assets/cloudbackends.js");
         StyleSheetFiles.Add("Assets/cloudbackends.css");
     }
@@ -85,9 +86,6 @@ public class CloudBackendsExtension : Extension
     public override void OnInit()
     {
         // ── Backend types ─────────────────────────────────────────────────────
-        // The three providers are no longer independently addable - CloudBackendTypes builds their
-        // BackendType records for internal use only (nonreal children of CloudBackendsBackend below).
-        // Their classes are otherwise unchanged and fully reused.
         CloudBackendTypes.Init();
 
         Program.Backends.RegisterBackendType<CloudBackendsBackend>(
@@ -96,34 +94,22 @@ public class CloudBackendsExtension : Extension
             CanLoadFast: true);
 
         // ── API keys ──────────────────────────────────────────────────────────
-        RegisterApiKey("runpod_api", "RunPod", "https://www.runpod.io/console/user/settings",
-            "Enter your RunPod API key. Get it from <a href='https://www.runpod.io/console/user/settings' target='_blank'>RunPod Settings</a>. Used for both Serverless and GPU Pod backends.");
+        RegisterApiKey("runpod_api", "RunPod", "https://console.runpod.io/user/credentials",
+            "Enter your RunPod API key. Create one in <a href='https://console.runpod.io/user/credentials' target='_blank'>RunPod Credentials</a>. Used for both Serverless and GPU Pod backends.");
 
-        RegisterApiKey("vastai_api", "Vast.ai", "https://cloud.vast.ai/cli/",
-            "Enter your Vast.ai API key. Get it from <a href='https://cloud.vast.ai/cli/' target='_blank'>Vast.ai Account Settings</a>.");
+        RegisterApiKey("vastai_api", "Vast.ai", "https://cloud.vast.ai/manage-keys/",
+            "Enter your Vast.ai API key. Create one in <a href='https://cloud.vast.ai/manage-keys/' target='_blank'>Vast.ai Keys, API Keys</a>. Used for both Serverless and Instance backends.");
 
         // ── Remote model providers ────────────────────────────────────────────
-        // Pods are deliberately absent here. A pod attaches core's own SwarmSwarmBackend, whose models
-        // already reach the browser through the built-in "remote_swarm" provider, so registering our
-        // own would list them twice.
-        // Known limitation: ExtraModelProviders callbacks carry no session, so the model LIST is the
-        // union across users' children; generation itself is still strictly per-user (a request routed
-        // at another user's model gets a clean refusal). Per-user listing needs a core PR, not a hack.
+        // Instances need none: their attached swarm backend's models already reach the browser through core.
+        // The list is shared by all users (the callback has no session); generation is still per user.
         RegisterModelProvider<RunPodServerlessBackend>("runpod_serverless");
         RegisterModelProvider<VastAIBackend>("vastai_serverless");
 
         // ── Per-user child provisioning ───────────────────────────────────────
-        // Backends are per-user (each runs on its owner's key), created on demand. This hook is the
-        // only pre-backend-matching point that carries the requesting user, so it is where a user's
-        // serverless children come into being. It MUST be registered before the routing hooks below,
-        // so a child can exist by the time routing inspects children. Instance (pod) children spawn
-        // only from the explicit start/status WebAPI routes - starting one bills, so a generation on
-        // some unrelated backend must never trigger it.
+        // The only hook before backend matching that knows the user. Serverless children only: instance children come
+        // from the explicit start and status routes, because starting one bills.
         RegisterPerUserProvisioning();
-
-        // No backend-type rewriting: core's own model filter already routes cloud-only models away from local
-        // backends, and forcing the serverless type would exclude the workers' mirrored backends (a different
-        // type) that should take warm generations directly.
 
         // ── Web API ───────────────────────────────────────────────────────────
         CloudBackendsWebAPI.Register();
@@ -150,6 +136,7 @@ public class CloudBackendsExtension : Extension
         return LastWarmAttempt.TryGetValue(key, out long last) && now - last >= WarmRetryMs && LastWarmAttempt.TryUpdate(key, now, last);
     }
 
+    /// <summary>Creates each user's serverless children when they first generate.</summary>
     static void RegisterPerUserProvisioning()
     {
         T2IEngine.PreGenerateEvent += (p) =>
@@ -169,11 +156,7 @@ public class CloudBackendsExtension : Extension
             {
                 if (targetType.Equals(def.Type().ID, StringComparison.OrdinalIgnoreCase))
                 {
-                    // The request explicitly targets this cloud type, so the user's child must be ready
-                    // BEFORE backend matching runs - a still-loading child is excluded from matching,
-                    // which fails fast whenever any other backend is running. The wait is short: child
-                    // Init is credential validation (capped 30s), never an instance boot. A readable
-                    // throw here (no key on file, bad key) surfaces as the generation's error message.
+                    // Explicitly targeted: the child must be ready before matching. Its Init only validates credentials (30s cap).
                     Exception lastFail = null;
                     bool ready = false;
                     foreach (CloudBackendsBackend parent in parents.Where(par => par.IsProviderEnabled(def)))
@@ -196,9 +179,7 @@ public class CloudBackendsExtension : Extension
                 }
                 else
                 {
-                    // Not targeted: warm the user's children in the background so their cloud models
-                    // and routing become available, without delaying this (non-cloud) generation.
-                    // Skips a healthy existing child (in-memory, no DB read) and throttles the rest, since this runs per image.
+                    // Warms the user's children in the background, throttled since this runs per image.
                     foreach (CloudBackendsBackend parent in parents)
                     {
                         if (parent.GetChildFor(user.UserID, def) is AbstractT2IBackend child && child.Status != BackendStatus.ERRORED)
@@ -216,6 +197,7 @@ public class CloudBackendsExtension : Extension
         };
     }
 
+    /// <summary>Adds an API key type to User Settings.</summary>
     static void RegisterApiKey(string keyType, string title, string createLink, string infoHtml)
     {
         BasicAPIFeatures.AcceptedAPIKeyTypes.Add(keyType);
@@ -237,6 +219,7 @@ public class CloudBackendsExtension : Extension
         }
     }
 
+    /// <summary>Lists a serverless type's discovered models to the browser.</summary>
     static void RegisterModelProvider<T>(string backendTypeId) where T : CloudBackendBase
     {
         try

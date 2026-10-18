@@ -28,9 +28,6 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
     /// <summary>Shared HTTP client for provider REST calls.</summary>
     public static readonly HttpClient Http = NetworkBackendUtils.MakeHttpClient();
 
-    /// <summary>Human-readable provider name used in logs and error messages.</summary>
-    public string ProviderName => providerName;
-
     /// <summary>
     /// Calls the provider's REST API, translating failures into readable errors. A non-JSON success
     /// body yields null. With <paramref name="allowNotFound"/>, a 404 yields null instead of throwing.
@@ -49,7 +46,7 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             }
             return request;
         }
-        Logs.Debug($"[{providerName}] {method} {path}");
+        Logs.Debug($"[{providerName}] {method} {path.Split('?')[0]}");
         // Backs off on rate limits (Vast.ai allows about two requests a second); only reads and deletes retry server errors.
         bool idempotent = method == HttpMethod.Get || method == HttpMethod.Delete;
         using HttpResponseMessage response = await HttpRetry.SendAsync(Http, MakeRequest, $"[{providerName}]", cancel, idempotent);
@@ -79,7 +76,6 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         try
         {
             JObject problem = JObject.Parse(text);
-            Logs.Debug($"[{providerName}] API error {status} response fields: {string.Join(", ", problem.Properties().Select(p => $"{p.Name}:{p.Value.Type}"))}");
             detail = problem["detail"]?.ToString() ?? text;
             string fields = ValidationErrors(problem);
             if (fields is not null)
@@ -89,12 +85,14 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         }
         catch (Exception)
         {
-            // Intentionally empty.
+            // Not JSON: the raw body is the detail.
         }
+        // Error bodies can echo a request, e.g. an instance's env with its worker token.
+        detail = MaskSecrets(detail);
         throw errorMapper?.Invoke(status, detail) ?? new CloudApiException(providerName, status, detail);
     }
 
-    /// <summary>Parses newline or comma separated KEY=VALUE pairs into a JSON object.</summary>
+    /// <summary>Parses KEY=VALUE pairs, one per line, into a JSON object.</summary>
     public static JObject ParseEnv(string raw)
     {
         JObject result = [];
@@ -102,7 +100,7 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         {
             return result;
         }
-        foreach (string line in raw.Split(['\n', '\r', ','], StringSplitOptions.RemoveEmptyEntries))
+        foreach (string line in raw.Split(['\n', '\r'], StringSplitOptions.RemoveEmptyEntries))
         {
             int eq = line.IndexOf('=');
             if (eq > 0)
@@ -133,7 +131,10 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             cancel.ThrowIfCancellationRequested();
             try
             {
-                JObject session = await (client ?? Http).PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], workerToken is null ? null : req => req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", workerToken), cancel);
+                // One hung request must not use up the whole startup wait.
+                using CancellationTokenSource attempt = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+                attempt.CancelAfter(TimeSpan.FromSeconds(30));
+                JObject session = await (client ?? Http).PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], workerToken is null ? null : req => req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", workerToken), attempt.Token);
                 if (session?["error_id"]?.ToString() == "worker_unauthorized")
                 {
                     throw new SwarmReadableErrorException($"The SwarmUI at {publicUrl} refused this backend's token. If you created that instance yourself, set its SWARMUI_WORKER_TOKEN to match, or let this backend create the instance.");
@@ -147,7 +148,7 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             {
                 throw;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (!cancel.IsCancellationRequested)
             {
                 last = ex;
             }
@@ -172,8 +173,7 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         {
             if (item is not JObject e)
             {
-                // Plain-text errors may quote the rejected value, so anything shaped like a token is masked.
-                return System.Text.RegularExpressions.Regex.Replace(item.ToString(), "[A-Za-z0-9_-]{32,}", "***");
+                return MaskSecrets(item.ToString());
             }
             string path = (e["path"] ?? e["location"] ?? e["field"] ?? e["name"])?.ToString(Newtonsoft.Json.Formatting.None).Trim('"');
             string message = (e["message"] ?? e["reason"] ?? e["msg"])?.ToString();
@@ -181,6 +181,12 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         }).Where(m => !string.IsNullOrWhiteSpace(m)).Take(5);
         string joined = string.Join("; ", items);
         return joined.Length == 0 ? null : joined;
+    }
+
+    /// <summary>Masks anything shaped like a token or key (32+ URL-safe characters).</summary>
+    internal static string MaskSecrets(string text)
+    {
+        return text is null ? null : System.Text.RegularExpressions.Regex.Replace(text, "[A-Za-z0-9_-]{32,}", "***");
     }
 }
 
@@ -196,8 +202,10 @@ public class CloudStatusCache
     /// <summary>Single-flights status fetches.</summary>
     readonly SemaphoreSlim Lock = new(1, 1);
 
+    /// <summary>The last fetched status.</summary>
     CloudInstanceStatus Cached;
 
+    /// <summary>When <see cref="Cached"/> goes stale.</summary>
     DateTime Expiry = DateTime.MinValue;
 
     /// <summary>Returns the cached status, or fetches (single-flight) when expired or forced.</summary>

@@ -14,11 +14,9 @@ using SwarmUI.Utils;
 namespace Hartsy.Extensions.CloudBackends.Core;
 
 /// <summary>
-/// The single user-facing "Cloud Backends" entry. Never generates anything itself - on Init it spins up
-/// a hidden (nonreal) child backend for each provider section the user has enabled, reusing the existing
-/// <see cref="RunPodServerlessBackend"/>/<see cref="RunPodPodsBackend"/>/<see cref="VastAIBackend"/>/
-/// <see cref="VastAIInstanceBackend"/> classes unchanged. On Shutdown (including a settings-edit re-Init)
-/// it tears all of them down again, so the child set always matches the current toggle state.
+/// The single user-facing "Cloud Backends" entry. Never generates itself: each user gets hidden (nonreal) children, one
+/// per enabled provider section, created on demand on that user's own API key. Shutdown (including a settings edit) tears
+/// them all down; users get fresh ones on next use.
 /// </summary>
 public class CloudBackendsBackend : AbstractT2IBackend
 {
@@ -51,7 +49,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ConfigComment("Destroy the pod when this backend shuts down, instead of just stopping it.")]
         public bool RunPodPods_TerminateOnShutdown = false;
         [SuggestionPlaceholder(Text = "blank = a name unique to this backend")]
-        [ConfigComment("Name given to pods this backend creates, and used to find that pod again later.\nLeave blank to use a name unique to this backend (recommended) - a shared literal name here across two or more Cloud Backends instances would make each backend's 'find an existing pod by name' step liable to attach to the other's pod instead of creating its own.")]
+        [ConfigComment("Name given to pods this backend creates, and used to find that pod again later.\nLeave blank (recommended) for a name unique to this backend and user.")]
         public string RunPodPods_PodName = "";
         [ConfigComment("Docker image to create the pod from. Ignored when TemplateId is set.\nUse the Hartsy RunPod worker image (pinned to a release), which secures the pod with a token this backend manages.")]
         public string RunPodPods_ImageName = CloudBackendTypes.DefaultRunPodImage;
@@ -81,7 +79,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public string RunPodPods_DataCenterId = "";
         [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
         public string RunPodPods_PodEnv = "";
-        [ConfigComment("Only for a pod you created yourself (set in Pod ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let Cloud Backends create the pod with a token of its own. Stored in the backend settings, so admins can see it.")]
+        [ConfigComment("Only for a pod you created yourself (set in Pod ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let Cloud Backends create the pod with a token of its own. Hidden once saved.")]
+        [ValueIsSecret]
         public string RunPodPods_WorkerToken = "";
         [ConfigComment("How long to wait for the pod to boot and for SwarmUI on it to answer, in seconds.")]
         public int RunPodPods_StartupTimeoutSec = 900;
@@ -118,7 +117,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ConfigComment("Destroy the instance when this backend shuts down, instead of just stopping it.")]
         public bool VastAIInstance_TerminateOnShutdown = false;
         [SuggestionPlaceholder(Text = "blank = a label unique to this backend")]
-        [ConfigComment("Label given to instances this backend creates, and used to find that instance again later.\nLeave blank to use a label unique to this backend (recommended) - a shared literal label across two or more Cloud Backends instances would make each backend's find-by-label step liable to attach to the other's instance instead of creating its own.")]
+        [ConfigComment("Label given to instances this backend creates, and used to find that instance again later.\nLeave blank (recommended) for a label unique to this backend and user.")]
         public string VastAIInstance_Label = "";
         [ConfigComment("Docker image to create the instance from. Ignored when TemplateHashId is set.\nUse the Hartsy Vast.ai worker image (pinned to a release), which serves HTTPS and is secured with a token this backend manages.")]
         public string VastAIInstance_Image = CloudBackendTypes.DefaultVastImage;
@@ -126,7 +125,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ConfigComment("Vast.ai template to create the instance from, instead of naming an image directly.")]
         public string VastAIInstance_TemplateHashId = "";
         [SuggestionPlaceholder(Text = "pick an offer, or leave blank for cheapest available")]
-        [ConfigComment("Specific rentable offer to create the instance from.\nLeave blank to search on-demand offers and take the cheapest match. Unlike RunPod's GPU-type retry, an offer is a specific host slot - if it's gone by the time Swarm tries to use it, pick another rather than expecting an automatic fallback.")]
+        [ConfigComment("Specific rentable offer (machine) to create the instance from.\nLeave blank to take the cheapest matching offer. If a chosen offer is gone by the time you start, pick another.")]
         public string VastAIInstance_OfferId = "";
         [ConfigComment("Container disk size in GB for a created instance. This is wiped when the instance is destroyed.")]
         public int VastAIInstance_DiskGb = 20;
@@ -137,7 +136,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public string VastAIInstance_VolumeMountPath = "/workspace";
         [ConfigComment("Extra environment variables for a created instance, as KEY=VALUE, one per line.\nThe SwarmUI port mapping is added automatically - no need to include it here.")]
         public string VastAIInstance_Env = "";
-        [ConfigComment("Only for an instance you created yourself (set in Instance ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let Cloud Backends create the instance with a token of its own. Stored in the backend settings, so admins can see it.")]
+        [ConfigComment("Only for an instance you created yourself (set in Instance ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let Cloud Backends create the instance with a token of its own. Hidden once saved.")]
+        [ValueIsSecret]
         public string VastAIInstance_WorkerToken = "";
         [ConfigComment("How long to wait for the instance to boot and for SwarmUI on it to answer, in seconds.")]
         public int VastAIInstance_StartupTimeoutSec = 900;
@@ -149,6 +149,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public double VastAIInstance_MaxSpendUsd = 0;
     }
 
+    /// <summary>This backend's settings.</summary>
     Settings Config => (Settings)SettingsRaw;
 
     /// <summary>One provider section of the parent settings: its field prefix, display label, which API key it bills, whether it rents whole instances, and its hidden backend type.</summary>
@@ -181,6 +182,12 @@ public class CloudBackendsBackend : AbstractT2IBackend
 
     /// <summary>Per-(user, provider) spawn locks, so concurrent first requests cannot double-spawn a child.</summary>
     readonly ConcurrentDictionary<string, SemaphoreSlim> SpawnLocks = new();
+
+    /// <summary>When each errored child was first seen errored, so a transient failure is retried after a while.</summary>
+    readonly ConcurrentDictionary<string, DateTime> ErroredSince = new();
+
+    /// <summary>How long an errored child is kept before the next use respawns it.</summary>
+    static readonly TimeSpan ErroredRetryAfter = TimeSpan.FromMinutes(5);
 
     /// <summary>Control backend only - never loads models or generates directly.</summary>
     public override IEnumerable<string> SupportedFeatures => [];
@@ -265,9 +272,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
 
     /// <summary>
     /// Ensures the given user has a child backend for the given provider, spawning one on their own API
-    /// key if needed. Idempotent and cheap when the child already exists (any status - an ERRORED child
-    /// is only respawned when the user's key has changed since it errored, so a bad key cannot become a
-    /// per-generation retry loop). Returns null without side effects when the section is disabled or
+    /// key if needed. Idempotent and cheap when the child already exists. An errored child is respawned
+    /// only after the user's key changes or a few minutes pass, so a bad key cannot become a retry loop. Returns null without side effects when the section is disabled or
     /// the user has no key; <paramref name="throwWhenUnavailable"/> upgrades those to readable errors
     /// for explicit user actions.
     ///
@@ -293,7 +299,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         string key = $"{user.UserID}/{def.Prefix}";
         string apiKey = user.GetGenericData(def.KeyType, "key")?.Trim();
         AbstractT2IBackend existing = GetChildFor(user.UserID, def);
-        if (existing is not null && !(existing.Status == BackendStatus.ERRORED && existing is ICloudBackend cloud && !string.IsNullOrEmpty(apiKey) && !cloud.IsUsingApiKey(apiKey)))
+        if (existing is not null && !ShouldRespawn(existing, key, apiKey))
         {
             return existing;
         }
@@ -312,45 +318,47 @@ public class CloudBackendsBackend : AbstractT2IBackend
             existing = GetChildFor(user.UserID, def);
             if (existing is not null)
             {
-                if (existing.Status == BackendStatus.ERRORED && existing is ICloudBackend cloud2 && !cloud2.IsUsingApiKey(apiKey))
-                {
-                    Logs.Info($"[CloudBackends] Respawning errored {def.Label} child for user '{user.UserID}' after an API key change.");
-                    await RemoveChild(existing.BackendData.ID, key);
-                }
-                else
+                if (!ShouldRespawn(existing, key, apiKey))
                 {
                     return existing;
                 }
+                Logs.Info($"[CloudBackends] Respawning errored {def.Label} child for user '{user.UserID}'.");
+                ErroredSince.TryRemove(key, out _);
+                await RemoveChild(existing.BackendData.ID, key);
             }
             AutoConfiguration settings = BuildChildSettings(def);
+            // A name unique to this backend and user, so each user's find-by-name reattaches only their own machine.
+            string uniqueName = $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
             if (settings is RunPodPodsBackend.Settings pods && string.IsNullOrWhiteSpace(pods.PodName))
             {
-                // A name unique to this backend AND user, so each user's find-by-name reattaches their
-                // own pod. The local user keeps the pre-per-user default name, so upgrading does not
-                // orphan (and keep billing) a pod created under the old naming.
-                pods.PodName = user.UserID == SessionHandler.LocalUserID ? $"swarmui-cloudbackends-{BackendData.ID}" : $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
+                pods.PodName = uniqueName;
             }
             if (settings is VastAIInstanceBackend.Settings vast && string.IsNullOrWhiteSpace(vast.Label))
             {
-                // Same unique fallback as the pod name above, for the same reasons.
-                vast.Label = user.UserID == SessionHandler.LocalUserID ? $"swarmui-cloudbackends-{BackendData.ID}" : $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
+                vast.Label = uniqueName;
             }
             Logs.Info($"[CloudBackends] Spawning {def.Label} child of backend #{BackendData.ID} for user '{user.UserID}'.");
             BackendHandler.BackendData data = Handler.AddNewNonrealBackend(def.Type(), BackendData, settings, newData =>
             {
                 newData.AbstractBackend.Title = $"[Cloud Backends #{BackendData.ID}] {def.Label} ({user.UserID})";
-                switch (newData.AbstractBackend)
+                if (newData.AbstractBackend is CloudBackendBase serverless)
                 {
-                    case CloudBackendBase c: c.OwnerUserId = user.UserID; break;
-                    case CloudInstanceBackendBase i: i.OwnerUserId = user.UserID; break;
+                    serverless.OwnerUserId = user.UserID;
                 }
-                // AddNewNonrealBackend takes a `parent` argument but (as of this writing) never assigns
-                // it - set it ourselves so WebAPI calls can find "user X's RunPod Pods child of backend
-                // #N" by the one ID the frontend actually has (the parent's), instead of needing the
-                // child's own hidden negative ID, which is never exposed to the UI.
+                else if (newData.AbstractBackend is CloudInstanceBackendBase instance)
+                {
+                    instance.OwnerUserId = user.UserID;
+                }
+                // Core never assigns the parent of a nonreal backend; the routes find a user's child through it.
                 newData.AbstractParent = BackendData;
             });
             ChildMap[key] = data.ID;
+            if (Status != BackendStatus.RUNNING)
+            {
+                // This backend shut down while the child was being created; nothing would ever manage it.
+                await RemoveChild(data.ID, key);
+                return null;
+            }
             return data.AbstractBackend as AbstractT2IBackend;
         }
         finally
@@ -398,26 +406,37 @@ public class CloudBackendsBackend : AbstractT2IBackend
         }
     }
 
+    /// <summary>Deletes every child.</summary>
     async Task TearDownChildren()
     {
         foreach (KeyValuePair<string, int> pair in ChildMap)
         {
-            ChildMap.TryRemove(pair.Key, out _);
-            try
-            {
-                await Handler.DeleteById(pair.Value);
-            }
-            catch (Exception ex)
-            {
-                Logs.Debug($"[CloudBackends] Removing child backend #{pair.Value} failed: {ex.Message}");
-            }
+            await RemoveChild(pair.Value, pair.Key);
         }
+        ErroredSince.Clear();
+    }
+
+    /// <summary>True if an existing child should be replaced: it errored, and either the owner's key changed since, or it has stayed errored a while.</summary>
+    bool ShouldRespawn(AbstractT2IBackend existing, string key, string apiKey)
+    {
+        if (existing.Status != BackendStatus.ERRORED || string.IsNullOrEmpty(apiKey))
+        {
+            ErroredSince.TryRemove(key, out _);
+            return false;
+        }
+        if (existing is ICloudBackend cloud && !cloud.IsUsingApiKey(apiKey))
+        {
+            return true;
+        }
+        DateTime since = ErroredSince.GetOrAdd(key, _ => DateTime.UtcNow);
+        return DateTime.UtcNow - since > ErroredRetryAfter;
     }
 
     public override async Task Shutdown()
     {
-        await TearDownChildren();
+        // Set first, so a child still being created sees it and removes itself.
         Status = BackendStatus.DISABLED;
+        await TearDownChildren();
     }
 
     public override bool IsValidForThisBackend(T2IParamInput input)
