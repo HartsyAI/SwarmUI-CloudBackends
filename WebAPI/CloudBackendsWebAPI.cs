@@ -15,25 +15,25 @@ public static class CloudBackendsWebAPI
 {
     public static void Register()
     {
-        API.RegisterAPICall(CloudRefreshModels, true, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(CloudGetStatus, false, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(CloudStartPod, true, CloudBackendsExtension.PermUseRunPodPods);
-        API.RegisterAPICall(CloudStartPodWS, true, CloudBackendsExtension.PermUseRunPodPods);
-        API.RegisterAPICall(CloudStopPod, true, CloudBackendsExtension.PermUseRunPodPods);
-        API.RegisterAPICall(CloudGetPodStatus, false, CloudBackendsExtension.PermUseRunPodPods);
-        API.RegisterAPICall(VastAIStartInstance, true, CloudBackendsExtension.PermUseVastAIInstances);
-        API.RegisterAPICall(VastAIStartInstanceWS, true, CloudBackendsExtension.PermUseVastAIInstances);
-        API.RegisterAPICall(VastAIStopInstance, true, CloudBackendsExtension.PermUseVastAIInstances);
-        API.RegisterAPICall(VastAIGetInstanceStatus, false, CloudBackendsExtension.PermUseVastAIInstances);
+        API.RegisterAPICall(CloudRefreshModels, true, CloudBackends.PermCloudStatus);
+        API.RegisterAPICall(CloudGetStatus, false, CloudBackends.PermCloudStatus);
+        API.RegisterAPICall(CloudStartPod, true, CloudBackends.PermUseRunPodPods);
+        API.RegisterAPICall(CloudStartPodWS, true, CloudBackends.PermUseRunPodPods);
+        API.RegisterAPICall(CloudStopPod, true, CloudBackends.PermUseRunPodPods);
+        API.RegisterAPICall(CloudGetPodStatus, false, CloudBackends.PermUseRunPodPods);
+        API.RegisterAPICall(VastAIStartInstance, true, CloudBackends.PermUseVastAIInstances);
+        API.RegisterAPICall(VastAIStartInstanceWS, true, CloudBackends.PermUseVastAIInstances);
+        API.RegisterAPICall(VastAIStopInstance, true, CloudBackends.PermUseVastAIInstances);
+        API.RegisterAPICall(VastAIGetInstanceStatus, false, CloudBackends.PermUseVastAIInstances);
         API.RegisterAPICall(CloudListProviders, false, Permissions.ViewBackendsList);
-        API.RegisterAPICall(CloudListRunPodOptions, false, CloudBackendsExtension.PermUseRunPodPods);
-        API.RegisterAPICall(CloudListWorkers, false, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(CloudStopWorker, true, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(CloudValidateBackend, false, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(CloudClearModelCache, true, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(CloudListOrphans, false, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(CloudStopOrphan, true, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(VastAIListInstanceOptions, false, CloudBackendsExtension.PermUseVastAIInstances);
+        API.RegisterAPICall(CloudListRunPodOptions, false, CloudBackends.PermUseRunPodPods);
+        API.RegisterAPICall(CloudListWorkers, false, CloudBackends.PermCloudStatus);
+        API.RegisterAPICall(CloudStopWorker, true, CloudBackends.PermCloudStatus);
+        API.RegisterAPICall(CloudValidateBackend, false, CloudBackends.PermCloudStatus);
+        API.RegisterAPICall(CloudClearModelCache, true, CloudBackends.PermCloudStatus);
+        API.RegisterAPICall(CloudListOrphans, false, CloudBackends.PermCloudStatus);
+        API.RegisterAPICall(CloudStopOrphan, true, CloudBackends.PermCloudStatus);
+        API.RegisterAPICall(VastAIListInstanceOptions, false, CloudBackends.PermUseVastAIInstances);
     }
 
     /// <summary>True if the session's user may act on this backend (each provider defines its own permission).</summary>
@@ -671,7 +671,7 @@ public static class CloudBackendsWebAPI
         JArray orphans = [];
         JArray errors = [];
         string runpodKey = session.User.GetGenericData("runpod_api", "key")?.Trim();
-        if (!string.IsNullOrEmpty(runpodKey) && session.User.HasPermission(CloudBackendsExtension.PermUseRunPodPods))
+        if (!string.IsNullOrEmpty(runpodKey) && session.User.HasPermission(CloudBackends.PermUseRunPodPods))
         {
             try
             {
@@ -692,7 +692,7 @@ public static class CloudBackendsWebAPI
             }
         }
         string vastKey = session.User.GetGenericData("vastai_api", "key")?.Trim();
-        if (!string.IsNullOrEmpty(vastKey) && session.User.HasPermission(CloudBackendsExtension.PermUseVastAIInstances))
+        if (!string.IsNullOrEmpty(vastKey) && session.User.HasPermission(CloudBackends.PermUseVastAIInstances))
         {
             try
             {
@@ -730,7 +730,7 @@ public static class CloudBackendsWebAPI
         if (provider == "runpod")
         {
             string key = session.User.GetGenericData("runpod_api", "key")?.Trim();
-            if (string.IsNullOrEmpty(key) || !session.User.HasPermission(CloudBackendsExtension.PermUseRunPodPods))
+            if (string.IsNullOrEmpty(key) || !session.User.HasPermission(CloudBackends.PermUseRunPodPods))
             {
                 return Error("You need a RunPod API key and the RunPod GPU Pods permission to do this.", "no_api_key");
             }
@@ -745,7 +745,7 @@ public static class CloudBackendsWebAPI
         if (provider == "vastai")
         {
             string key = session.User.GetGenericData("vastai_api", "key")?.Trim();
-            if (string.IsNullOrEmpty(key) || !session.User.HasPermission(CloudBackendsExtension.PermUseVastAIInstances))
+            if (string.IsNullOrEmpty(key) || !session.User.HasPermission(CloudBackends.PermUseVastAIInstances))
             {
                 return Error("You need a Vast.ai API key and the Vast.ai Instances permission to do this.", "no_api_key");
             }

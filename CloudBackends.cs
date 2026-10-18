@@ -26,7 +26,7 @@ namespace Hartsy.Extensions.CloudBackends;
 /// <see cref="CloudBackendTypes"/>, then add its prefixed fields to <see cref="CloudBackendsBackend.Settings"/> and its
 /// entries to <see cref="CloudBackendsBackend.Providers"/> and <see cref="CloudBackendsBackend.IsProviderEnabled"/>.
 /// </summary>
-public class CloudBackendsExtension : Extension
+public class CloudBackends : Extension
 {
     // ── Permissions ───────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ public class CloudBackendsExtension : Extension
 
     // ── Extension lifecycle ───────────────────────────────────────────────────
 
-    public CloudBackendsExtension()
+    public CloudBackends()
     {
         // Shown in the Extensions tab until the repo is on the official extension list, which then takes over.
         ExtensionAuthor = "Hartsy";
