@@ -353,7 +353,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
                 newData.AbstractParent = BackendData;
             });
             ChildMap[key] = data.ID;
-            if (Status != BackendStatus.RUNNING)
+            if (Status is BackendStatus.DISABLED or BackendStatus.ERRORED)
             {
                 // This backend shut down while the child was being created; nothing would ever manage it.
                 await RemoveChild(data.ID, key);

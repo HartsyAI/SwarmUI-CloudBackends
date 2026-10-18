@@ -70,7 +70,6 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     /// <inheritdoc/>
     public string ProviderName => "Vast.ai";
 
-
     // ── Leases ────────────────────────────────────────────────────────────────
 
     /// <inheritdoc/>

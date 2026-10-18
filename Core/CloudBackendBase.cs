@@ -435,9 +435,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         finally
         {
+            int remaining;
             lock (ReserveLock)
             {
-                PendingAcquires--;
+                remaining = --PendingAcquires;
+            }
+            // Shutdown leaves the provider to the last lease still starting, which disposes it here.
+            if (remaining == 0 && ShuttingDown && Provider is null)
+            {
+                provider?.Dispose();
             }
         }
     }
