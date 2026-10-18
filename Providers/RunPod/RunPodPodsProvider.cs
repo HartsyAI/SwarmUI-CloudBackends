@@ -15,9 +15,6 @@ public class RunPodPodPlan
     /// <summary>Port SwarmUI listens on inside the pod. Declared as an http port so RunPod's proxy fronts it.</summary>
     public int SwarmUIPort = 7801;
 
-    /// <summary>Whether the provider may create a pod when no existing one is found.</summary>
-    public bool AutoCreate = false;
-
     /// <summary>Pod ID remembered from a previous run, used as a reattach hint after live verification. Never blocks a fresh create when stale.</summary>
     public string PersistedId = "";
 
@@ -79,7 +76,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     public string ActiveInstanceId { get; private set; } = plan.PodId?.Trim() ?? "";
 
     public string ProviderName => "RunPod GPU Pods";
-    public string ApiKeyType => "runpod_api";
 
     /// <summary>Shared HTTP plumbing, with RunPod's well-known failure statuses mapped to actionable messages.</summary>
     readonly CloudApiClient Api = new("RunPodPods", "https://api.runpod.io/v2", apiKey, (status, detail) => status switch
@@ -135,13 +131,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
 
     public async Task ValidateAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActiveInstanceId) && !plan.AutoCreate)
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId) && string.IsNullOrWhiteSpace(plan.ImageName) && string.IsNullOrWhiteSpace(plan.TemplateId))
         {
-            throw new SwarmReadableErrorException("No RunPod pod ID is set and AutoCreate is off. Set 'PodId', or enable 'AutoCreate' with an image (or template) and a GPU type.");
-        }
-        if (plan.AutoCreate && string.IsNullOrWhiteSpace(plan.ImageName) && string.IsNullOrWhiteSpace(plan.TemplateId))
-        {
-            throw new SwarmReadableErrorException("AutoCreate is on but neither 'ImageName' nor 'TemplateId' is set, so there is nothing to create a pod from.");
+            throw new SwarmReadableErrorException("Set 'ImageName' or 'TemplateId' so a pod can be created, or set 'PodId' to use an existing pod.");
         }
         await ApiAsync(HttpMethod.Get, "/pods", null, cancel);
         if (!string.IsNullOrWhiteSpace(ActiveInstanceId) && await GetPodAsync(ActiveInstanceId, cancel) is null)
@@ -159,7 +151,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         Logs.Info($"[RunPodPods] Pod '{podId}' status={status}");
         if (status.Equals("TERMINATED", StringComparison.OrdinalIgnoreCase))
         {
-            throw new SwarmReadableErrorException($"RunPod pod '{podId}' has been terminated and cannot be resumed. Create a new pod, or enable AutoCreate.");
+            throw new SwarmReadableErrorException($"RunPod pod '{podId}' has been terminated and cannot be resumed. Clear 'PodId' to let Cloud Backends create a new one.");
         }
         // v2 publishes the currently-legal transitions per pod, so ask rather than assume.
         if (!status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
@@ -280,10 +272,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         {
             return ActiveInstanceId;
         }
-        if (!plan.AutoCreate)
-        {
-            throw new SwarmReadableErrorException("No RunPod pod ID is set and AutoCreate is off.");
-        }
         // A pod remembered from a previous run is only a hint - verify it still exists and is not
         // terminal before trusting it, so a stale memory can never block or misdirect a fresh create.
         if (!string.IsNullOrWhiteSpace(plan.PersistedId))
@@ -341,7 +329,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             Logs.Info($"[RunPodPods] Creating pod '{plan.PodName}' on '{gpuId}'{(string.IsNullOrWhiteSpace(dataCenterId) ? "" : $" in {dataCenterId}")}...");
             try
             {
-                JObject created = await ApiAsync(HttpMethod.Post, "/pods", body, cancel) as JObject;
+                cancel.ThrowIfCancellationRequested();
+                // Never cancelled once sent: a pod RunPod creates bills, and losing its ID would leave it running unreleased.
+                JObject created = await ApiAsync(HttpMethod.Post, "/pods", body, CancellationToken.None) as JObject;
                 string id = created?["id"]?.ToString();
                 if (string.IsNullOrWhiteSpace(id))
                 {
@@ -367,7 +357,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         JObject body = new()
         {
             ["name"] = plan.PodName,
-            ["cloud"] = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperInvariant(),
+            ["cloud"] = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperFast(),
             ["disk"] = Math.Max(1, plan.ContainerDiskGb),
             // SwarmUI's port must be http for RunPod's proxy to route to it.
             ["ports"] = new JArray($"{plan.SwarmUIPort}/http", "22/tcp"),
@@ -432,7 +422,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         {
             return [plan.GpuTypeId];
         }
-        string cloud = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperInvariant();
+        string cloud = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperFast();
         JToken catalog = await ApiAsync(HttpMethod.Get, $"/catalog/gpus?include=AVAILABILITY&product=POD&cloud={cloud}", null, cancel);
         List<string> ordered = OrderGpuCandidates(catalog?["gpus"] as JArray, cloud, dataCenterId);
         if (ordered.Count == 0)

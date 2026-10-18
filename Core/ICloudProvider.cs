@@ -42,9 +42,6 @@ public interface ICloudProvider : IDisposable
     /// <summary>Human-readable provider name shown in logs and status responses.</summary>
     string ProviderName { get; }
 
-    /// <summary>Key type string registered in SwarmUI's upstream API key store (e.g. "runpod_api").</summary>
-    string ApiKeyType { get; }
-
     /// <summary>
     /// Leases a worker and returns once its gateway address and token are known. Cancelling <paramref name="cancel"/>
     /// before a worker has been assigned withdraws the request so nothing is billed; once one has been assigned it

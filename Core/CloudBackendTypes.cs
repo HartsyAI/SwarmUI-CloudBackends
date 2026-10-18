@@ -10,11 +10,8 @@ namespace Hartsy.Extensions.CloudBackends.Core;
 /// (RunPod Serverless, RunPod GPU Pods, Vast.ai Serverless, Vast.ai Instances) WITHOUT calling
 /// <see cref="BackendHandler.RegisterBackendType"/>.
 ///
-/// The provider classes are otherwise unchanged and fully functional - they just aren't independently
-/// addable any more. <see cref="CloudBackendsBackend"/> is the one user-facing "Add new backend" entry;
-/// it spins these up as hidden (nonreal) children via <see cref="BackendHandler.AddNewNonrealBackend"/>,
-/// which only needs a BackendType record (BackendClass + SettingsClass) - it never touches the public
-/// registry that feeds the "Add new backend" button list or the per-generation BackendType dropdown.
+/// <see cref="CloudBackendsBackend"/> creates these as hidden (nonreal) children through
+/// <see cref="BackendHandler.AddNewNonrealBackend"/>, so they never appear in "Add new backend" or the BackendType parameter.
 /// </summary>
 public static class CloudBackendTypes
 {

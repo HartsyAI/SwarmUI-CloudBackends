@@ -84,7 +84,9 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     public abstract void CheckPermission(Session session);
 
     /// <summary>Throw if this backend's settings are unusable. Runs before the provider is built.</summary>
-    protected virtual void CheckRequiredConfig() { }
+    protected virtual void CheckRequiredConfig()
+    {
+    }
 
     /// <summary>The live provider, once created in Init.</summary>
     public ICloudInstanceProvider Provider;
@@ -96,14 +98,15 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     public BackendHandler.BackendData ChildBackend;
 
     /// <summary>Guards start and stop so two requests cannot race the instance lifecycle.</summary>
-    public SemaphoreSlim InstanceLock = new(1, 1);
+    public readonly SemaphoreSlim InstanceLock = new(1, 1);
+
+    /// <summary>Cancelled when this backend shuts down, so a start in progress gives up instead of holding the lock for minutes.</summary>
+    CancellationTokenSource Lifetime = new();
 
     /// <summary>Control instances never load models or generate; the child backend does.</summary>
     public override IEnumerable<string> SupportedFeatures => [];
 
     // ── Runtime/spend failsafe ───────────────────────────────────────────────
-    // Same Program.TickEvent subscribe-in-Init/unsubscribe-in-Shutdown idiom AutoScalingBackend uses for
-    // its own periodic housekeeping; throttled internally since the tick fires roughly once a second.
 
     /// <summary>When the current instance was confirmed up. Null while no instance is running.</summary>
     public DateTime? InstanceStartedAt;
@@ -190,13 +193,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
 
     // ── Per-user instance persistence ─────────────────────────────────────────
 
-    /// <summary>
-    /// Per-user KV name this backend's created instance ID is remembered under (SaveGenericData
-    /// lowercases it). Keyed by class plus the user-visible parent backend ID, so each provider section
-    /// of each "Cloud Backends" entry remembers its own instance per user. Note this key follows the
-    /// parent's ID: renumbering the backend via EditBackend's new_id orphans the remembered instance
-    /// (same pre-existing property as the default pod naming scheme).
-    /// </summary>
+    /// <summary>Per-user key the active instance ID is remembered under: class plus the parent backend's ID.</summary>
     string PersistName => $"{GetType().Name}_{BackendData?.AbstractParent?.ID ?? BackendData?.ID}";
 
     /// <summary>
@@ -215,7 +212,6 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// <summary>A token set in the card for an existing machine you created yourself, or null to use (and inject) this backend's own.</summary>
     protected virtual string ExistingWorkerToken => null;
 
-    /// <summary>Remembers the provider's active instance ID in the owner's user data (no-op if unchanged or unknown).</summary>
     /// <summary>How many instance IDs per provider are remembered for orphan detection.</summary>
     const int KnownInstanceLimit = 50;
 
@@ -264,6 +260,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         }
     }
 
+    /// <summary>Remembers the provider's active instance ID in the owner's user data (no-op if unchanged or unknown).</summary>
     void PersistActiveInstanceId()
     {
         string id = Provider?.ActiveInstanceId;
@@ -271,7 +268,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         {
             return;
         }
-        // Recorded even when unchanged: an ID remembered before the known-instances list existed must still join it.
+        // Recorded even when unchanged, so an ID missing from the orphan list (older install, or evicted) rejoins it.
         RememberKnownInstance(Owner, GetType().Name, id);
         if (id == PersistedInstanceId)
         {
@@ -284,7 +281,11 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
 
     public override async Task Init()
     {
+        // A re-enable can Init without a matching Shutdown; never subscribe twice.
+        Program.TickEvent -= FailsafeTick;
         Program.TickEvent += FailsafeTick;
+        Lifetime.Dispose();
+        Lifetime = new CancellationTokenSource();
         AddLoadStatus($"Starting {GetType().Name} backend...");
         string apiKey;
         try
@@ -295,7 +296,6 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend has no valid owner user ('{OwnerUserId}').");
             apiKey = GetApiKey(owner);
             PersistedInstanceId = owner.GetGenericData("cloudbackends", PersistName)?.Trim();
-            // Covers installs whose instance was remembered before the known-instances list existed.
             RememberKnownInstance(owner, GetType().Name, PersistedInstanceId);
             WorkerToken = string.IsNullOrWhiteSpace(ExistingWorkerToken) ? owner.GetGenericData("cloudbackends", $"{PersistName}_token")?.Trim() : ExistingWorkerToken.Trim();
             if (string.IsNullOrWhiteSpace(WorkerToken))
@@ -327,19 +327,12 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         // A control instance must not be offered for generation itself.
         CanLoadModels = false;
         MaxUsages = 1;
-        // The instance is deliberately NOT started here: renting one bills continuously, and a backend
-        // that comes into being on its owner's first use must never do that on its own. Start is always
-        // an explicit action (the Start button, or the start API route).
+        // Never started here: renting bills, so starting is always an explicit action (Start, or the start route).
         Status = BackendStatus.RUNNING;
         AddLoadStatus($"{Provider.ProviderName} backend ready. The instance is not started yet; press Start to rent one.");
     }
 
-    /// <summary>
-    /// Re-resolves the owner's API key and rebuilds the provider if it changed, so a key rotation takes
-    /// effect on the next start instead of requiring a disable/re-enable cycle. Must be called under
-    /// <see cref="InstanceLock"/>. Safe while no instance is attached; the persisted instance ID (not
-    /// in-memory provider state) is what carries reattachment across the rebuild.
-    /// </summary>
+    /// <summary>Rebuilds the provider if the owner's API key changed, so a new key applies on the next start. Must be called under <see cref="InstanceLock"/>.</summary>
     void RefreshProviderIfKeyChanged()
     {
         User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend's owner user ('{OwnerUserId}') no longer exists.");
@@ -355,19 +348,21 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         oldProvider?.Dispose();
     }
 
-    /// <summary>
-    /// Starts the cloud instance if it is not already running, and attaches the owner-bound swarm
-    /// child to it. Safe to call repeatedly.
-    /// </summary>
     /// <summary>True while a start is in progress: the provider may already know the instance's ID, but the child is not attached yet.</summary>
     public volatile bool Starting = false;
 
+    /// <summary>Starts the cloud instance if it is not already running, and attaches the owner-bound swarm child to it. Safe to call repeatedly.</summary>
     public async Task StartInstanceAsync()
     {
-        await InstanceLock.WaitAsync(Program.GlobalProgramCancel);
+        using CancellationTokenSource cancel = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token, Program.GlobalProgramCancel);
+        await InstanceLock.WaitAsync(cancel.Token);
         Starting = true;
         try
         {
+            if (Status != BackendStatus.RUNNING)
+            {
+                throw new SwarmReadableErrorException("This cloud backend is not running (it was disabled, or failed to start), so it cannot start an instance.");
+            }
             if (ChildBackend is not null && CurrentInstance is not null)
             {
                 return;
@@ -378,7 +373,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             InstanceStartedAt = DateTime.UtcNow;
             try
             {
-                CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, InstanceConfig.PollIntervalMs, Program.GlobalProgramCancel);
+                CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, InstanceConfig.PollIntervalMs, cancel.Token);
             }
             catch (Exception)
             {
@@ -394,9 +389,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             }
             finally
             {
-                // Remember the instance even when the start times out partway: it may already have been
-                // created (and be billing), and the remembered ID is what lets the next attempt reattach
-                // it rather than create a second one.
+                // Remembered even when the start fails partway: it may already exist and bill, and this lets the next start reattach it.
                 PersistActiveInstanceId();
             }
             AddLoadStatus($"Instance '{CurrentInstance.InstanceId}' is up at {CurrentInstance.PublicUrl}, attaching Swarm backend...");
@@ -478,6 +471,9 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     public override async Task Shutdown()
     {
         Program.TickEvent -= FailsafeTick;
+        // A start still in progress gives up and releases the lock, then the stop below releases anything it created.
+        Status = BackendStatus.DISABLED;
+        Lifetime.Cancel();
         string name = Provider?.ProviderName ?? GetType().Name;
         Logs.Info($"[{name}] Backend {BackendData?.ID} shutting down...");
         try
@@ -490,7 +486,6 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         }
         Provider?.Dispose();
         Provider = null;
-        Status = BackendStatus.DISABLED;
     }
 
     /// <inheritdoc/>

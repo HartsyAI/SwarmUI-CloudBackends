@@ -1,35 +1,25 @@
 /**
- * Client-side enhancement for the "Cloud Backends" backend card, done strictly additively on top of
- * core's own rendering (no core function is replaced and no shared schema is mutated):
- *
- * 1. Live dropdowns: fields like GPU type, network volume, or Vast.ai offer become dropdowns filled
- *    from the user's own provider account (what is rentable right now, at what price). The conversion
- *    is an in-place DOM swap of the rendered text input for a select with the same id and data-name,
- *    so core's Edit/Save flow keeps working untouched. If the account call fails or no API key is set,
- *    the fields stay as plain text boxes, which still work if you know the exact ids.
- *
- * 2. Section regrouping: the card's flat field list is regrouped into one collapsible section per
- *    provider, each with its own Enabled toggle in the header. Instance-renting sections (RunPod GPU
- *    Pods, Vast.ai Instances) also get Start/Stop buttons and a live status line; Start streams the
- *    server's progress over websocket, since a cold start takes minutes.
- *
- * The provider table itself comes from the server (CloudListProviders); only presentation details
- * (wording, which field feeds the price estimate) live here.
- *
- * Re-render hooks: core rebuilds a card from scratch on add, save, and status-poll changes. Those all
- * land in the DOM, so a MutationObserver on the backends list re-runs enhancement; the
- * backendsRevisedCallbacks hook covers the regular poll path as well. Enhancement is idempotent and
- * performs zero DOM writes when a card is already enhanced, so the observer cannot loop.
+ * Enhances the "Cloud Backends" card on top of core's rendering, without replacing any core code:
+ * - Groups the fields into one collapsible section per provider, with an Enabled toggle in each header.
+ * - Turns GPU type, network volume, offer and similar fields into dropdowns filled from the user's own account
+ *   (same id and data-name, so core's Edit and Save keep working). Without a key they stay text boxes.
+ * - Adds Start/Stop and a status line to instance sections, and Discover, Validate and a worker list to serverless ones.
+ * Core rebuilds cards on add, save and status polls, so a MutationObserver re-runs enhancement; it makes no DOM
+ * writes on an already-enhanced card, so it cannot loop.
  */
 class CloudBackendsHelper {
 
+    /** Sets up empty state; init() loads the provider table. */
     constructor() {
         this.typeId = 'cloud_backends';
         /** Provider entries from CloudListProviders, or null until fetched. */
         this.providers = null;
-        /** Fetched account options per source id ('runpod', 'vast'). */
+        /** Fetched account options per source id ('runpod:SECURE', 'runpod:COMMUNITY', 'vast'). */
         this.accountOptions = {};
+        /** Source ids with an options request in flight. */
         this.optionsPending = {};
+        /** True once account options have been requested at least once. */
+        this.optionsRequested = false;
         /** Reentrancy guard so our own enhancement writes don't recurse through the MutationObserver. */
         this.enhancing = false;
         /** Presentation details per provider prefix - everything else about a provider comes from the server. */
@@ -45,33 +35,55 @@ class CloudBackendsHelper {
         };
     }
 
-    /** Called once at session ready: fetch the provider table and account options, then hook re-render points. */
+    /** Called once at session ready: fetches the provider table, then hooks re-render points. Account options load when the Backends tab opens. */
     init() {
         genericRequest('CloudListProviders', {}, data => {
             this.providers = data.providers || [];
-            this.refreshOptions('runpod', 'CloudListRunPodOptions', { 'cloud_type': 'SECURE' });
-            this.refreshOptions('vast', 'VastAIListInstanceOptions', {});
             backendsRevisedCallbacks.push(() => this.enhanceAllCards());
             let list = document.getElementById('backends_list');
             if (list) {
-                // Core rebuilds cards directly (bypassing the poll callback) on add and on save - the
-                // observer catches those. Enhancement makes no DOM writes once a card is done, so our
-                // own edits can't loop it.
                 new MutationObserver(() => this.onListMutated()).observe(list, { childList: true, subtree: true });
             }
             let tabButton = document.getElementById('serverbackendstabbutton');
+            // A card switched to another RunPod cloud type needs that type's prices and availability.
+            document.addEventListener('change', e => {
+                if (e.target?.dataset?.name == 'RunPodPods_CloudType') {
+                    this.refreshAllOptions();
+                }
+            });
             if (tabButton) {
-                // Refresh when the user opens the Backends tab, so a GPU/offer that sold out (or an API
-                // key added since page load) is reflected without a reload.
-                tabButton.addEventListener('click', () => {
-                    this.refreshOptions('runpod', 'CloudListRunPodOptions', { 'cloud_type': 'SECURE' });
-                    this.refreshOptions('vast', 'VastAIListInstanceOptions', {});
-                });
+                // Loaded on each visit, so what is rentable (and a key added since) stays current without a reload.
+                tabButton.addEventListener('click', () => this.refreshAllOptions());
             }
             this.enhanceAllCards();
-        }, 0, e => console.log(`[CloudBackends] Could not list providers, card enhancement disabled: ${e}`));
+        }, 0, e => console.warn(`[CloudBackends] Could not list providers, card enhancement disabled: ${e}`));
     }
 
+    /** Fetches both providers' account options. RunPod's are fetched once per cloud type the cards use, since prices and availability differ. */
+    refreshAllOptions() {
+        this.optionsRequested = true;
+        let cloudTypes = new Set(['SECURE']);
+        for (let select of document.querySelectorAll('[data-name="RunPodPods_CloudType"]')) {
+            if (select.value) {
+                cloudTypes.add(select.value);
+            }
+        }
+        for (let cloudType of cloudTypes) {
+            this.refreshOptions(`runpod:${cloudType}`, 'CloudListRunPodOptions', { 'cloud_type': cloudType });
+        }
+        this.refreshOptions('vast', 'VastAIListInstanceOptions', {});
+    }
+
+    /** The fetched account options of one provider ('runpod' or 'vast') that apply to a card. */
+    optionsFor(source, backendId) {
+        if (source != 'runpod') {
+            return this.accountOptions[source];
+        }
+        let cloudType = document.getElementById(`setting_${backendId}_RunPodPods_CloudType`)?.value || 'SECURE';
+        return this.accountOptions[`runpod:${cloudType}`];
+    }
+
+    /** Re-runs enhancement after core changes the backends list, guarding against our own writes. */
     onListMutated() {
         if (this.enhancing) {
             return;
@@ -91,16 +103,13 @@ class CloudBackendsHelper {
             return;
         }
         this.optionsPending[source] = true;
-        // genericRequest only ever calls the success callback with a payload that has no "error" field
-        // (site.js diverts any `data.error` to the error callback as a plain string), so a missing key
-        // or failed call always lands in the error callback below, never here.
         genericRequest(call, params, data => {
             this.optionsPending[source] = false;
             this.accountOptions[source] = data;
             this.enhanceAllCards();
         }, 0, e => {
             this.optionsPending[source] = false;
-            console.log(`[CloudBackends] Could not load ${source} options, leaving text inputs: ${e}`);
+            console.warn(`[CloudBackends] Could not load ${source} options, leaving text inputs: ${e}`);
         });
     }
 
@@ -117,6 +126,11 @@ class CloudBackendsHelper {
             if (!cardBody) {
                 continue;
             }
+            if (!this.optionsRequested && cardBody.offsetParent != null) {
+                // The Backends tab was already open when the page loaded, so its click never fired.
+                this.optionsRequested = true;
+                this.refreshAllOptions();
+            }
             this.applyDropdowns(cardBody, backend.id);
             if (!cardBody.classList.contains('cloudbackends-organized')) {
                 cardBody.classList.add('cloudbackends-organized');
@@ -127,10 +141,10 @@ class CloudBackendsHelper {
 
     // ── Live dropdowns ───────────────────────────────────────────────────────
 
-    /** Field name -> {values, names} choices for everything the fetched account options can offer. */
-    buildChoices() {
+    /** Field name -> {values, names} choices for everything the fetched account options can offer a card. */
+    buildChoices(backendId) {
         let choices = {};
-        let runpod = this.accountOptions['runpod'];
+        let runpod = this.optionsFor('runpod', backendId);
         if (runpod) {
             choices['RunPodPods_GpuTypeId'] = this.withBlank(runpod.gpus, '(cheapest available)',
                 g => g.id,
@@ -160,7 +174,7 @@ class CloudBackendsHelper {
                 p => p.id,
                 p => `${p.name || p.id} · ${p.status || '?'}${p.gpu ? ' · ' + p.gpu : ''}`);
         }
-        let vast = this.accountOptions['vast'];
+        let vast = this.optionsFor('vast', backendId);
         if (vast) {
             choices['VastAIInstance_OfferId'] = this.withBlank(vast.offers, '(cheapest available)',
                 o => o.id,
@@ -203,7 +217,7 @@ class CloudBackendsHelper {
 
     /** Swaps text inputs for selects (same id/data-name, preserved value) wherever choices exist. Writes nothing when already up to date. */
     applyDropdowns(cardBody, backendId) {
-        let choices = this.buildChoices();
+        let choices = this.buildChoices(backendId);
         for (let [field, choice] of Object.entries(choices)) {
             // Leave the field as-is when the account has nothing to offer, so it stays typeable
             // rather than becoming a dropdown whose only entry is "none".
@@ -300,13 +314,14 @@ class CloudBackendsHelper {
             let body = createDiv(null, 'cloudbackends-provider-body');
             body.style.display = 'none';
             if (toggleDiv) {
-                // Mirror the Enabled checkbox into the header for at-a-glance state and one-click
-                // toggling without expanding the section; the original stays in the body for its label.
+                // A copy of the Enabled checkbox in the header; the original stays in the body with its label.
                 let toggleInput = toggleDiv.querySelector('[data-name]');
                 let headerToggle = toggleInput.cloneNode(true);
                 headerToggle.removeAttribute('id');
                 headerToggle.removeAttribute('data-name');
                 headerToggle.checked = toggleInput.checked;
+                // Core's Edit enables only [data-name] inputs, so follow the original's disabled state.
+                new MutationObserver(() => { headerToggle.disabled = toggleInput.disabled; }).observe(toggleInput, { attributes: true, attributeFilter: ['disabled'] });
                 headerToggle.addEventListener('click', e => e.stopPropagation());
                 headerToggle.addEventListener('change', () => { toggleInput.checked = headerToggle.checked; });
                 toggleInput.addEventListener('change', () => { headerToggle.checked = toggleInput.checked; });
@@ -366,7 +381,7 @@ class CloudBackendsHelper {
     estimatePriceLine(backendId, provider, pres) {
         let itemLabel = provider.item_label || 'Instance';
         let pickedValue = pres ? document.getElementById(`setting_${backendId}_${pres.pickerField}`)?.value : null;
-        let catalog = pres ? this.accountOptions[pres.priceSource]?.[pres.priceListKey] : null;
+        let catalog = pres ? this.optionsFor(pres.priceSource, backendId)?.[pres.priceListKey] : null;
         let match = pickedValue && catalog ? catalog.find(entry => entry.id == pickedValue) : null;
         let price = match ? match[pres.priceField] : null;
         if (match && price) {
@@ -402,13 +417,10 @@ class CloudBackendsHelper {
                 statusLine.innerText = message;
             }
         };
-        // Same genericRequest contract as refreshOptions above: the success callback never sees an
-        // "error"-bearing payload, so only has_instance (a real non-error alternate outcome) needs
-        // handling here.
         let refresh = (forceRefresh = false) => {
             genericRequest(provider.status_call, { 'backend_id': `${backendId}`, 'force_refresh': forceRefresh }, data => {
                 if (!data.has_instance) {
-                    setBusy(false, `Status: ${pres?.noItemMessage || 'none yet - Start will create one.'}`);
+                    setBusy(false, `Status: ${data.message || pres?.noItemMessage || 'none yet, Start creates one.'}`);
                     startButton.disabled = false;
                     stopButton.disabled = true;
                     return;
@@ -441,19 +453,32 @@ class CloudBackendsHelper {
                 return;
             }
             setBusy(true, `Starting ${itemLabel.toLowerCase()} (this can take a while on a cold start)...`);
-            makeWSRequest(provider.start_call_ws, { 'backend_id': `${backendId}` }, data => {
+            let finished = false;
+            let socket = makeWSRequest(provider.start_call_ws, { 'backend_id': `${backendId}` }, data => {
                 if (data.status) {
                     statusLine.innerText = `Starting: ${data.status}`;
                 }
                 if (data.done) {
+                    finished = true;
                     refresh(true);
                 }
-            }, 0, e => setBusy(false, `Status: start failed - ${e}`));
+            }, 0, e => {
+                finished = true;
+                setBusy(false, `Status: start failed: ${e}`);
+            });
+            if (socket) {
+                // A dropped connection must not leave the buttons disabled on "Starting...".
+                socket.addEventListener('close', () => {
+                    if (!finished) {
+                        refresh(true);
+                    }
+                });
+            }
         });
         stopButton.addEventListener('click', () => {
             setBusy(true, `Stopping ${itemLabel.toLowerCase()}...`);
             genericRequest(provider.stop_call, { 'backend_id': `${backendId}` }, () => refresh(true),
-                0, e => setBusy(false, `Status: stop failed - ${e}`));
+                0, e => setBusy(false, `Status: stop failed: ${e}`));
         });
         return { refresh };
     }
@@ -534,7 +559,7 @@ class CloudBackendsHelper {
                 total++;
                 let row = createDiv(null, 'cloudbackends-worker-row');
                 let label = document.createElement('span');
-                label.innerText = `${worker.worker_id} · ${worker.in_use ? 'generating' : 'idle'} · up ${this.formatDuration(worker.age_seconds)}`;
+                label.innerText = `${worker.worker_id || worker.lease_id} · ${worker.in_use ? 'generating' : 'idle'} · up ${this.formatDuration(worker.age_seconds)}`;
                 let stop = document.createElement('button');
                 stop.className = 'basic-button cloudbackends-worker-stop';
                 stop.innerText = 'Stop';
@@ -543,7 +568,7 @@ class CloudBackendsHelper {
                         return;
                     }
                     stop.disabled = true;
-                    genericRequest('CloudStopWorker', { 'backend_id': `${backendId}`, 'worker_id': worker.worker_id }, () => refresh(), 0, e => {
+                    genericRequest('CloudStopWorker', { 'backend_id': `${backendId}`, 'worker_id': worker.worker_id || worker.lease_id }, () => refresh(), 0, e => {
                         stop.disabled = false;
                         statusLine.innerText = `Stop failed: ${e}`;
                     });
@@ -597,7 +622,7 @@ class CloudBackendsHelper {
                     row.appendChild(stop);
                     notice.appendChild(row);
                 }
-            }, 0, e => console.log(`[CloudBackends] Could not check for orphaned instances: ${e}`));
+            }, 0, e => console.warn(`[CloudBackends] Could not check for orphaned instances: ${e}`));
         };
         load();
     }

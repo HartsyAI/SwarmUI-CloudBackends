@@ -27,7 +27,7 @@ public class CloudInstanceStatus
     public int UptimeSeconds;
 
     /// <summary>Actions the provider currently permits (RunPod publishes these; empty where the provider has no such list).</summary>
-    public string[] AllowedActions { get; set; } = [];
+    public string[] AllowedActions = [];
 
     /// <summary>Base URL where the instance's SwarmUI is (or will be) reachable, or null until known.</summary>
     public string PublicUrl;

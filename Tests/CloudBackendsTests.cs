@@ -152,6 +152,10 @@ public class RunPodLeaseTests
         Assert.That(RunPodServerlessProvider.IsVersion1JobError("Unknown action: lease"), Is.True);
         Assert.That(RunPodServerlessProvider.IsVersion1JobError("{'success': False, 'error': 'Unknown action: lease', 'available_actions': ['wakeup']}"), Is.True);
         Assert.That(RunPodServerlessProvider.IsVersion1JobError("Unknown action 'lease'. This worker supports 'lease' and 'health'."), Is.False);
+        // A version 2 worker refusing a version 1 wakeup: RunPod keeps only the text.
+        Assert.That(RunPodServerlessProvider.IsVersion2WakeupRefusal("Unknown action 'wakeup'. This worker supports 'lease' and 'health'."), Is.True);
+        Assert.That(RunPodServerlessProvider.IsVersion2WakeupRefusal("Unknown action: lease"), Is.False);
+        Assert.That(RunPodServerlessProvider.IsVersion2WakeupRefusal(null), Is.False);
         Assert.That(RunPodServerlessProvider.IsVersion1JobError(null), Is.False);
     }
 
@@ -167,11 +171,13 @@ public class RunPodLeaseTests
     [Test]
     public void FlagsCudaHostsTooOldForHartsyInference()
     {
-        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray("12.8", "12.9", "13.0"), 13.0), Is.True);
-        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray("13.0", "13.1"), 13.0), Is.False);
-        // No list means any version, including old ones.
-        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray(), 13.0), Is.True);
-        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(null, 13.0), Is.True);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray("12.8", "12.9", "13.0"), null, 13.0), Is.True);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray("13.0", "13.1"), null, 13.0), Is.False);
+        // No list means any version, including old ones, unless the endpoint sets a high enough minimum.
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray(), null, 13.0), Is.True);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(null, "", 13.0), Is.True);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray(), "13.0", 13.0), Is.False);
+        Assert.That(RunPodServerlessProvider.AllowsCudaBelow(new JArray(), "12.8", 13.0), Is.True);
     }
 
     [Test]
@@ -427,5 +433,27 @@ public class HttpRetryRuleTests
             Assert.That(r.StatusCode, Is.EqualTo(HttpStatusCode.BadGateway));
         }
         Assert.That(failing.Calls, Is.EqualTo(1));
+    }
+
+    [Test]
+    public void ParsesEnvOnePerLineKeepingCommas()
+    {
+        JObject env = CloudApiClient.ParseEnv("CUDA_VISIBLE_DEVICES=0,1\nHF_TOKEN = abc \r\n\nBROKEN\nA=b=c");
+        Assert.That(env["CUDA_VISIBLE_DEVICES"]?.ToString(), Is.EqualTo("0,1"));
+        Assert.That(env["HF_TOKEN"]?.ToString(), Is.EqualTo("abc"));
+        Assert.That(env["A"]?.ToString(), Is.EqualTo("b=c"));
+        Assert.That(env.ContainsKey("BROKEN"), Is.False);
+        Assert.That(CloudApiClient.ParseEnv("  "), Is.Empty);
+    }
+
+    [Test]
+    public void MasksTokenShapedTextInProviderErrors()
+    {
+        string token = new('a', 48);
+        Assert.That(CloudApiClient.MaskSecrets($"env SWARMUI_WORKER_TOKEN={token} is invalid"), Is.EqualTo("env SWARMUI_WORKER_TOKEN=*** is invalid"));
+        Assert.That(CloudApiClient.MaskSecrets("short values stay"), Is.EqualTo("short values stay"));
+        Assert.That(CloudApiClient.MaskSecrets(null), Is.Null);
+        JObject problem = new() { ["errors"] = new JArray($"value {token} rejected", new JObject { ["path"] = "env", ["message"] = "bad" }) };
+        Assert.That(CloudApiClient.ValidationErrors(problem), Is.EqualTo("value *** rejected; env: bad"));
     }
 }

@@ -28,11 +28,7 @@ internal static class CloudChildBackend
         SwarmSwarmBackend.SwarmSwarmBackendSettings settings = new()
         {
             Address = address,
-            // AllowIdle does two things we need: SwarmSwarmBackend only re-polls the remote's backend list
-            // (ReviseRemoteDataList) via its idle monitor, so without this a backend added on the remote after
-            // attach (or removed and re-added) is never picked up without a manual restart. It also lets a
-            // transient connectivity blip recover on its own by going IDLE instead of ERRORED, which matters
-            // more here than for a same-machine remote since a cloud proxy URL is more prone to brief hiccups.
+            // Keeps re-polling the worker's backend list, and lets a brief network blip recover (IDLE, not ERRORED).
             AllowIdle = true,
             AllowForwarding = false,
             AllowWebsocket = true,
@@ -45,8 +41,7 @@ internal static class CloudChildBackend
             swarm.IsSpecialControlled = true;
             swarm.CanLoadModels = false;
             swarm.Title = title;
-            // Core's AddNewNonrealBackend takes a parent argument but never assigns it - set it ourselves,
-            // since OwnerBoundSwarmBackend's ownership walk relies on this exact link.
+            // Core never assigns the parent of a nonreal backend; OwnerBoundSwarmBackend's ownership walk relies on it.
             newData.AbstractParent = owner.BackendData;
             newData.UpdateLastReleaseTime();
         });

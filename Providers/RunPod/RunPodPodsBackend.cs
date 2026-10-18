@@ -35,7 +35,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
         public string PodName = "swarmui-cloudbackends";
 
         [SuggestionPlaceholder(Text = "docker image with SwarmUI")]
-        [ConfigComment("Docker image to create the pod from, for example 'kalebbroo/swarmui-runpod:latest'.\nIgnored when TemplateId is set.")]
+        [ConfigComment("Docker image to create the pod from, for example 'kalebbroo/swarmui-worker-runpod:2.0.0-comfyui'.\nIgnored when TemplateId is set.")]
         public string ImageName = "";
 
         [SuggestionPlaceholder(Text = "RunPod template id")]
@@ -77,7 +77,8 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
         [ConfigComment("Environment variables for a created pod, as KEY=VALUE, one per line.")]
         public string PodEnv = "";
 
-        [ConfigComment("Only for a pod you created yourself (set in Pod ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let this backend create the pod with a token of its own. Stored in the backend settings, so admins can see it.")]
+        [ConfigComment("Only for a pod you created yourself (set in Pod ID) that already runs the Hartsy worker: its SWARMUI_WORKER_TOKEN.\nLeave blank to let this backend create the pod with a token of its own. Hidden once saved.")]
+        [ValueIsSecret]
         public string WorkerToken = "";
     }
 
@@ -93,7 +94,6 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
             PodId = config.PodId?.Trim() ?? "",
             PersistedId = PersistedInstanceId ?? "",
             SwarmUIPort = config.SwarmUIPort,
-            AutoCreate = true,
             PodName = string.IsNullOrWhiteSpace(config.PodName) ? "swarmui-cloudbackends" : config.PodName.Trim(),
             ImageName = config.ImageName?.Trim() ?? "",
             TemplateId = config.TemplateId?.Trim() ?? "",

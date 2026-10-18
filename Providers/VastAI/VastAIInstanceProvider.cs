@@ -15,9 +15,6 @@ public class VastAIInstancePlan
     /// <summary>Port SwarmUI listens on inside the instance. Declared to Vast via a Docker -p flag in `env`.</summary>
     public int SwarmUIPort = 7801;
 
-    /// <summary>Whether the provider may create an instance when no existing one is found.</summary>
-    public bool AutoCreate = false;
-
     /// <summary>Instance ID remembered from a previous run, used as a reattach hint after live verification. Never blocks a fresh create when stale.</summary>
     public string PersistedId = "";
 
@@ -78,7 +75,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     public string ActiveInstanceId { get; private set; } = plan.InstanceId?.Trim() ?? "";
 
     public string ProviderName => "Vast.ai Instances";
-    public string ApiKeyType => "vastai_api";
 
     /// <summary>Shared HTTP plumbing, with Vast's well-known failure statuses mapped to actionable messages.</summary>
     readonly CloudApiClient Api = new("VastAI Instances", "https://console.vast.ai", apiKey, (status, detail) => status switch
@@ -156,13 +152,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
 
     public async Task ValidateAsync(CancellationToken cancel = default)
     {
-        if (string.IsNullOrWhiteSpace(ActiveInstanceId) && !plan.AutoCreate)
+        if (string.IsNullOrWhiteSpace(ActiveInstanceId) && string.IsNullOrWhiteSpace(plan.Image) && string.IsNullOrWhiteSpace(plan.TemplateHashId))
         {
-            throw new SwarmReadableErrorException("No Vast.ai instance ID is set and AutoCreate is off. Set 'InstanceId', or enable 'AutoCreate' with an image (or template) and an offer.");
-        }
-        if (plan.AutoCreate && string.IsNullOrWhiteSpace(plan.Image) && string.IsNullOrWhiteSpace(plan.TemplateHashId))
-        {
-            throw new SwarmReadableErrorException("AutoCreate is on but neither 'Image' nor 'TemplateHashId' is set, so there is nothing to create an instance from.");
+            throw new SwarmReadableErrorException("Set 'Image' or 'TemplateHashId' so an instance can be created, or set 'InstanceId' to use an existing instance.");
         }
         // Same endpoint the existing Vast.ai Serverless provider already validates against successfully.
         await ApiAsync(HttpMethod.Get, "/api/v0/users/current/", null, cancel);
@@ -205,21 +197,24 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         int clampedPollMs = Math.Clamp(pollIntervalMs, 2000, 15000);
         CloudInstanceStatus liveStatus = null;
         string lastState = null;
+        // A restarted instance still reads "exited" until its host acts on the start request.
+        DateTime stoppedIsFatalAfter = DateTime.UtcNow.AddSeconds(90);
         while (DateTime.UtcNow < deadline)
         {
             cancel.ThrowIfCancellationRequested();
             try
             {
-                liveStatus = await GetStatusAsync(forceRefresh: true, cancel);
+                JObject polled = await GetInstanceAsync(instanceId, cancel);
+                liveStatus = StatusFromInstance(polled);
                 // Vast's own progress text (image pull, errors), which says far more than the status word.
-                string message = (await GetInstanceAsync(instanceId, cancel))?["status_msg"]?.ToString()?.Trim();
+                string message = polled?["status_msg"]?.ToString()?.Trim();
                 string state = $"{liveStatus?.Status}{(string.IsNullOrWhiteSpace(message) ? "" : $": {message}")}";
                 if (state != lastState)
                 {
                     Logs.Info($"[VastAI Instances] Instance '{instanceId}' {state}");
                     lastState = state;
                 }
-                if (liveStatus?.Status is "exited" or "offline")
+                if (liveStatus?.Status is "exited" or "offline" && DateTime.UtcNow > stoppedIsFatalAfter)
                 {
                     throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' stopped while starting ({state}). Check the instance's logs in the Vast.ai console.");
                 }
@@ -305,10 +300,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         {
             return ActiveInstanceId;
         }
-        if (!plan.AutoCreate)
-        {
-            throw new SwarmReadableErrorException("No Vast.ai instance ID is set and AutoCreate is off.");
-        }
         // An instance remembered from a previous run is only a hint - verify it still exists before
         // trusting it, so a stale memory can never block or misdirect a fresh create.
         if (!string.IsNullOrWhiteSpace(plan.PersistedId))
@@ -391,7 +382,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             };
         }
         Logs.Info($"[VastAI Instances] Creating instance '{plan.Label}' from offer '{offerId}'...");
-        JObject created = await ApiAsync(HttpMethod.Put, $"/api/v0/asks/{offerId}/", body, cancel) as JObject;
+        cancel.ThrowIfCancellationRequested();
+        // Never cancelled once sent: an instance Vast rents bills, and losing its ID would leave it running unreleased.
+        JObject created = await ApiAsync(HttpMethod.Put, $"/api/v0/asks/{offerId}/", body, CancellationToken.None) as JObject;
         if (created?["success"]?.Value<bool>() is not true)
         {
             throw new SwarmReadableErrorException($"Vast.ai rejected the instance creation: {created}");
@@ -556,8 +549,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         {
             await ApiAsync(HttpMethod.Put, $"/api/v0/instances/{ActiveInstanceId}/", new JObject { ["state"] = "stopped" }, cancel, allowNotFound: true);
         }
-        catch (CloudApiException ex)
+        catch (CloudApiException ex) when (ex.Status is 400 or 409)
         {
+            // Already stopped. Anything else propagates, so a failed stop is reported as possibly still billing.
             Logs.Verbose($"[VastAI Instances] Instance '{ActiveInstanceId}' stop returned {ex.Status}: {ex.Detail}");
         }
     }
