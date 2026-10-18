@@ -38,15 +38,27 @@ To install by hand instead, clone this repository into `SwarmUI/src/Extensions/`
    | [Vast.ai Serverless](docs/setup/vastai-serverless.md) | Account, API key, a worker image with your model in it, and a serverless endpoint. |
    | [Vast.ai Instances](docs/setup/vastai-instances.md) | Account and API key. The card rents and starts the instance for you. |
 
-2. **Add the card.** In SwarmUI, open **Server ▸ Backends**, turn on **Show Advanced**, and press **Cloud Backends**.
+2. **Save your API key in SwarmUI.** Open **User ▸ User Info** and scroll to **API Keys**. Paste your RunPod and/or Vast.ai key into its row and press **Save**. Keys are per user: each user's cloud usage runs on, and is billed to, their own key.
+
+   ![SwarmUI User tab, User Info, API Keys section](docs/images/swarmui/user-info.png)
+
+   ![The RunPod row in the API Keys table, with the key box and Save button](docs/images/swarmui/apikey-runpod.png)
+
+   ![The Vast.ai row in the API Keys table, with the key box and Save button](docs/images/swarmui/apikey-vast.png)
+
+3. **Add the card.** Open **Server ▸ Backends**, turn on **Show Advanced**, and press **Cloud Backends**.
 
    ![Add new backend row with Show Advanced on and the Cloud Backends button highlighted](docs/images/swarmui/add-backend.png)
 
-3. **Fill in a section.** The card has one collapsible section per provider. Turn on the ones you set up, fill them in as the guide says, and press **Save**.
+4. **Fill in a section.** The card has one collapsible section per provider. Turn on the ones you set up, fill them in as the guide says, and press **Save** at the top of the card. To change settings later, press **✎** on the card, edit, and press **Save** again.
 
    <img src="docs/images/swarmui/card-collapsed.png" width="450" alt="Cloud Backends card with its four provider sections collapsed">
 
-4. **Generate.** That's it.
+   For example, the RunPod Serverless section, with its **Discover models**, **Validate** and **Refresh** buttons:
+
+   <img src="docs/images/swarmui/runpod-serverless-card.png" width="550" alt="Cloud Backends card with the RunPod Serverless section open">
+
+5. **Generate.** That's it.
 
 Saving the card never starts or bills anything by itself. Serverless workers start only when a generation needs one; pods and instances start only when you press **Start**.
 

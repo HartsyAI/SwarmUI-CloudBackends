@@ -90,8 +90,15 @@ The easiest way to fill it is a short-lived pod that has the volume attached.
 
    ![Pod settings showing the RTX 2000 Ada, the network volume mounted at /workspace, and the Deploy Pod button](../images/runpod/upload-pod.png)
 
-4. When the pod is running, press **Connect** on it and open **Jupyter Lab**. In Jupyter Lab, open a **Terminal**.
-5. Create the folders and download your models into them. For example:
+4. When the pod is running (a minute or two), click it in the **Pods** list. On its **Connect** tab, press **Jupyter Notebook** next to Port 8888. It opens Jupyter Lab in a new browser tab.
+
+   ![Pod Connect tab with the Jupyter Notebook link on port 8888 highlighted](../images/runpod/upload-connect.png)
+
+5. In Jupyter Lab, the file browser on the left shows the network volume (`/workspace`). Press **Terminal** in the Launcher to open a terminal.
+
+   ![Jupyter Lab with the workspace file browser and the Terminal button highlighted](../images/runpod/upload-jupyter.png)
+
+6. In the terminal, create the folders and download your models into them. For example:
 
    ```bash
    mkdir -p /workspace/Models/Stable-Diffusion /workspace/Models/Lora /workspace/Models/VAE /workspace/Models/text_encoders
@@ -99,11 +106,15 @@ The easiest way to fill it is a short-lived pod that has the volume attached.
    wget -O sd_xl_base_1.0.safetensors "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors"
    ```
 
+   ![Jupyter Lab terminal with the mkdir and wget commands typed in](../images/runpod/upload-terminal.png)
+
    - **Hugging Face:** use the file's **download** link (the URL has `/resolve/` in it). For gated models, add `--header="Authorization: Bearer <your Hugging Face token>"` to the `wget` command.
    - **Civitai:** copy the model's download link and add `?token=<your Civitai API key>` to the end.
    - **Files on your computer:** drag them into Jupyter Lab's file browser, into the right folder. This is fine for small files like LoRAs; for big checkpoints, downloading on the pod is much faster.
 
-6. When you're done, go back to **Pods**, press **Stop**, then **Terminate** the pod. Your files stay on the network volume; only the pod is deleted. A pod bills by the hour while it runs, so don't leave it on.
+7. When you're done, go back to **Pods**, click the pod, press **Stop** and confirm, then press **Terminate** and confirm. Your files stay on the network volume; only the pod is deleted. A pod bills by the hour while it runs, so don't leave it on.
+
+   ![Stopped pod with the Terminate button highlighted](../images/runpod/upload-terminate.png)
 
 **Using S3 instead:** if you chose a data center with the S3 badge, you can upload with any S3 tool (such as `aws s3 cp`) using an **S3 API key** from **Credentials ▸ S3 API Keys**. Upload to the `Models/...` paths in the volume's bucket. See RunPod's [S3 API guide](https://docs.runpod.io/storage/s3-api).
 
