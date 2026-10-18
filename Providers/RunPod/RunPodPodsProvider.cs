@@ -355,7 +355,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         JObject body = new()
         {
             ["name"] = plan.PodName,
-            ["cloud"] = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperInvariant(),
+            ["cloud"] = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperFast(),
             ["disk"] = Math.Max(1, plan.ContainerDiskGb),
             // SwarmUI's port must be http for RunPod's proxy to route to it.
             ["ports"] = new JArray($"{plan.SwarmUIPort}/http", "22/tcp"),
@@ -420,7 +420,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         {
             return [plan.GpuTypeId];
         }
-        string cloud = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperInvariant();
+        string cloud = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperFast();
         JToken catalog = await ApiAsync(HttpMethod.Get, $"/catalog/gpus?include=AVAILABILITY&product=POD&cloud={cloud}", null, cancel);
         List<string> ordered = OrderGpuCandidates(catalog?["gpus"] as JArray, cloud, dataCenterId);
         if (ordered.Count == 0)

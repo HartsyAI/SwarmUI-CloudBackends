@@ -133,7 +133,13 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         {
             return publicUrl;
         }
+        // A failed attach leaves the previous relay listening; close it before replacing it.
+        VastTlsRelay old = Relay;
         Relay = new VastTlsRelay(publicUrl);
+        if (old is not null)
+        {
+            _ = old.DisposeAsync();
+        }
         return Relay.LocalUrl;
     }
 

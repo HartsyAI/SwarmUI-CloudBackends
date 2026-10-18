@@ -585,10 +585,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
-    /// <summary>Finds a slot by the worker ID the provider reported.</summary>
-    public WorkerSlot FindSlot(string workerId)
+    /// <summary>Finds a slot by the worker ID the provider reported, or by its lease ID (always set, unlike the worker ID).</summary>
+    public WorkerSlot FindSlot(string id)
     {
-        return Slots.FirstOrDefault(s => s.Worker.WorkerId == workerId);
+        return Slots.FirstOrDefault(s => s.Worker.WorkerId == id || s.Worker.LeaseId == id);
     }
 
     /// <summary>

@@ -31,17 +31,8 @@
     flex: 1;
 }
 
-.cloudbackends-provider-header .auto-checkbox-box {
-    margin: 0;
-    padding: 0;
-}
-
 .cloudbackends-provider-body {
     padding: 6px 10px 10px 10px;
-}
-
-.cloudbackends-provider-actions:empty {
-    display: none;
 }
 
 .cloudbackends-provider-actions {
@@ -58,6 +49,7 @@
     flex-basis: 100%;
     opacity: 0.85;
     font-size: 0.9em;
+    white-space: pre-line;
 }
 
 /* Leased serverless workers, and orphaned instances. */
@@ -79,10 +71,6 @@
 .cloudbackends-worker-row span {
     flex: 1;
     overflow-wrap: anywhere;
-}
-
-.cloudbackends-pod-status {
-    white-space: pre-line;
 }
 
 .cloudbackends-orphans {

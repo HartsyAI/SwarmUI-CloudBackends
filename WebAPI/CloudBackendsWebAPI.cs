@@ -20,23 +20,20 @@ public static class CloudBackendsWebAPI
         API.RegisterAPICall(CloudStartPod, true, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudStartPodWS, true, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudStopPod, true, CloudBackendsExtension.PermUseRunPodPods);
-        API.RegisterAPICall(CloudStopPodWS, true, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudGetPodStatus, false, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(VastAIStartInstance, true, CloudBackendsExtension.PermUseVastAIInstances);
         API.RegisterAPICall(VastAIStartInstanceWS, true, CloudBackendsExtension.PermUseVastAIInstances);
         API.RegisterAPICall(VastAIStopInstance, true, CloudBackendsExtension.PermUseVastAIInstances);
-        API.RegisterAPICall(VastAIStopInstanceWS, true, CloudBackendsExtension.PermUseVastAIInstances);
         API.RegisterAPICall(VastAIGetInstanceStatus, false, CloudBackendsExtension.PermUseVastAIInstances);
         API.RegisterAPICall(CloudListProviders, false, Permissions.ViewBackendsList);
-        API.RegisterAPICall(CloudDebugInvalidateSession, true, Permissions.EditBackends);
-        API.RegisterAPICall(CloudListRunPodOptions, false, Permissions.EditBackends);
+        API.RegisterAPICall(CloudListRunPodOptions, false, CloudBackendsExtension.PermUseRunPodPods);
         API.RegisterAPICall(CloudListWorkers, false, CloudBackendsExtension.PermCloudStatus);
         API.RegisterAPICall(CloudStopWorker, true, CloudBackendsExtension.PermCloudStatus);
         API.RegisterAPICall(CloudValidateBackend, false, CloudBackendsExtension.PermCloudStatus);
         API.RegisterAPICall(CloudClearModelCache, true, CloudBackendsExtension.PermCloudStatus);
         API.RegisterAPICall(CloudListOrphans, false, CloudBackendsExtension.PermCloudStatus);
         API.RegisterAPICall(CloudStopOrphan, true, CloudBackendsExtension.PermCloudStatus);
-        API.RegisterAPICall(VastAIListInstanceOptions, false, Permissions.EditBackends);
+        API.RegisterAPICall(VastAIListInstanceOptions, false, CloudBackendsExtension.PermUseVastAIInstances);
     }
 
     /// <summary>True if the session's user may act on this backend (each provider defines its own permission).</summary>
@@ -133,7 +130,13 @@ public static class CloudBackendsWebAPI
         }
         catch (SwarmReadableErrorException ex)
         {
-            output(new JObject { ["error"] = ex.Message });
+            output(Error(ex.Message, "instance_action_failed"));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Anything else must still end the stream, or the card waits on "Starting..." forever.
+            Logs.Error($"[CloudBackends] Instance {(input.Start ? "start" : "stop")} for backend #{input.BackendId} failed: {ex.ReadableString()}");
+            output(Error($"The instance {(input.Start ? "start" : "stop")} failed: {ex.Message}", "instance_action_failed"));
         }
     }
 
@@ -141,7 +144,7 @@ public static class CloudBackendsWebAPI
     static async Task<JObject> InstanceActionImpl<T>(Session session, int backend_id, CloudBackendsBackend.ProviderDef def, bool start) where T : CloudInstanceBackendBase
     {
         List<JObject> outputs = await API.RunWebsocketHandlerCallDirect(InstanceActionInternal<T>, session, (backend_id, def, start));
-        return outputs.LastOrDefault() ?? new JObject { ["error"] = "Instance action produced no result." };
+        return outputs.LastOrDefault() ?? Error("Instance action produced no result.", "instance_action_failed");
     }
 
     /// <summary>Shared implementation behind the per-provider instance-status routes.</summary>
@@ -153,12 +156,12 @@ public static class CloudBackendsWebAPI
             backend.CheckPermission(session);
             if (backend.Provider is null)
             {
-                return new JObject { ["error"] = "Backend has no active provider (not yet initialized)." };
+                return Error("Backend has no active provider (not yet initialized).", "card_starting");
             }
             CloudInstanceStatus status = await backend.Provider.GetStatusAsync(force_refresh);
             if (status is null)
             {
-                return new JObject { ["has_instance"] = false, ["message"] = "No instance resolved yet - it is created on first Start." };
+                return new JObject { ["has_instance"] = false, ["message"] = string.IsNullOrWhiteSpace(backend.Provider.ActiveInstanceId) ? "No instance yet: Start creates one." : $"Instance '{backend.Provider.ActiveInstanceId}' was not found on the provider. Start creates a new one." };
             }
             return new JObject
             {
@@ -175,7 +178,7 @@ public static class CloudBackendsWebAPI
         }
         catch (SwarmReadableErrorException ex)
         {
-            return new JObject { ["error"] = ex.Message };
+            return Error(ex.Message, "status_failed");
         }
     }
 
@@ -230,9 +233,9 @@ public static class CloudBackendsWebAPI
             if (broken is not null)
             {
                 string lastStatus = broken.LoadStatusReport?.LastOrDefault()?.Message;
-                return new JObject { ["error"] = $"Your {broken.HandlerTypeData?.Name ?? "cloud"} backend failed to start.{(string.IsNullOrWhiteSpace(lastStatus) ? "" : $" {lastStatus}")}" };
+                return Error($"Your {broken.HandlerTypeData?.Name ?? "cloud"} backend failed to start.{(string.IsNullOrWhiteSpace(lastStatus) ? "" : $" {lastStatus}")}", "backend_errored");
             }
-            return new JObject { ["error"] = "No serverless cloud backends are available for your user. Enable a serverless provider section and set your API key in User Settings, API Keys." };
+            return Error("No serverless cloud backends are available for your user. Enable a serverless provider section and set your API key in User Settings, API Keys.", "no_backend");
         }
         int refreshed = 0, failed = 0;
         JArray errors = [];
@@ -324,17 +327,6 @@ public static class CloudBackendsWebAPI
         return InstanceActionImpl<RunPodPodsBackend>(session, backend_id, CloudBackendsBackend.ProviderByPrefix("RunPodPods_"), start: false);
     }
 
-    [API.APIDescription("Websocket variant of CloudStopPod: streams status lines while the pod stops, then a final {\"message\": ..., \"done\": true} or {\"error\": ...}.",
-        """
-            "message": "Instance stopped for backend #1.", "done": true
-        """)]
-    public static async Task<JObject> CloudStopPodWS(System.Net.WebSockets.WebSocket socket, Session session,
-        [API.APIParameter("ID of the 'Cloud Backends' backend whose RunPod GPU Pods section to act on.")] int backend_id)
-    {
-        await API.RunWebsocketHandlerCallWS(InstanceActionInternal<RunPodPodsBackend>, session, (backend_id, CloudBackendsBackend.ProviderByPrefix("RunPodPods_"), false), socket);
-        return null;
-    }
-
     [API.APIDescription("Live status of the pod behind a RunPod GPU Pods backend - state, GPU, cost/hr, uptime, and which actions RunPod currently allows on it. Cached briefly server-side so a UI poll does not hammer RunPod's API.",
         """
             "has_instance": true, // false with a "message" when no pod is resolved yet
@@ -386,17 +378,6 @@ public static class CloudBackendsWebAPI
         return InstanceActionImpl<VastAIInstanceBackend>(session, backend_id, CloudBackendsBackend.ProviderByPrefix("VastAIInstance_"), start: false);
     }
 
-    [API.APIDescription("Websocket variant of VastAIStopInstance: streams status lines while the instance stops, then a final {\"message\": ..., \"done\": true} or {\"error\": ...}.",
-        """
-            "message": "Instance stopped for backend #1.", "done": true
-        """)]
-    public static async Task<JObject> VastAIStopInstanceWS(System.Net.WebSockets.WebSocket socket, Session session,
-        [API.APIParameter("ID of the 'Cloud Backends' backend whose Vast.ai Instances section to act on.")] int backend_id)
-    {
-        await API.RunWebsocketHandlerCallWS(InstanceActionInternal<VastAIInstanceBackend>, session, (backend_id, CloudBackendsBackend.ProviderByPrefix("VastAIInstance_"), false), socket);
-        return null;
-    }
-
     [API.APIDescription("Live status of the instance behind a Vast.ai Instances backend - state, GPU, cost/hr, uptime. Cached briefly server-side so a UI poll does not hammer Vast's API.",
         """
             "has_instance": true, // false with a "message" when no instance is resolved yet
@@ -431,7 +412,7 @@ public static class CloudBackendsWebAPI
         string key = session.User.GetGenericData("runpod_api", "key")?.Trim();
         if (string.IsNullOrEmpty(key))
         {
-            return new JObject { ["error"] = "No RunPod API key set. Add one in User Settings, API Keys, RunPod, then reopen this form." };
+            return Error("No RunPod API key set. Add one in User Settings, API Keys, RunPod, then reopen this form.", "no_api_key");
         }
         string cloud = string.Equals(cloud_type, "COMMUNITY", StringComparison.OrdinalIgnoreCase) ? "COMMUNITY" : "SECURE";
         using RunPodPodsProvider provider = new(key, new RunPodPodPlan { CloudType = cloud });
@@ -448,7 +429,7 @@ public static class CloudBackendsWebAPI
         string key = session.User.GetGenericData("vastai_api", "key")?.Trim();
         if (string.IsNullOrEmpty(key))
         {
-            return new JObject { ["error"] = "No Vast.ai API key set. Add one in User Settings, API Keys, Vast.ai, then reopen this form." };
+            return Error("No Vast.ai API key set. Add one in User Settings, API Keys, Vast.ai, then reopen this form.", "no_api_key");
         }
         using VastAIInstanceProvider provider = new(key, new VastAIInstancePlan());
         return await provider.ListAccountOptionsAsync();
@@ -467,7 +448,6 @@ public static class CloudBackendsWebAPI
                     "start_call": "CloudStartPod",
                     "start_call_ws": "CloudStartPodWS",
                     "stop_call": "CloudStopPod",
-                    "stop_call_ws": "CloudStopPodWS",
                     "status_call": "CloudGetPodStatus"
                 }
             ]
@@ -490,7 +470,6 @@ public static class CloudBackendsWebAPI
                 entry["start_call"] = "CloudStartPod";
                 entry["start_call_ws"] = "CloudStartPodWS";
                 entry["stop_call"] = "CloudStopPod";
-                entry["stop_call_ws"] = "CloudStopPodWS";
                 entry["status_call"] = "CloudGetPodStatus";
             }
             else if (def.Prefix == "VastAIInstance_")
@@ -499,7 +478,6 @@ public static class CloudBackendsWebAPI
                 entry["start_call"] = "VastAIStartInstance";
                 entry["start_call_ws"] = "VastAIStartInstanceWS";
                 entry["stop_call"] = "VastAIStopInstance";
-                entry["stop_call_ws"] = "VastAIStopInstanceWS";
                 entry["status_call"] = "VastAIGetInstanceStatus";
             }
             providers.Add(entry);
@@ -578,7 +556,7 @@ public static class CloudBackendsWebAPI
         """)]
     public static async Task<JObject> CloudStopWorker(Session session,
         [API.APIParameter("ID of the 'Cloud Backends' card (or of one of its serverless backends).")] int backend_id,
-        [API.APIParameter("Worker ID, as listed by CloudListWorkers.")] string worker_id)
+        [API.APIParameter("Worker ID or lease ID, as listed by CloudListWorkers.")] string worker_id)
     {
         foreach (CloudBackendBase backend in UserServerless(session, backend_id, ""))
         {
@@ -782,26 +760,4 @@ public static class CloudBackendsWebAPI
         return Error($"Unknown provider '{provider}'. Use 'runpod' or 'vastai'.", "invalid_provider");
     }
 
-    [API.APIDescription("Debug/testing hook: corrupts the cached SwarmUI session ID this server holds against each of a serverless backend's leased workers, so the session-recovery path can be exercised deterministically. Requires backend editing permission; no effect on the workers themselves.",
-        """
-            "success": true,
-            "invalidated": 1
-        """)]
-    public static Task<JObject> CloudDebugInvalidateSession(Session session,
-        [API.APIParameter("ID of the serverless cloud backend (or its 'Cloud Backends' card) whose worker sessions to invalidate.")] int backend_id)
-    {
-        List<CloudBackendBase> backends = UserServerless(session, backend_id, "");
-        int count = 0;
-        foreach (WorkerSlot slot in backends.SelectMany(b => b.Slots))
-        {
-            slot.Worker.SessionId = "swarm_debug_invalidated_session";
-            count++;
-        }
-        if (count == 0)
-        {
-            return Task.FromResult(Error("None of your serverless backends under this ID has a leased worker.", "worker_not_found"));
-        }
-        Logs.Info($"[CloudBackends] Debug: invalidated {count} worker session(s) under backend #{backend_id}.");
-        return Task.FromResult(new JObject { ["success"] = true, ["invalidated"] = count });
-    }
 }
