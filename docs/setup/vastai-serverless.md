@@ -99,7 +99,7 @@ The template tells Vast which image to run and how.
 
 ## Step 6: Create the serverless endpoint
 
-1. Open **Serverless** in the left menu and press **Get Started** (or **New** if you already have endpoints). In the dialog, choose **Advanced setup**.
+1. Open **Serverless** in the left menu and press **Get Started** (or **+ Endpoint** if you already have endpoints). In the dialog, choose **Advanced setup**.
 2. Set:
 
    | Setting | Value | Why |
@@ -113,17 +113,34 @@ The template tells Vast which image to run and how.
 
    ![Create Endpoint form with Minimum Workers 0, Max Workers 2, Minimum Load 0, and the inactivity timeout on at 300 seconds](../images/vastai/endpoint.png)
 
-3. Press **Next**.
+3. Press **Next**. Vast creates the endpoint and opens **Create Workergroup** for it.
 
 ## Step 7: Add a workergroup
 
 A workergroup tells the endpoint which template to run, and on which GPUs.
 
-1. Add a workergroup to the endpoint and choose your template from Step 5.
-2. Set the GPU filter to **16 GB of VRAM or more** (24 GB for the Krea 2 Turbo image). For the **HartsyInference** images (all the ready-made ones), also require **CUDA 13.0 or newer**: its GPU kernels need a CUDA 13 driver.
-3. Create it.
+1. Under **1. Select Template**, press **Change Template**, choose **My Templates**, and press the **▶** (Select template) button on your template from Step 5.
 
-To change the template later, edit it through **Serverless ▸ (your endpoint) ▸ Edit workergroup**. Saving a template from the **Templates** page makes a new copy, which the workergroup doesn't use.
+   ![Select Template dialog on My Templates, with the SwarmUI Worker template highlighted](../images/vastai/workergroup-template.png)
+
+2. Under **2. Configure GPU Pool**, press **Filters** and set:
+
+   | Filter | Value |
+   |---|---|
+   | Per GPU RAM | Minimum `24` GB for the Krea 2 Turbo image; `16` GB for smaller models. |
+   | Min Cuda Version | `13.0` for the **HartsyInference** images (all the ready-made ones): their GPU kernels need a CUDA 13 driver. |
+
+   The filters show as chips at the top of the panel, and the GPU list below updates to the machines Vast may recruit.
+
+3. Press **Create**.
+
+   ![Create Workergroup page with the template, the Filters button, the CUDA and GPU RAM filter chips, and the Create button highlighted](../images/vastai/workergroup.png)
+
+Your endpoint now shows on the **Serverless** page. Its name is what SwarmUI needs. To add a workergroup later, use **+ Workergroup** on the endpoint.
+
+![Serverless page showing the swarmui-vast endpoint and its + Workergroup button](../images/vastai/endpoint-list.png)
+
+To change the template later, edit the workergroup on this page. Saving a template from the **Templates** page makes a new copy, which the workergroup doesn't use.
 
 ## Step 8: Add the Cloud Backends card in SwarmUI
 
