@@ -17,7 +17,7 @@ By Hartsy. MIT licensed.
 
 - SwarmUI (current release).
 - An account with RunPod and/or Vast.ai, with credit.
-- For serverless: an endpoint running the Hartsy worker image. Setup is below.
+- For serverless: an endpoint running the Hartsy worker image. The [setup guides](#quick-start) walk you through it.
   - RunPod: [`kalebbroo/swarmui-worker-runpod`](https://github.com/HartsyAI/RunPod-Worker-SwarmUI)
   - Vast.ai: an image built from [`kalebbroo/swarmui-worker-vast`](https://github.com/HartsyAI/Vast-Worker-SwarmUI)
 
@@ -29,16 +29,24 @@ To install by hand instead, clone this repository into `SwarmUI/src/Extensions/`
 
 ## Quick start
 
-1. Put your provider API key in **User Settings ▸ API Keys** (RunPod and/or Vast.ai). Keys are per user; each user's cloud usage runs on their own key.
-2. Open **Server ▸ Backends**, turn on **Show Advanced**, and add **Cloud Backends**.
+1. **Set up a provider.** Follow the step-by-step guide for the one you want. Each guide starts from a brand new account and ends with your first generation:
 
-   <img src="Assets/screenshots/add-backend-button.png" width="500" alt="Add new backend, with the Cloud Backends button among the advanced types">
+   | Guide | What you set up |
+   |---|---|
+   | [RunPod Serverless](docs/setup/runpod-serverless.md) | Account, API key, a network volume with your models, and a serverless endpoint. |
+   | [RunPod GPU Pods](docs/setup/runpod-pods.md) | Account, API key, and a network volume. The card creates and starts the pod for you. |
+   | [Vast.ai Serverless](docs/setup/vastai-serverless.md) | Account, API key, a worker image with your model in it, and a serverless endpoint. |
+   | [Vast.ai Instances](docs/setup/vastai-instances.md) | Account and API key. The card rents and starts the instance for you. |
 
-3. The card has one collapsible section per provider. Turn one on, fill in its settings (see the provider setup below), and save.
+2. **Add the card.** In SwarmUI, open **Server ▸ Backends**, turn on **Show Advanced**, and press **Cloud Backends**.
 
-   <img src="Assets/screenshots/accordion-collapsed.png" width="500" alt="Cloud Backends card with its four provider sections collapsed">
+   ![Add new backend row with Show Advanced on and the Cloud Backends button highlighted](docs/images/swarmui/add-backend.png)
 
-4. Generate. That's it.
+3. **Fill in a section.** The card has one collapsible section per provider. Turn on the ones you set up, fill them in as the guide says, and press **Save**.
+
+   <img src="docs/images/swarmui/card-collapsed.png" width="450" alt="Cloud Backends card with its four provider sections collapsed">
+
+4. **Generate.** That's it.
 
 Saving the card never starts or bills anything by itself. Serverless workers start only when a generation needs one; pods and instances start only when you press **Start**.
 
@@ -58,81 +66,16 @@ SwarmUI only offers models it knows about. There are two ways a cloud endpoint's
 
 Either way the list is remembered per user and endpoint, across restarts. Use the `CloudClearModelCache` API route if you change what is on the endpoint.
 
-## RunPod Serverless setup
+## Provider settings
 
-1. **Network volume.** In RunPod, create a network volume in the data center you want. Put your models in `Models/` at its root, using SwarmUI's folder names: `Models/Stable-Diffusion`, `Models/Lora`, `Models/VAE`, and so on.
-2. **Endpoint.** Create a **Queue** serverless endpoint from `kalebbroo/swarmui-worker-runpod:<version>-comfyui` (or `-hartsyinference`), pinned to a release version:
+Every setting on the card has a **?** next to it that explains it. The setup guides above walk through the ones that matter, in order:
 
-   | Setting | Value |
-   |---|---|
-   | Network volume | the volume from step 1 |
-   | GPU | 16 GB VRAM or more (24 GB for large models) |
-   | CUDA version | 12.8 or newer for ComfyUI; **13.0 or newer for HartsyInference** (its GPU kernels need a CUDA 13 driver) |
-   | Container disk | 30 GB (ComfyUI) or 15 GB (HartsyInference) |
-   | Expose HTTP ports | `7801` (under Container configuration). Without it RunPod's proxy cannot reach the worker. |
-   | Active workers | 0 |
-   | Max workers | at least your **Max Workers** below |
-   | Execution timeout | longer than **Max Lease Seconds** (e.g. 4200 s for the default 3600) |
-   | FlashBoot | on |
+- [RunPod Serverless](docs/setup/runpod-serverless.md): endpoint settings (image, HTTP port 7801, execution timeout, CUDA versions), and the card's Max Workers, Idle Seconds and Max Lease Seconds.
+- [RunPod GPU Pods](docs/setup/runpod-pods.md): GPU type, network volume, the Start and Stop buttons, and the Max Runtime and Max Spend failsafes.
+- [Vast.ai Serverless](docs/setup/vastai-serverless.md): the worker image, template, endpoint (Min Load 0, an inactivity timeout) and workergroup.
+- [Vast.ai Instances](docs/setup/vastai-instances.md): offers, disk, volumes, and the failsafes.
 
-3. **Card.** In the **RunPod Serverless** section, turn it on and set:
-
-   | Setting | Meaning |
-   |---|---|
-   | Endpoint ID | The endpoint's ID from the RunPod console. |
-   | Max Workers | Most workers that may run at once. 1 means never more than one. |
-   | Idle Seconds | How long a worker may sit with no generation before shutting down. Lower costs less; higher avoids cold starts between bursts. |
-   | Max Lease Seconds | Longest a worker is held before it is handed back and leased again. Keep it under the endpoint's execution timeout. |
-   | Startup Timeout | How long to wait for a worker to start. |
-
-4. Press **Validate** in the section. It checks the endpoint's settings against the card (execution timeout, max workers, image version) and tells you what to fix. It costs nothing.
-
-**Already running the version 1 image (`kalebbroo/swarmui-runpod`)?** It keeps working, in single-worker compatibility mode: one worker at a time, kept alive with keepalive jobs as before, and without an access token on the worker. Move the endpoint to `kalebbroo/swarmui-worker-runpod` when you want scaling and a secured worker; your network volume works with both.
-
-## Vast.ai Serverless setup
-
-Vast.ai serverless workers cannot attach a volume, so **your model must be inside the worker image**. Build one from the Hartsy Vast worker:
-
-```bash
-git clone https://github.com/HartsyAI/Vast-Worker-SwarmUI && cd Vast-Worker-SwarmUI
-docker build --build-arg BACKEND=hartsyinference --build-arg BASE_VERSION=<version> \
-  --build-arg BAKE_MODEL_URL=https://example.com/my-model.safetensors \
-  --build-arg BAKE_MODEL_SHA256=<sha256 of the file> \
-  -t <you>/swarmui-worker-vast:<version>-mymodel .
-docker push <you>/swarmui-worker-vast:<version>-mymodel
-```
-
-Then on Vast.ai:
-
-1. **Template** ([Templates ▸ New](https://cloud.vast.ai/templates/)): your image, launch mode **Docker ENTRYPOINT**, Docker options `-p 7801:7801 -p 8000:8000 -e WORKER_PORT=8000`, and a container disk well above the image's unpacked size (e.g. 40 GB). Vast's 8 GB default is too small, and an undersized disk fails without saying why.
-2. **Endpoint** ([Serverless](https://cloud.vast.ai/serverless/)): **Min Workers 0**, **Min Load 0**, and an **Inactivity Timeout** (e.g. 300). With Min Load above 0 the endpoint never scales to zero; with Min Workers above 0 Vast keeps stopped workers that bill for storage. Set **Max Workers** to at least your card's Max Workers.
-3. **Workergroup** under the endpoint, using the template, with a GPU filter of 16 GB VRAM or more. To change the template later, edit it through **Serverless ▸ Edit workergroup**, because saving from Templates creates a new copy the workergroup does not use.
-4. **Card:** turn on **Vast.ai Serverless**, set **Endpoint ID** to the endpoint's **name**, and set Max Workers and Idle Seconds as above (Vast.ai workers are kept at least 60 seconds). Press **Validate**.
-
-## RunPod GPU Pods
-
-Leave **Pod ID** blank to have the card create a pod, or set it to use an existing one. With your API key set, the GPU type, network volume, data center and template fields become dropdowns filled from your account, with live prices and availability.
-
-<img src="Assets/screenshots/runpod-live-dropdowns.png" width="600" alt="RunPod GPU Pods section with live GPU type and network volume dropdowns">
-
-- **Image** defaults to the Hartsy RunPod worker, pinned to a release. The card gives the pod an access token automatically, so nobody else can use it.
-- **Start** creates or resumes the pod (you confirm the price first); **Stop** stops it. **Terminate On Shutdown** destroys the pod instead of stopping it, which only makes sense when a network volume holds everything worth keeping.
-- **Max Runtime Minutes** and **Max Spend USD** stop the pod automatically if you forget.
-- To use a pod you created yourself, it must run the Hartsy worker image; put its `SWARMUI_WORKER_TOKEN` in **Worker Token**. Letting the card create the pod is simpler: it then manages the token for you.
-
-## Vast.ai Instances
-
-The same as pods, with Vast.ai's differences:
-
-- An instance comes from a specific **offer** (a particular machine). Leave **Offer ID** blank to take the cheapest match, or pick one from the live dropdown.
-
-  <img src="Assets/screenshots/vastai-live-dropdowns.png" width="600" alt="Vast.ai Instances section with a live offer selected">
-
-- Vast.ai has no proxy domain; the instance is reached at its public IP over **HTTPS**, using a certificate the worker gets from Vast.ai at startup. The card checks it against Vast.ai's own root certificate.
-- Without an Offer ID, the card rents the cheapest matching host with at least 64 direct ports. If a host it rented never forwards the port, the card destroys that instance and rents a different machine (up to 3 hosts).
-- Attach an existing network volume with **Network Volume ID**. Creating a new named volume is done on Vast.ai's site.
-- To use an instance you created yourself, it must run the Hartsy Vast worker image; put its `SWARMUI_WORKER_TOKEN` in **Worker Token**.
-- When you pick a **Template**, the template's image is used and the Image setting is ignored.
+**Already running the version 1 RunPod image (`kalebbroo/swarmui-runpod`)?** It keeps working, in single-worker compatibility mode: one worker at a time, kept alive with keepalive jobs as before, and without an access token on the worker. Move the endpoint to `kalebbroo/swarmui-worker-runpod` when you want scaling and a secured worker; your network volume works with both.
 
 ## Keeping costs under control
 
