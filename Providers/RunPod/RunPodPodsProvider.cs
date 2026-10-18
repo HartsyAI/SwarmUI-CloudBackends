@@ -329,7 +329,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             Logs.Info($"[RunPodPods] Creating pod '{plan.PodName}' on '{gpuId}'{(string.IsNullOrWhiteSpace(dataCenterId) ? "" : $" in {dataCenterId}")}...");
             try
             {
-                JObject created = await ApiAsync(HttpMethod.Post, "/pods", body, cancel) as JObject;
+                cancel.ThrowIfCancellationRequested();
+                // Never cancelled once sent: a pod RunPod creates bills, and losing its ID would leave it running unreleased.
+                JObject created = await ApiAsync(HttpMethod.Post, "/pods", body, CancellationToken.None) as JObject;
                 string id = created?["id"]?.ToString();
                 if (string.IsNullOrWhiteSpace(id))
                 {

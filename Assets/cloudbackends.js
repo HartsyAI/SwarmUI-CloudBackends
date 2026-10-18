@@ -14,7 +14,7 @@ class CloudBackendsHelper {
         this.typeId = 'cloud_backends';
         /** Provider entries from CloudListProviders, or null until fetched. */
         this.providers = null;
-        /** Fetched account options per source id ('runpod', 'vast'). */
+        /** Fetched account options per source id ('runpod:SECURE', 'runpod:COMMUNITY', 'vast'). */
         this.accountOptions = {};
         /** Source ids with an options request in flight. */
         this.optionsPending = {};
@@ -45,6 +45,12 @@ class CloudBackendsHelper {
                 new MutationObserver(() => this.onListMutated()).observe(list, { childList: true, subtree: true });
             }
             let tabButton = document.getElementById('serverbackendstabbutton');
+            // A card switched to another RunPod cloud type needs that type's prices and availability.
+            document.addEventListener('change', e => {
+                if (e.target?.dataset?.name == 'RunPodPods_CloudType') {
+                    this.refreshAllOptions();
+                }
+            });
             if (tabButton) {
                 // Loaded on each visit, so what is rentable (and a key added since) stays current without a reload.
                 tabButton.addEventListener('click', () => this.refreshAllOptions());
@@ -53,12 +59,28 @@ class CloudBackendsHelper {
         }, 0, e => console.warn(`[CloudBackends] Could not list providers, card enhancement disabled: ${e}`));
     }
 
-    /** Fetches both providers' account options. RunPod prices depend on the cloud type a card uses. */
+    /** Fetches both providers' account options. RunPod's are fetched once per cloud type the cards use, since prices and availability differ. */
     refreshAllOptions() {
         this.optionsRequested = true;
-        let cloudType = document.querySelector('[data-name="RunPodPods_CloudType"]')?.value || 'SECURE';
-        this.refreshOptions('runpod', 'CloudListRunPodOptions', { 'cloud_type': cloudType });
+        let cloudTypes = new Set(['SECURE']);
+        for (let select of document.querySelectorAll('[data-name="RunPodPods_CloudType"]')) {
+            if (select.value) {
+                cloudTypes.add(select.value);
+            }
+        }
+        for (let cloudType of cloudTypes) {
+            this.refreshOptions(`runpod:${cloudType}`, 'CloudListRunPodOptions', { 'cloud_type': cloudType });
+        }
         this.refreshOptions('vast', 'VastAIListInstanceOptions', {});
+    }
+
+    /** The fetched account options of one provider ('runpod' or 'vast') that apply to a card. */
+    optionsFor(source, backendId) {
+        if (source != 'runpod') {
+            return this.accountOptions[source];
+        }
+        let cloudType = document.getElementById(`setting_${backendId}_RunPodPods_CloudType`)?.value || 'SECURE';
+        return this.accountOptions[`runpod:${cloudType}`];
     }
 
     /** Re-runs enhancement after core changes the backends list, guarding against our own writes. */
@@ -119,10 +141,10 @@ class CloudBackendsHelper {
 
     // ── Live dropdowns ───────────────────────────────────────────────────────
 
-    /** Field name -> {values, names} choices for everything the fetched account options can offer. */
-    buildChoices() {
+    /** Field name -> {values, names} choices for everything the fetched account options can offer a card. */
+    buildChoices(backendId) {
         let choices = {};
-        let runpod = this.accountOptions['runpod'];
+        let runpod = this.optionsFor('runpod', backendId);
         if (runpod) {
             choices['RunPodPods_GpuTypeId'] = this.withBlank(runpod.gpus, '(cheapest available)',
                 g => g.id,
@@ -152,7 +174,7 @@ class CloudBackendsHelper {
                 p => p.id,
                 p => `${p.name || p.id} · ${p.status || '?'}${p.gpu ? ' · ' + p.gpu : ''}`);
         }
-        let vast = this.accountOptions['vast'];
+        let vast = this.optionsFor('vast', backendId);
         if (vast) {
             choices['VastAIInstance_OfferId'] = this.withBlank(vast.offers, '(cheapest available)',
                 o => o.id,
@@ -195,7 +217,7 @@ class CloudBackendsHelper {
 
     /** Swaps text inputs for selects (same id/data-name, preserved value) wherever choices exist. Writes nothing when already up to date. */
     applyDropdowns(cardBody, backendId) {
-        let choices = this.buildChoices();
+        let choices = this.buildChoices(backendId);
         for (let [field, choice] of Object.entries(choices)) {
             // Leave the field as-is when the account has nothing to offer, so it stays typeable
             // rather than becoming a dropdown whose only entry is "none".
@@ -359,7 +381,7 @@ class CloudBackendsHelper {
     estimatePriceLine(backendId, provider, pres) {
         let itemLabel = provider.item_label || 'Instance';
         let pickedValue = pres ? document.getElementById(`setting_${backendId}_${pres.pickerField}`)?.value : null;
-        let catalog = pres ? this.accountOptions[pres.priceSource]?.[pres.priceListKey] : null;
+        let catalog = pres ? this.optionsFor(pres.priceSource, backendId)?.[pres.priceListKey] : null;
         let match = pickedValue && catalog ? catalog.find(entry => entry.id == pickedValue) : null;
         let price = match ? match[pres.priceField] : null;
         if (match && price) {

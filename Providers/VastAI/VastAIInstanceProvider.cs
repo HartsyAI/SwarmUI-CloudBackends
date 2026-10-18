@@ -382,7 +382,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             };
         }
         Logs.Info($"[VastAI Instances] Creating instance '{plan.Label}' from offer '{offerId}'...");
-        JObject created = await ApiAsync(HttpMethod.Put, $"/api/v0/asks/{offerId}/", body, cancel) as JObject;
+        cancel.ThrowIfCancellationRequested();
+        // Never cancelled once sent: an instance Vast rents bills, and losing its ID would leave it running unreleased.
+        JObject created = await ApiAsync(HttpMethod.Put, $"/api/v0/asks/{offerId}/", body, CancellationToken.None) as JObject;
         if (created?["success"]?.Value<bool>() is not true)
         {
             throw new SwarmReadableErrorException($"Vast.ai rejected the instance creation: {created}");
