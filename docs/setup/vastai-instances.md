@@ -44,7 +44,7 @@ In SwarmUI, open **User ▸ User Info ▸ API Keys**, paste the key into the **V
 
 2. Turn on the switch in the **Vast.ai Instances** header and open the section. With your API key saved, **GPU** becomes a dropdown of the GPUs you can rent right now, with their lowest price.
 
-   ![Vast.ai Instances section showing InstanceId, image, offer, disk and volume settings](../images/swarmui/vast-instances-card-1.png)
+   ![Vast.ai Instances section showing Instance, Delete On Stop, image, GPU, container disk and network volume settings](../images/swarmui/vast-instances-card-1.png)
 
 3. Set at least these:
 

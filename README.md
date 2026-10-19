@@ -50,13 +50,13 @@ To install by hand instead, clone this repository into `SwarmUI/src/Extensions/`
 
    ![Add new backend row with Show Advanced on and the Cloud Backends button highlighted](docs/images/swarmui/add-backend.png)
 
-4. **Fill in a section.** The card has one collapsible section per provider. Turn on the ones you set up, fill them in as the guide says, and press **Save** at the top of the card. To change settings later, press **✎** on the card, edit, and press **Save** again.
+4. **Fill in a section.** The card has one collapsible section per provider, each with a **Setup guide** link in its header. Turn on the ones you set up, fill them in as the guide says, and press **Save** at the top of the card. To change settings later, press **✎** on the card, edit, and press **Save** again.
 
-   <img src="docs/images/swarmui/card-collapsed.png" width="450" alt="Cloud Backends card with its four provider sections collapsed">
+   <img src="docs/images/swarmui/card-collapsed.png" width="450" alt="Cloud Backends card with its four provider sections collapsed, each with a Setup guide link">
 
-   For example, the RunPod Serverless section, with its **Discover models**, **Validate** and **Refresh** buttons:
+   For example, the RunPod Serverless section, with its endpoint, Max Workers and Idle Shutdown settings, and its **Discover models**, **Validate** and **Refresh** buttons:
 
-   <img src="docs/images/swarmui/runpod-serverless-card.png" width="550" alt="Cloud Backends card with the RunPod Serverless section open">
+   <img src="docs/images/swarmui/runpod-serverless-card.png" width="550" alt="Cloud Backends card with the RunPod Serverless section open: Endpoint, Max Workers and Idle Shutdown, then Discover models, Validate and Refresh">
 
 5. **Generate.** That's it.
 
@@ -67,7 +67,7 @@ Saving the card never starts or bills anything by itself. Serverless workers sta
 - **Local first.** If you have a local GPU backend that is free and has the model, it takes the generation. The cloud is used when your local backends are busy, or do not have the model.
 - **A worker starts when needed.** The first cloud generation starts a worker (a cold start takes from under a minute with a warm worker to a few minutes from scratch). Later generations go straight to the running worker.
 - **More workers under load.** If every running worker is busy and another generation arrives, another worker starts, up to **Max Workers**. If a busy worker frees up first, it takes the generation instead.
-- **Workers shut down when idle.** After **Idle Seconds** with no generation, a worker shuts down and stops billing. The next generation starts one again.
+- **Workers shut down when idle.** After **Idle Shutdown** with no generation, a worker shuts down and stops billing. The next generation starts one again.
 
 ## Models
 
@@ -80,18 +80,27 @@ Either way the list is remembered per user and endpoint, across restarts. Use th
 
 ## Provider settings
 
-Every setting on the card has a **?** next to it that explains it, and each section's header links to its setup guide. Dropdowns are filled from your own account once its API key is saved, and settings only a custom setup needs sit under **Advanced**. The setup guides walk through the ones that matter, in order:
+Every setting on the card has a **?** next to it that explains it. Each section works the same way:
 
-- [RunPod Serverless](docs/setup/runpod-serverless.md): endpoint settings (image, HTTP port 7801, execution timeout, CUDA versions), and the card's Max Workers and Idle Shutdown.
-- [RunPod GPU Pods](docs/setup/runpod-pods.md): GPU type, network volume, the Start and Stop buttons, and the Max Runtime and Max Spend failsafes.
+- **Dropdowns come from your account.** Once your API key is saved, the Endpoint, Pod, Instance, GPU, Template, Network Volume and Data Center fields list what your account has, with prices. Without a key they stay plain text boxes.
+- **Advanced holds the rest.** Settings only a custom setup needs sit under a collapsed **Advanced** group at the bottom of each section: a template, extra disk, the SwarmUI port, environment variables, and the startup timeout.
+- **Delete On Stop** (pods and instances) is on by default. Stop then deletes a machine the card created, so nothing keeps billing afterwards. A pod or instance you picked yourself is only ever paused.
+- **Failsafes** stop a pod or instance you forgot about. Max Runtime and Max Spend default to 4 hours and $10; **Off** turns either one off.
+
+<img src="docs/images/swarmui/runpod-pods-advanced.png" width="550" alt="RunPod GPU Pods section with its Advanced group open: template, GPU count, pod volume, volume mount path, SwarmUI port, environment variables and startup timeout">
+
+The setup guides walk through the settings that matter, in order:
+
+- [RunPod Serverless](docs/setup/runpod-serverless.md): the endpoint, Max Workers and Idle Shutdown.
+- [RunPod GPU Pods](docs/setup/runpod-pods.md): the image, GPU, network volume, Delete On Stop, the failsafes, and the Start and Stop buttons.
 - [Vast.ai Serverless](docs/setup/vastai-serverless.md): the worker image, template, endpoint (Min Load 0, an inactivity timeout) and workergroup.
-- [Vast.ai Instances](docs/setup/vastai-instances.md): GPU, disk, volumes, and the failsafes.
+- [Vast.ai Instances](docs/setup/vastai-instances.md): the image, GPU, disk, network volume, the failsafes, and the Start and Stop buttons.
 
 **Already running the version 1 RunPod image (`kalebbroo/swarmui-runpod`)?** It keeps working, in single-worker compatibility mode: one worker at a time, kept alive with keepalive jobs as before, and without an access token on the worker. Move the endpoint to `kalebbroo/swarmui-worker-runpod` when you want scaling and a secured worker; your network volume works with both.
 
 ## Keeping costs under control
 
-- Serverless workers shut down after **Idle Seconds**; nothing keeps one running unless you are generating.
+- Serverless workers shut down after **Idle Shutdown**; nothing keeps one running unless you are generating.
 - If SwarmUI stops unexpectedly, RunPod workers still shut themselves down when idle, and Vast.ai sessions expire on their own.
 - The card shows a warning when a pod or instance created by Cloud Backends (under any name) is running but not attached to any card, for example after SwarmUI stopped uncleanly. Stop it from there.
 - The **Workers** list in each serverless section shows every running worker, with a **Stop** button.

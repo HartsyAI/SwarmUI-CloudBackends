@@ -62,6 +62,8 @@
 .cloudbackends-suggest-input {
     flex: 1;
     min-width: 0;
+    border: 1px solid var(--shadow);
+    padding: 2px;
 }
 
 /* A field another setting overrides, such as Data Center once a network volume is picked. */

@@ -54,7 +54,7 @@ When you pick the volume's data center, check that it has the GPU you want: pods
 
 2. Turn on the switch in the **RunPod GPU Pods** header and open the section. With your API key saved, the pod, GPU, network volume, data center and template boxes turn into dropdowns filled from your account, with live prices.
 
-   ![RunPod GPU Pods section showing PodId, image, GPU type, network volume and other settings](../images/swarmui/runpod-pods-card-1.png)
+   ![RunPod GPU Pods section showing Pod, Delete On Stop, image, GPU, container disk, network volume and cloud settings](../images/swarmui/runpod-pods-card-1.png)
 
 3. Set at least these:
 
