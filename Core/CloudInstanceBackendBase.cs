@@ -450,13 +450,13 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             ReattachChecked = true;
             if (status is null)
             {
-                Logs.Info($"[{Provider.ProviderName}] Instance '{id}' kept from an earlier run is gone or stopped.");
+                Logs.Info($"[{Provider.ProviderName}] Instance '{id}' kept from an earlier run is gone.");
                 Owner?.DeleteGenericData("cloudbackends", StartRecordName);
                 return false;
             }
             InstanceStartedAt = RestoredStartTime(recorded, status.UptimeSeconds, DateTime.UtcNow);
-            AddLoadStatus($"Reattached instance '{id}', which an earlier SwarmUI run left running. It bills until it is stopped.");
-            Logs.Info($"[{Provider.ProviderName}] Backend #{BackendData?.ID} reattached instance '{id}' (running since {InstanceStartedAt:u}); the safety stops apply again.");
+            AddLoadStatus($"Reattached instance '{id}' ({status.Status}), kept from an earlier SwarmUI run. It is held until Stop releases it.");
+            Logs.Info($"[{Provider.ProviderName}] Backend #{BackendData?.ID} reattached instance '{id}' ({status.Status}, first started {InstanceStartedAt:u}); the safety stops apply again.");
             return true;
         }
         catch (Exception ex)

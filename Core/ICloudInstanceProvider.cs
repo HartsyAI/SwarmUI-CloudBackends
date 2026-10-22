@@ -59,8 +59,8 @@ public interface ICloudInstanceProvider : IDisposable
     Task<double?> GetCostPerHourAsync(CancellationToken cancel = default);
 
     /// <summary>
-    /// Binds the provider to an instance an earlier SwarmUI run left running, or was still starting, and returns its status; null when it is
-    /// gone or stopped. A provider that cannot do this returns null, so its instances are never kept through a restart.
+    /// Binds the provider to an instance an earlier SwarmUI run kept (running, still starting, or stopped since) and returns its status; null
+    /// when it is gone. A provider that cannot do this returns null, so its instances are never kept through a restart.
     /// </summary>
     Task<CloudInstanceStatus> AdoptInstanceAsync(string instanceId, CancellationToken cancel = default) => Task.FromResult<CloudInstanceStatus>(null);
 

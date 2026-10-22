@@ -72,7 +72,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Statuses a pod never leaves on its own.</summary>
     static readonly string[] TerminalStatuses = ["ERROR", "TERMINATED"];
 
-    /// <summary>Statuses of a pod that no longer runs, so it no longer bills for a GPU: a kept pod found in one is not reattached.</summary>
+    /// <summary>Statuses of a pod that does not run and will not run unless something starts it: a connect gives up on these instead of waiting.</summary>
     static readonly string[] StoppedStatuses = ["EXITED", "PAUSED", "DEAD", "ERROR", "TERMINATED"];
 
     /// <summary>Pod this provider is bound to. Resolved on first wake.</summary>
@@ -167,6 +167,10 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         if (status.Equals("TERMINATED", StringComparison.OrdinalIgnoreCase))
         {
             throw new SwarmReadableErrorException($"RunPod pod '{podId}' has been terminated and cannot be resumed. Clear 'PodId' to let Cloud Backends create a new one.");
+        }
+        if (!mayStart && StoppedStatuses.Contains(status, StringComparer.OrdinalIgnoreCase))
+        {
+            throw new SwarmReadableErrorException($"RunPod pod '{podId}' is {status}. Press Start to resume it, or Stop to release it.");
         }
         // v2 publishes the currently-legal transitions per pod, so ask rather than assume.
         if (!status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
@@ -284,10 +288,13 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return StatusFromPod(pod);
     }
 
-    /// <summary>True for a pod that may still bill: running, or on its way there (SwarmUI can exit while a start is still waiting for it).</summary>
+    /// <summary>
+    /// True for a pod that still exists, whatever its state: running, still starting (SwarmUI can exit mid-start), or stopped since (from the
+    /// RunPod console, or by the pod itself). The card holds it until Stop or a failsafe releases it, so a stopped pod is still terminated.
+    /// </summary>
     internal static bool IsAdoptable(JObject pod)
     {
-        return pod is not null && !StoppedStatuses.Contains(pod["status"]?.ToString() ?? "", StringComparer.OrdinalIgnoreCase);
+        return pod is not null && !string.Equals(pod["status"]?.ToString(), "TERMINATED", StringComparison.OrdinalIgnoreCase);
     }
 
     public void Dispose() { }
