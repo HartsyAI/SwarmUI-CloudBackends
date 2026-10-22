@@ -96,6 +96,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ManualSettingsOptions(Vals = ["300", "600", "900", "1200", "1800"], ManualNames = ["5 minutes", "10 minutes", "15 minutes", "20 minutes", "30 minutes"])]
         [ConfigComment("How long to wait for the pod to boot and SwarmUI on it to answer.\nRaise it if the first start of a large image times out.")]
         public int RunPodPods_StartupTimeoutSec = 900;
+        [ConfigComment("Leave the pod running when SwarmUI shuts down or restarts, and reattach it when SwarmUI is back; the safety stops resume then.\nWhile SwarmUI is down the pod keeps billing and nothing can stop it. Saving or deleting this card still stops the pod.")]
+        public bool RunPodPods_KeepRunningOnShutdown = false;
 
         // ── Vast.ai Serverless ───────────────────────────────────────────────
         [ConfigComment("Turn Vast.ai Serverless on or off.")]
@@ -162,7 +164,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
     public static readonly HashSet<string> AdvancedFields =
     [
         "RunPodServerless_StartupTimeoutSec",
-        "RunPodPods_TemplateId", "RunPodPods_GpuCount", "RunPodPods_VolumeGb", "RunPodPods_VolumeMountPath", "RunPodPods_SwarmUIPort", "RunPodPods_PodEnv", "RunPodPods_StartupTimeoutSec",
+        "RunPodPods_TemplateId", "RunPodPods_GpuCount", "RunPodPods_VolumeGb", "RunPodPods_VolumeMountPath", "RunPodPods_SwarmUIPort", "RunPodPods_PodEnv", "RunPodPods_StartupTimeoutSec", "RunPodPods_KeepRunningOnShutdown",
         "VastAI_StartupTimeoutSec",
         "VastAIInstance_TemplateHashId", "VastAIInstance_VolumeMountPath", "VastAIInstance_SwarmUIPort", "VastAIInstance_Env", "VastAIInstance_StartupTimeoutSec"
     ];
@@ -195,6 +197,13 @@ public class CloudBackendsBackend : AbstractT2IBackend
         "RunPodPods_" => Config.RunPodPods_Enabled,
         "VastAI_" => Config.VastAI_Enabled,
         "VastAIInstance_" => Config.VastAIInstance_Enabled,
+        _ => false
+    };
+
+    /// <summary>True if the given instance section keeps its machines running through a SwarmUI shutdown.</summary>
+    public bool KeepsRunningOnShutdown(ProviderDef def) => def.Prefix switch
+    {
+        "RunPodPods_" => Config.RunPodPods_KeepRunningOnShutdown,
         _ => false
     };
 
@@ -247,6 +256,28 @@ public class CloudBackendsBackend : AbstractT2IBackend
             ? "No provider enabled - nothing available. Expand a provider section, enable it, and Save."
             : $"{enabledCount} provider(s) enabled. Per-user backends are created on demand for each user with an API key set.");
         WarmUsersWithKeys();
+        ReattachKeptInstances();
+    }
+
+    /// <summary>
+    /// Creates, in the background, the instance backends of users whose machine an earlier run left running under Keep Running On Shutdown,
+    /// so status, Stop and the safety stops cover it again without anyone pressing Start. Creating one only reattaches; it never starts anything.
+    /// </summary>
+    void ReattachKeptInstances()
+    {
+        foreach (ProviderDef def in Providers.Where(d => d.IsInstance && IsProviderEnabled(d) && KeepsRunningOnShutdown(d)))
+        {
+            string typeName = def.Type().BackendClass.Name;
+            foreach (string userId in UsersWithKey(def.KeyType))
+            {
+                User user = Program.Sessions.GetUser(userId, makeNew: false);
+                if (CloudInstanceBackendBase.HasHeldInstance(user, typeName, BackendData.ID))
+                {
+                    Logs.Info($"[CloudBackends] Reattaching the {def.Label} machine that user '{userId}' kept running through the last shutdown.");
+                    _ = Utilities.RunCheckedTask(() => EnsureChildForUser(user, def), "cloud backends reattach");
+                }
+            }
+        }
     }
 
     /// <summary>

@@ -57,7 +57,7 @@ RunPod's load-balancing endpoints were considered and rejected: no session affin
 
 ## Instances
 
-`CloudInstanceBackendBase` drives the provider API to start, stop or create an instance, waits for its SwarmUI to answer (authenticated), and attaches the child. The instance's token is generated once per user and card section, saved with the remembered instance ID, and injected as `SWARMUI_WORKER_TOKEN` when the card creates the instance. Failsafes stop an instance after a runtime or spend cap. Orphans (running instances named `swarmui-cloudbackends...` that no card has attached) are listed and stopped only through explicit routes.
+`CloudInstanceBackendBase` drives the provider API to start, stop or create an instance, waits for its SwarmUI to answer (authenticated), and attaches the child. The instance's token is generated once per user and card section, saved with the remembered instance ID, and injected as `SWARMUI_WORKER_TOKEN` when the card creates the instance. Failsafes stop an instance after a runtime or spend cap. With Keep Running On Shutdown, a SwarmUI exit (not a card save or delete) detaches the child but leaves the instance running, its ID and first start time remembered per user; the card's next Init recreates that user's backend, which reattaches the instance (also one still starting) so status, Stop and the failsafes cover it again, and reconnects its child once the instance's SwarmUI answers, without starting anything. Orphans (running instances named `swarmui-cloudbackends...` that no card has attached) are listed and stopped only through explicit routes.
 
 ## Provider APIs
 

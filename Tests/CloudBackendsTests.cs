@@ -226,6 +226,69 @@ public class RunPodPodTests
     }
 }
 
+/// <summary>Keep Running On Shutdown: what a shutdown releases, and how a kept pod is recognised and timed after a restart.</summary>
+[TestFixture]
+public class KeepRunningTests
+{
+    [Test]
+    public void OnlyASwarmExitWithTheSettingOnKeepsTheInstance()
+    {
+        Assert.That(CloudInstanceBackendBase.ReleasesOnShutdown(keepRunning: false, swarmExiting: true), Is.True);
+        Assert.That(CloudInstanceBackendBase.ReleasesOnShutdown(keepRunning: false, swarmExiting: false), Is.True);
+        // Saving, disabling or deleting the card shuts the backend down without SwarmUI exiting: still released.
+        Assert.That(CloudInstanceBackendBase.ReleasesOnShutdown(keepRunning: true, swarmExiting: false), Is.True);
+        Assert.That(CloudInstanceBackendBase.ReleasesOnShutdown(keepRunning: true, swarmExiting: true), Is.False);
+    }
+
+    [Test]
+    public void StartRecordBelongsToItsOwnInstanceOnly()
+    {
+        DateTime started = new(2026, 10, 22, 19, 30, 5, DateTimeKind.Utc);
+        string record = CloudInstanceBackendBase.FormatStartRecord("abc123", started);
+        Assert.That(CloudInstanceBackendBase.ParseStartRecord(record, "abc123"), Is.EqualTo(started));
+        Assert.That(CloudInstanceBackendBase.ParseStartRecord(record, "other"), Is.Null);
+        Assert.That(CloudInstanceBackendBase.ParseStartRecord(record, ""), Is.Null);
+        Assert.That(CloudInstanceBackendBase.ParseStartRecord("", "abc123"), Is.Null);
+        Assert.That(CloudInstanceBackendBase.ParseStartRecord(null, "abc123"), Is.Null);
+        Assert.That(CloudInstanceBackendBase.ParseStartRecord("abc123 not-a-time", "abc123"), Is.Null);
+    }
+
+    [Test]
+    public void ReattachedInstanceKeepsCountingFromItsFirstStart()
+    {
+        DateTime now = new(2026, 10, 22, 20, 0, 0, DateTimeKind.Utc);
+        DateTime recorded = now.AddMinutes(-50);
+        Assert.That(CloudInstanceBackendBase.RestoredStartTime(recorded, uptimeSeconds: 60, now), Is.EqualTo(recorded));
+        // A record from the future (clock skew) is not trusted; the provider's uptime is next, then now.
+        Assert.That(CloudInstanceBackendBase.RestoredStartTime(now.AddMinutes(5), uptimeSeconds: 600, now), Is.EqualTo(now.AddMinutes(-10)));
+        Assert.That(CloudInstanceBackendBase.RestoredStartTime(null, uptimeSeconds: 0, now), Is.EqualTo(now));
+    }
+
+    [Test]
+    public void PodsThatMayStillBillAreReattached()
+    {
+        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "RUNNING" }), Is.True);
+        // SwarmUI can exit while a start still waits for the pod: a pod on its way to running stays this card's to stop.
+        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "CREATED" }), Is.True);
+        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "RESTARTING" }), Is.True);
+        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "EXITED" }), Is.False);
+        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "terminated" }), Is.False);
+        Assert.That(RunPodPodsProvider.IsAdoptable(null), Is.False);
+    }
+
+    [Test]
+    public void OffByDefaultAndReachesThePodSection()
+    {
+        Assert.That(new CloudBackendsBackend.Settings().RunPodPods_KeepRunningOnShutdown, Is.False);
+        Assert.That(new RunPodPodsBackend.Settings().KeepRunningOnShutdown, Is.False);
+        // The card copies each RunPodPods_X into the pod backend's X by name, so every card field needs a field of that name there.
+        string[] missing = [.. typeof(CloudBackendsBackend.Settings).GetFields().Select(f => f.Name)
+            .Where(n => n.StartsWith("RunPodPods_") && n != "RunPodPods_Enabled")
+            .Where(n => typeof(RunPodPodsBackend.Settings).GetField(n["RunPodPods_".Length..]) is null)];
+        Assert.That(missing, Is.Empty);
+    }
+}
+
 /// <summary>Vast.ai session renewal and lease parsing.</summary>
 [TestFixture]
 public class VastSessionTests

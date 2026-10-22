@@ -67,6 +67,9 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
 
         /// <summary>Failsafe: stop once the estimated spend (the provider's hourly rate times time running) reaches this many US dollars. Zero disables it.</summary>
         public double MaxSpendUsd = 0;
+
+        /// <summary>Leave the instance running when SwarmUI itself shuts down, and reattach it on the next run. Off releases it, as any other shutdown does.</summary>
+        public bool KeepRunningOnShutdown = false;
     }
 
     /// <summary>How often to poll the provider while an instance starts, in milliseconds.</summary>
@@ -143,6 +146,9 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     /// </summary>
     bool HasBillableInstance => CurrentInstance is not null || (InstanceStartedAt is not null && !string.IsNullOrWhiteSpace(Provider?.ActiveInstanceId));
 
+    /// <summary>True while this backend holds an instance it would release on Stop, attached or not (see <see cref="HasBillableInstance"/>).</summary>
+    public bool HoldsInstance => HasBillableInstance;
+
     async Task CheckFailsafeAsync()
     {
         if (!HasBillableInstance || InstanceStartedAt is null || FailsafeTripped)
@@ -195,7 +201,50 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
     // ── Per-user instance persistence ─────────────────────────────────────────
 
     /// <summary>Per-user key the active instance ID is remembered under: class plus the parent backend's ID.</summary>
-    string PersistName => $"{GetType().Name}_{BackendData?.AbstractParent?.ID ?? BackendData?.ID}";
+    string PersistName => PersistKey(GetType().Name, BackendData?.AbstractParent?.ID ?? BackendData?.ID ?? 0);
+
+    /// <summary>The per-user key a backend type under a card remembers its instance under.</summary>
+    public static string PersistKey(string backendTypeName, int cardId) => $"{backendTypeName}_{cardId}";
+
+    /// <summary>
+    /// Per-user key of the start record, "{id} {start time}", written when this backend starts or reattaches an instance and removed when
+    /// it releases it. It marks the instance as held by this backend, and keeps the safety stops counting from the first start across a restart.
+    /// </summary>
+    string StartRecordName => $"{PersistName}_started";
+
+    /// <summary>A start record for <paramref name="instanceId"/>.</summary>
+    internal static string FormatStartRecord(string instanceId, DateTime startedUtc) => $"{instanceId} {startedUtc.ToUniversalTime():O}";
+
+    /// <summary>The start time in a start record when the record is for <paramref name="instanceId"/>, else null.</summary>
+    internal static DateTime? ParseStartRecord(string record, string instanceId)
+    {
+        string[] parts = record?.Trim().Split(' ', 2) ?? [];
+        if (parts.Length != 2 || string.IsNullOrWhiteSpace(instanceId) || parts[0] != instanceId.Trim())
+        {
+            return null;
+        }
+        return DateTime.TryParse(parts[1], System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.RoundtripKind, out DateTime started) ? started.ToUniversalTime() : null;
+    }
+
+    /// <summary>When a reattached instance started billing: its start record, else now minus the uptime the provider reports, else now.</summary>
+    internal static DateTime RestoredStartTime(DateTime? recorded, int uptimeSeconds, DateTime nowUtc)
+    {
+        if (recorded is DateTime started && started <= nowUtc)
+        {
+            return started;
+        }
+        return uptimeSeconds > 0 ? nowUtc.AddSeconds(-uptimeSeconds) : nowUtc;
+    }
+
+    /// <summary>True if a shutdown releases the instance: always, unless Keep Running On Shutdown is on and SwarmUI itself is exiting. Saving, disabling or deleting the card still releases it.</summary>
+    internal static bool ReleasesOnShutdown(bool keepRunning, bool swarmExiting) => !(keepRunning && swarmExiting);
+
+    /// <summary>True if the user has an instance that a backend of this type under this card started and has not released.</summary>
+    public static bool HasHeldInstance(User user, string backendTypeName, int cardId)
+    {
+        string key = PersistKey(backendTypeName, cardId);
+        return ParseStartRecord(user?.GetGenericData("cloudbackends", $"{key}_started"), user?.GetGenericData("cloudbackends", key)) is not null;
+    }
 
     /// <summary>
     /// Instance ID remembered from a previous run for this owner, loaded at Init. Subclasses feed this
@@ -271,6 +320,10 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         }
         // Recorded even when unchanged, so an ID missing from the orphan list (older install, or evicted) rejoins it.
         RememberKnownInstance(Owner, GetType().Name, id);
+        if (InstanceStartedAt is DateTime started && ParseStartRecord(Owner?.GetGenericData("cloudbackends", StartRecordName), id) is null)
+        {
+            Owner?.SaveGenericData("cloudbackends", StartRecordName, FormatStartRecord(id, started));
+        }
         if (id == PersistedInstanceId)
         {
             return;
@@ -328,9 +381,145 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         // A control instance must not be offered for generation itself.
         CanLoadModels = false;
         MaxUsages = 1;
+        await ReattachKeptInstanceAsync();
         // Never started here: renting bills, so starting is always an explicit action (Start, or the start route).
         Status = BackendStatus.RUNNING;
-        AddLoadStatus($"{Provider.ProviderName} backend ready. The instance is not started yet; press Start to rent one.");
+        AddLoadStatus(HasBillableInstance ? $"{Provider.ProviderName} backend ready, holding instance '{Provider.ActiveInstanceId}'." : $"{Provider.ProviderName} backend ready. The instance is not started yet; press Start to rent one.");
+        if (HasBillableInstance)
+        {
+            ScheduleReconnect();
+        }
+    }
+
+    /// <summary>True once the instance an earlier run left running has been looked up, or there was none to look up. A failed lookup leaves it false, so the next status or Stop retries.</summary>
+    volatile bool ReattachChecked = false;
+
+    /// <summary>
+    /// With Keep Running On Shutdown, binds this backend to the instance an earlier SwarmUI run left running, so status, Stop and the safety stops
+    /// cover it again without anyone pressing Start. Never starts anything, and never throws: a failed lookup is retried on the next call.
+    /// </summary>
+    public async Task ReattachKeptInstanceAsync()
+    {
+        if (ReattachChecked || !InstanceConfig.KeepRunningOnShutdown)
+        {
+            return;
+        }
+        try
+        {
+            await InstanceLock.WaitAsync(Program.GlobalProgramCancel);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        bool reattached;
+        try
+        {
+            reattached = await ReattachKeptInstanceLockedAsync();
+        }
+        finally
+        {
+            InstanceLock.Release();
+        }
+        // Init reconnects once it is RUNNING; a later reattach (a status call retrying a failed lookup) reconnects here.
+        if (reattached && Status == BackendStatus.RUNNING)
+        {
+            ScheduleReconnect();
+        }
+    }
+
+    /// <summary><see cref="ReattachKeptInstanceAsync"/>, for a caller already holding <see cref="InstanceLock"/>. True if it reattached an instance.</summary>
+    async Task<bool> ReattachKeptInstanceLockedAsync()
+    {
+        if (ReattachChecked || !InstanceConfig.KeepRunningOnShutdown || Provider is null)
+        {
+            return false;
+        }
+        string id = PersistedInstanceId;
+        DateTime? recorded = ParseStartRecord(Owner?.GetGenericData("cloudbackends", StartRecordName), id);
+        // Only an instance this backend started and never released is reattached; a provider bound to another instance (a PodId set since) is left alone.
+        if (recorded is null || HasBillableInstance || (!string.IsNullOrWhiteSpace(Provider.ActiveInstanceId) && Provider.ActiveInstanceId != id))
+        {
+            ReattachChecked = true;
+            return false;
+        }
+        try
+        {
+            using CancellationTokenSource cancel = Utilities.TimedCancel(TimeSpan.FromSeconds(30));
+            CloudInstanceStatus status = await Provider.AdoptInstanceAsync(id, cancel.Token);
+            ReattachChecked = true;
+            if (status is null)
+            {
+                Logs.Info($"[{Provider.ProviderName}] Instance '{id}' kept from an earlier run is gone or stopped.");
+                Owner?.DeleteGenericData("cloudbackends", StartRecordName);
+                return false;
+            }
+            InstanceStartedAt = RestoredStartTime(recorded, status.UptimeSeconds, DateTime.UtcNow);
+            AddLoadStatus($"Reattached instance '{id}', which an earlier SwarmUI run left running. It bills until it is stopped.");
+            Logs.Info($"[{Provider.ProviderName}] Backend #{BackendData?.ID} reattached instance '{id}' (running since {InstanceStartedAt:u}); the safety stops apply again.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[{Provider.ProviderName}] Could not check instance '{id}' kept from an earlier run, will retry: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Reconnects, in the background, the Swarm backend of an instance reattached after a restart.</summary>
+    void ScheduleReconnect()
+    {
+        _ = Utilities.RunCheckedTask(ReconnectKeptInstanceAsync, $"{GetType().Name} #{BackendData?.ID} reconnect");
+    }
+
+    /// <summary>
+    /// Attaches the Swarm backend of a reattached instance once its SwarmUI answers, so it generates again without pressing Start. Never starts,
+    /// resumes or creates anything, and holds <see cref="InstanceLock"/> only to attach, so Stop is never kept waiting on the connection.
+    /// </summary>
+    async Task ReconnectKeptInstanceAsync()
+    {
+        ICloudInstanceProvider provider = Provider;
+        string id = provider?.ActiveInstanceId;
+        if (provider is null || string.IsNullOrWhiteSpace(id) || ChildBackend is not null)
+        {
+            return;
+        }
+        using CancellationTokenSource cancel = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token, Program.GlobalProgramCancel);
+        try
+        {
+            CloudInstanceInfo info = await provider.ConnectInstanceAsync(InstanceConfig.StartupTimeoutSec, PollIntervalMs, cancel.Token);
+            if (info is null)
+            {
+                return;
+            }
+            await InstanceLock.WaitAsync(cancel.Token);
+            try
+            {
+                // Stopped, released or attached by a Start while this waited: nothing to do.
+                if (Status != BackendStatus.RUNNING || ChildBackend is not null || CurrentInstance is not null || Provider != provider || !HasBillableInstance)
+                {
+                    return;
+                }
+                CurrentInstance = info;
+                AttachChildBackend();
+                AddLoadStatus($"Reconnected to instance '{id}' at {info.PublicUrl}.");
+            }
+            finally
+            {
+                InstanceLock.Release();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down.
+        }
+        catch (Exception ex)
+        {
+            if (Provider == provider && HasBillableInstance && ChildBackend is null)
+            {
+                AddLoadStatus($"Instance '{id}' is held, but its SwarmUI did not answer ({ex.Message}). Press Start to reconnect it, or Stop to release it.");
+            }
+        }
     }
 
     /// <summary>Rebuilds the provider if the owner's API key changed, so a new key applies on the next start. Must be called under <see cref="InstanceLock"/>.</summary>
@@ -370,8 +559,8 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             }
             RefreshProviderIfKeyChanged();
             AddLoadStatus($"Starting {Provider.ProviderName} instance (up to {InstanceConfig.StartupTimeoutSec}s)...");
-            // The runtime and spend caps count from here, so they also cover an instance whose SwarmUI never answers.
-            InstanceStartedAt = DateTime.UtcNow;
+            // The runtime and spend caps count from here, so they also cover an instance whose SwarmUI never answers. A held instance keeps its first start.
+            InstanceStartedAt ??= DateTime.UtcNow;
             try
             {
                 CurrentInstance = await Provider.StartInstanceAsync(InstanceConfig.StartupTimeoutSec, PollIntervalMs, cancel.Token);
@@ -436,6 +625,8 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         bool released = false;
         try
         {
+            // An instance kept from an earlier run that Init could not look up is still this backend's to release.
+            await ReattachKeptInstanceLockedAsync();
             if (ChildBackend is not null)
             {
                 BackendHandler.BackendData child = ChildBackend;
@@ -452,6 +643,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
                 {
                     await Provider.ReleaseInstanceAsync();
                     released = true;
+                    Owner?.DeleteGenericData("cloudbackends", StartRecordName);
                 }
                 catch (Exception ex)
                 {
@@ -479,7 +671,14 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         Logs.Info($"[{name}] Backend {BackendData?.ID} shutting down...");
         try
         {
-            await StopInstanceAsync();
+            if (ReleasesOnShutdown(InstanceConfig.KeepRunningOnShutdown, Program.GlobalProgramCancel.IsCancellationRequested))
+            {
+                await StopInstanceAsync();
+            }
+            else
+            {
+                await LeaveInstanceRunningAsync();
+            }
         }
         catch (SwarmReadableErrorException)
         {
@@ -487,6 +686,32 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         }
         Provider?.Dispose();
         Provider = null;
+    }
+
+    /// <summary>Detaches the child but leaves the instance running, with its ID and start record kept for the next run to reattach. Safe to call twice.</summary>
+    async Task LeaveInstanceRunningAsync()
+    {
+        await InstanceLock.WaitAsync(CancellationToken.None);
+        try
+        {
+            if (ChildBackend is not null)
+            {
+                BackendHandler.BackendData child = ChildBackend;
+                ChildBackend = null;
+                await CloudChildBackend.DetachAsync(Handler, child, Provider?.ProviderName);
+                await OnChildDetachedAsync();
+            }
+            if (Provider is not null && HasBillableInstance)
+            {
+                Logs.Warning($"[{Provider.ProviderName}] Leaving instance '{CurrentInstance?.InstanceId ?? Provider.ActiveInstanceId}' running (Keep Running On Shutdown). It bills until it is stopped; the next SwarmUI run reattaches it.");
+            }
+            CurrentInstance = null;
+            InstanceStartedAt = null;
+        }
+        finally
+        {
+            InstanceLock.Release();
+        }
     }
 
     /// <inheritdoc/>

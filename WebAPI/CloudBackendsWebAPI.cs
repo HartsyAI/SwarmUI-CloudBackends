@@ -160,6 +160,8 @@ public static class CloudBackendsWebAPI
             {
                 return Error("Backend has no active provider (not yet initialized).", "card_starting");
             }
+            // Retries a reattach that failed at startup, so a machine kept through a restart is never reported as missing.
+            await backend.ReattachKeptInstanceAsync();
             CloudInstanceStatus status = await backend.Provider.GetStatusAsync(force_refresh);
             if (status is null)
             {
@@ -692,11 +694,11 @@ public static class CloudBackendsWebAPI
         return Task.FromResult(new JObject { ["success"] = true, ["cleared"] = backends.Count });
     }
 
-    /// <summary>IDs of instances the user's own instance backends have attached, or are starting right now (so they are not orphans).</summary>
+    /// <summary>IDs of instances the user's own instance backends have attached, are starting, or hold for Stop and the safety stops (so they are not orphans).</summary>
     static HashSet<string> AttachedInstanceIds(Session session)
     {
         return [.. Program.Backends.RunningBackendsOfType<CloudInstanceBackendBase>()
-            .Where(b => b.OwnerUserId == session.User.UserID && (b.ChildBackend is not null || b.Starting) && !string.IsNullOrWhiteSpace(b.Provider?.ActiveInstanceId))
+            .Where(b => b.OwnerUserId == session.User.UserID && (b.ChildBackend is not null || b.Starting || b.HoldsInstance) && !string.IsNullOrWhiteSpace(b.Provider?.ActiveInstanceId))
             .Select(b => b.Provider.ActiveInstanceId)];
     }
 
