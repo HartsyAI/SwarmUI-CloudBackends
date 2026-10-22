@@ -256,6 +256,25 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return status?.CostPerHour;
     }
 
+    /// <inheritdoc/>
+    public async Task<CloudInstanceStatus> AdoptInstanceAsync(string instanceId, CancellationToken cancel = default)
+    {
+        JObject pod = string.IsNullOrWhiteSpace(instanceId) ? null : await GetPodAsync(instanceId.Trim(), cancel);
+        if (!IsAdoptable(pod))
+        {
+            return null;
+        }
+        ActiveInstanceId = instanceId.Trim();
+        Logs.Info($"[RunPodPods] Reattached pod '{ActiveInstanceId}', still running from an earlier SwarmUI run.");
+        return StatusFromPod(pod);
+    }
+
+    /// <summary>True for a pod that is still running, and so still billing: the only kind a restart reattaches.</summary>
+    internal static bool IsAdoptable(JObject pod)
+    {
+        return pod is not null && string.Equals(pod["status"]?.ToString(), "RUNNING", StringComparison.OrdinalIgnoreCase);
+    }
+
     public void Dispose() { }
 
     // ── Pod lifecycle ─────────────────────────────────────────────────────────

@@ -42,7 +42,7 @@ class CloudBackendsHelper {
             GpuTypeId: 'GPU', GpuName: 'GPU', ContainerDiskGb: 'Container Disk', DiskGb: 'Container Disk', NetworkVolumeId: 'Network Volume',
             CloudType: 'Cloud', DataCenterId: 'Data Center', MaxRuntimeMinutes: 'Max Runtime', MaxSpendUsd: 'Max Spend',
             TemplateId: 'Template', TemplateHashId: 'Template', GpuCount: 'GPU Count', VolumeGb: 'Pod Volume (GB)', VolumeMountPath: 'Volume Mount Path',
-            SwarmUIPort: 'SwarmUI Port', PodEnv: 'Environment Variables', Env: 'Environment Variables'
+            SwarmUIPort: 'SwarmUI Port', PodEnv: 'Environment Variables', Env: 'Environment Variables', KeepRunningOnShutdown: 'Keep Running On Shutdown'
         };
         /**
          * Fields that only matter when another field is set. 'hide' removes the row; 'dim' greys it out, for a field the

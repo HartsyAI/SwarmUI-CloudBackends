@@ -77,6 +77,8 @@ When you pick the volume's data center, check that it has the GPU you want: pods
 
    **Advanced** holds settings only a custom setup needs: a RunPod template, GPU count, a pod volume, the volume mount path, the SwarmUI port, extra environment variables, and the startup timeout.
 
+   **Keep Running On Shutdown** (also under **Advanced**) leaves the pod running when SwarmUI shuts down or restarts and reattaches it when SwarmUI is back; with it on, a pod keeps billing while SwarmUI is down.
+
 5. Press **Save** at the top of the card. Saving never starts a pod.
 
 ## Step 6: Start the pod

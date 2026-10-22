@@ -57,4 +57,10 @@ public interface ICloudInstanceProvider : IDisposable
 
     /// <summary>The running instance's hourly price, for the spend failsafe, or null if unknown.</summary>
     Task<double?> GetCostPerHourAsync(CancellationToken cancel = default);
+
+    /// <summary>
+    /// Binds the provider to an instance an earlier SwarmUI run left running, after checking that it still runs, and returns its status;
+    /// null when it is gone or not running. A provider that cannot do this returns null, so its instances are never kept through a restart.
+    /// </summary>
+    Task<CloudInstanceStatus> AdoptInstanceAsync(string instanceId, CancellationToken cancel = default) => Task.FromResult<CloudInstanceStatus>(null);
 }
