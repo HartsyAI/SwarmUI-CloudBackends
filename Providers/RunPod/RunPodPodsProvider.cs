@@ -72,6 +72,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Statuses a pod never leaves on its own.</summary>
     static readonly string[] TerminalStatuses = ["ERROR", "TERMINATED"];
 
+    /// <summary>Statuses of a pod that no longer runs, so it no longer bills for a GPU: a kept pod found in one is not reattached.</summary>
+    static readonly string[] StoppedStatuses = ["EXITED", "PAUSED", "DEAD", "ERROR", "TERMINATED"];
+
     /// <summary>Pod this provider is bound to. Resolved on first wake.</summary>
     public string ActiveInstanceId { get; private set; } = plan.PodId?.Trim() ?? "";
 
@@ -142,7 +145,19 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         }
     }
 
-    public async Task<CloudInstanceInfo> StartInstanceAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
+    public Task<CloudInstanceInfo> StartInstanceAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
+    {
+        return StartOrConnectAsync(maxWaitSeconds, pollIntervalMs, mayStart: true, cancel);
+    }
+
+    /// <inheritdoc/>
+    public async Task<CloudInstanceInfo> ConnectInstanceAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
+    {
+        return string.IsNullOrWhiteSpace(ActiveInstanceId) ? null : await StartOrConnectAsync(maxWaitSeconds, pollIntervalMs, mayStart: false, cancel);
+    }
+
+    /// <summary>Resolves (or creates) the pod, starts it if <paramref name="mayStart"/>, then waits for its SwarmUI. Without <paramref name="mayStart"/> it only waits.</summary>
+    async Task<CloudInstanceInfo> StartOrConnectAsync(int maxWaitSeconds, int pollIntervalMs, bool mayStart, CancellationToken cancel)
     {
         DateTime deadline = DateTime.UtcNow.AddSeconds(maxWaitSeconds);
         string podId = await ResolvePodAsync(cancel);
@@ -156,7 +171,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         // v2 publishes the currently-legal transitions per pod, so ask rather than assume.
         if (!status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
         {
-            if (PodAllows(pod, "start"))
+            if (mayStart && PodAllows(pod, "start"))
             {
                 Logs.Info($"[RunPodPods] Starting pod '{podId}'...");
                 await ApiAsync(HttpMethod.Post, $"/pods/{podId}/action", new JObject { ["action"] = "start" }, cancel);
@@ -265,14 +280,14 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             return null;
         }
         ActiveInstanceId = instanceId.Trim();
-        Logs.Info($"[RunPodPods] Reattached pod '{ActiveInstanceId}', still running from an earlier SwarmUI run.");
+        Logs.Info($"[RunPodPods] Reattached pod '{ActiveInstanceId}' ({pod["status"]}), kept from an earlier SwarmUI run.");
         return StatusFromPod(pod);
     }
 
-    /// <summary>True for a pod that is still running, and so still billing: the only kind a restart reattaches.</summary>
+    /// <summary>True for a pod that may still bill: running, or on its way there (SwarmUI can exit while a start is still waiting for it).</summary>
     internal static bool IsAdoptable(JObject pod)
     {
-        return pod is not null && string.Equals(pod["status"]?.ToString(), "RUNNING", StringComparison.OrdinalIgnoreCase);
+        return pod is not null && !StoppedStatuses.Contains(pod["status"]?.ToString() ?? "", StringComparer.OrdinalIgnoreCase);
     }
 
     public void Dispose() { }

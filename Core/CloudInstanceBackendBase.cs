@@ -385,6 +385,10 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         // Never started here: renting bills, so starting is always an explicit action (Start, or the start route).
         Status = BackendStatus.RUNNING;
         AddLoadStatus(HasBillableInstance ? $"{Provider.ProviderName} backend ready, holding instance '{Provider.ActiveInstanceId}'." : $"{Provider.ProviderName} backend ready. The instance is not started yet; press Start to rent one.");
+        if (HasBillableInstance)
+        {
+            ScheduleReconnect();
+        }
     }
 
     /// <summary>True once the instance an earlier run left running has been looked up, or there was none to look up. A failed lookup leaves it false, so the next status or Stop retries.</summary>
@@ -408,22 +412,28 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         {
             return;
         }
+        bool reattached;
         try
         {
-            await ReattachKeptInstanceLockedAsync();
+            reattached = await ReattachKeptInstanceLockedAsync();
         }
         finally
         {
             InstanceLock.Release();
         }
+        // Init reconnects once it is RUNNING; a later reattach (a status call retrying a failed lookup) reconnects here.
+        if (reattached && Status == BackendStatus.RUNNING)
+        {
+            ScheduleReconnect();
+        }
     }
 
-    /// <summary><see cref="ReattachKeptInstanceAsync"/>, for a caller already holding <see cref="InstanceLock"/>.</summary>
-    async Task ReattachKeptInstanceLockedAsync()
+    /// <summary><see cref="ReattachKeptInstanceAsync"/>, for a caller already holding <see cref="InstanceLock"/>. True if it reattached an instance.</summary>
+    async Task<bool> ReattachKeptInstanceLockedAsync()
     {
         if (ReattachChecked || !InstanceConfig.KeepRunningOnShutdown || Provider is null)
         {
-            return;
+            return false;
         }
         string id = PersistedInstanceId;
         DateTime? recorded = ParseStartRecord(Owner?.GetGenericData("cloudbackends", StartRecordName), id);
@@ -431,7 +441,7 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
         if (recorded is null || HasBillableInstance || (!string.IsNullOrWhiteSpace(Provider.ActiveInstanceId) && Provider.ActiveInstanceId != id))
         {
             ReattachChecked = true;
-            return;
+            return false;
         }
         try
         {
@@ -440,17 +450,75 @@ public abstract class CloudInstanceBackendBase : AbstractT2IBackend, ICloudBacke
             ReattachChecked = true;
             if (status is null)
             {
-                Logs.Info($"[{Provider.ProviderName}] Instance '{id}' kept from an earlier run is no longer running.");
+                Logs.Info($"[{Provider.ProviderName}] Instance '{id}' kept from an earlier run is gone or stopped.");
                 Owner?.DeleteGenericData("cloudbackends", StartRecordName);
-                return;
+                return false;
             }
             InstanceStartedAt = RestoredStartTime(recorded, status.UptimeSeconds, DateTime.UtcNow);
             AddLoadStatus($"Reattached instance '{id}', which an earlier SwarmUI run left running. It bills until it is stopped.");
             Logs.Info($"[{Provider.ProviderName}] Backend #{BackendData?.ID} reattached instance '{id}' (running since {InstanceStartedAt:u}); the safety stops apply again.");
+            return true;
         }
         catch (Exception ex)
         {
             Logs.Warning($"[{Provider.ProviderName}] Could not check instance '{id}' kept from an earlier run, will retry: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Reconnects, in the background, the Swarm backend of an instance reattached after a restart.</summary>
+    void ScheduleReconnect()
+    {
+        _ = Utilities.RunCheckedTask(ReconnectKeptInstanceAsync, $"{GetType().Name} #{BackendData?.ID} reconnect");
+    }
+
+    /// <summary>
+    /// Attaches the Swarm backend of a reattached instance once its SwarmUI answers, so it generates again without pressing Start. Never starts,
+    /// resumes or creates anything, and holds <see cref="InstanceLock"/> only to attach, so Stop is never kept waiting on the connection.
+    /// </summary>
+    async Task ReconnectKeptInstanceAsync()
+    {
+        ICloudInstanceProvider provider = Provider;
+        string id = provider?.ActiveInstanceId;
+        if (provider is null || string.IsNullOrWhiteSpace(id) || ChildBackend is not null)
+        {
+            return;
+        }
+        using CancellationTokenSource cancel = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token, Program.GlobalProgramCancel);
+        try
+        {
+            CloudInstanceInfo info = await provider.ConnectInstanceAsync(InstanceConfig.StartupTimeoutSec, PollIntervalMs, cancel.Token);
+            if (info is null)
+            {
+                return;
+            }
+            await InstanceLock.WaitAsync(cancel.Token);
+            try
+            {
+                // Stopped, released or attached by a Start while this waited: nothing to do.
+                if (Status != BackendStatus.RUNNING || ChildBackend is not null || CurrentInstance is not null || Provider != provider || !HasBillableInstance)
+                {
+                    return;
+                }
+                CurrentInstance = info;
+                AttachChildBackend();
+                AddLoadStatus($"Reconnected to instance '{id}' at {info.PublicUrl}.");
+            }
+            finally
+            {
+                InstanceLock.Release();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down.
+        }
+        catch (Exception ex)
+        {
+            if (Provider == provider && HasBillableInstance && ChildBackend is null)
+            {
+                AddLoadStatus($"Instance '{id}' is held, but its SwarmUI did not answer ({ex.Message}). Press Start to reconnect it, or Stop to release it.");
+            }
         }
     }
 

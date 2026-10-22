@@ -265,12 +265,14 @@ public class KeepRunningTests
     }
 
     [Test]
-    public void OnlyRunningPodsAreReattached()
+    public void PodsThatMayStillBillAreReattached()
     {
         Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "RUNNING" }), Is.True);
+        // SwarmUI can exit while a start still waits for the pod: a pod on its way to running stays this card's to stop.
+        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "CREATED" }), Is.True);
+        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "RESTARTING" }), Is.True);
         Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "EXITED" }), Is.False);
-        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "TERMINATED" }), Is.False);
-        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject()), Is.False);
+        Assert.That(RunPodPodsProvider.IsAdoptable(new JObject { ["status"] = "terminated" }), Is.False);
         Assert.That(RunPodPodsProvider.IsAdoptable(null), Is.False);
     }
 
