@@ -1,11 +1,6 @@
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// Live status snapshot of a rented cloud instance (a RunPod pod, a Vast.ai instance), in one
-/// provider-neutral shape so the WebAPI and UI handle every provider identically. Providers project
-/// their own API responses into this via a static factory kept next to their JSON knowledge
-/// (see RunPodPodsProvider and VastAIInstanceProvider).
-/// </summary>
+/// <summary>Provider-neutral live status of a rented instance (a RunPod pod, a Vast.ai instance), so the WebAPI and UI handle every provider alike. Each provider projects its own API response into it.</summary>
 public class CloudInstanceStatus
 {
     /// <summary>Provider-side identifier, for example a RunPod pod ID or Vast.ai contract ID.</summary>

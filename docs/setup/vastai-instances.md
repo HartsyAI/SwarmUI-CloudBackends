@@ -64,7 +64,7 @@ In SwarmUI, open **User ▸ User Info ▸ API Keys**, paste the key into the **V
    | Max Runtime | Stop the instance after it has run this long. `4 hours` by default; **Off** turns it off. |
    | Max Spend | Stop the instance once it has cost about this much. `$10` by default; **Off** turns it off. |
 
-   **Advanced** holds settings only a custom setup needs: a Vast.ai template, the volume mount path, the SwarmUI port, extra environment variables, and the startup timeout.
+   **Advanced** holds settings only a custom setup needs: a Vast.ai template, the volume mount path, the SwarmUI port, and the startup timeout.
 
 5. Press **Save** at the top of the card. Saving never rents anything.
 
@@ -92,7 +92,7 @@ You can also see and stop your instances on Vast.ai under **Instances**.
 
 ## Using an instance you made yourself
 
-Pick it under **Instance**. It must run the Hartsy Vast.ai worker image (`kalebbroo/swarmui-worker-vast`) in entrypoint mode, expose port `7801`, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **Worker Token**, which shows once an instance is picked. Stop Instance only pauses an instance you made yourself, whatever **Delete On Stop** says. Letting the card rent the instance is simpler, because it handles all of that.
+Pick it under **Instance**. It must run the Hartsy Vast.ai worker image (`kalebbroo/swarmui-worker-vast`) in entrypoint mode, expose port `7801`, and have `SWARMUI_WORKER_CONFIG` set to `{"worker_token": "<token>"}`, where the token is a random value of at least 32 characters. Put the same token in **Worker Token**, which shows once an instance is picked. Stop Instance only pauses an instance you made yourself, whatever **Delete On Stop** says. Letting the card rent the instance is simpler, because it handles all of that.
 
 ## What it costs
 

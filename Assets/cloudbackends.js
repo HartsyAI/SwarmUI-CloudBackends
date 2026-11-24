@@ -1,13 +1,10 @@
 /**
  * Enhances the "Cloud Backends" card on top of core's rendering, without replacing any core code:
- * - Groups the fields into one collapsible section per provider, with an Enabled toggle and a setup guide link in each
- *   header, plain labels, and the rarely needed fields folded into an Advanced group.
- * - Turns endpoint, GPU, network volume and similar fields into dropdowns filled from the user's own account
- *   (same id and data-name, so core's Edit and Save keep working). Without a key they stay text boxes.
- * - Keeps a saved value that a dropdown doesn't list, and greys out or hides fields that don't apply.
+ * - Groups the fields into one collapsible section per provider, with an Enabled toggle and setup guide link in each header, plain labels, and the rarely needed fields folded into an Advanced group.
+ * - Turns endpoint, GPU, network volume and similar fields into dropdowns filled from the user's own account, with the same id and data-name so core's Edit and Save keep working. Without a key they stay text boxes.
+ * - Keeps a saved value that a dropdown does not list, and greys out or hides fields that do not apply.
  * - Adds Start/Stop and a status line to instance sections, and Discover, Validate and a worker list to serverless ones.
- * Core rebuilds cards on add, save and status polls, so a MutationObserver re-runs enhancement; it makes no DOM
- * writes on an already-enhanced card, so it cannot loop.
+ * Core rebuilds cards on add, save and status polls, so a MutationObserver re-runs enhancement. It makes no DOM writes on an already-enhanced card, so it cannot loop.
  */
 class CloudBackendsHelper {
 
@@ -42,7 +39,7 @@ class CloudBackendsHelper {
             GpuTypeId: 'GPU', GpuName: 'GPU', ContainerDiskGb: 'Container Disk', DiskGb: 'Container Disk', NetworkVolumeId: 'Network Volume',
             CloudType: 'Cloud', DataCenterId: 'Data Center', MaxRuntimeMinutes: 'Max Runtime', MaxSpendUsd: 'Max Spend',
             TemplateId: 'Template', TemplateHashId: 'Template', GpuCount: 'GPU Count', VolumeGb: 'Pod Volume (GB)', VolumeMountPath: 'Volume Mount Path',
-            SwarmUIPort: 'SwarmUI Port', PodEnv: 'Environment Variables', Env: 'Environment Variables', KeepRunningOnShutdown: 'Keep Running On Shutdown'
+            SwarmUIPort: 'SwarmUI Port', KeepRunningOnShutdown: 'Keep Running On Shutdown'
         };
         /**
          * Fields that only matter when another field is set. 'hide' removes the row; 'dim' greys it out, for a field the
@@ -57,7 +54,7 @@ class CloudBackendsHelper {
         ];
     }
 
-    /** Called once at session ready: fetches the provider table, then hooks re-render points. Account options load when the Backends tab opens. */
+    /** Called once at session ready: fetches the provider table, then hooks re-render points. Account options load on each visit to the Backends tab, so what is rentable (and a key added since) stays current without a reload. */
     init() {
         genericRequest('CloudListProviders', {}, data => {
             this.providers = data.providers || [];
@@ -72,11 +69,9 @@ class CloudBackendsHelper {
                 if (!name || !this.providers.some(p => name.startsWith(p.prefix))) {
                     return;
                 }
-                // A card switched to another RunPod cloud type needs that type's prices and availability.
                 if (name == 'RunPodPods_CloudType') {
                     this.refreshAllOptions();
                 }
-                // A different endpoint has a different worker limit, and other fields show or hide with this one.
                 this.enhanceAllCards();
             });
             document.addEventListener('input', e => {
@@ -86,7 +81,6 @@ class CloudBackendsHelper {
                 }
             });
             if (tabButton) {
-                // Loaded on each visit, so what is rentable (and a key added since) stays current without a reload.
                 tabButton.addEventListener('click', () => this.refreshAllOptions());
             }
             this.enhanceAllCards();
@@ -150,7 +144,7 @@ class CloudBackendsHelper {
         });
     }
 
-    /** Enhances every rendered cloud_backends card. Zero DOM writes for already-enhanced cards. */
+    /** Enhances every rendered cloud_backends card, with no DOM writes for an already-enhanced one. Also requests account options if the Backends tab was already open at load, since its click never fired. */
     enhanceAllCards() {
         if (!this.providers || typeof backends_loaded == 'undefined') {
             return;
@@ -164,7 +158,6 @@ class CloudBackendsHelper {
                 continue;
             }
             if (!this.optionsRequested && cardBody.offsetParent != null) {
-                // The Backends tab was already open when the page loaded, so its click never fired.
                 this.optionsRequested = true;
                 this.refreshAllOptions();
             }
@@ -220,9 +213,7 @@ class CloudBackendsHelper {
         }
     }
 
-    // ── Live dropdowns ───────────────────────────────────────────────────────
-
-    /** Field name -> {values, names} choices for everything the fetched account options can offer a card. */
+    /** Field name -> {values, names} choices for everything the fetched account options can offer a card. A serverless endpoint's Max Workers offers only as many workers as that endpoint allows. */
     buildChoices(backendId) {
         let choices = {};
         let runpod = this.optionsFor('runpod', backendId);
@@ -290,7 +281,6 @@ class CloudBackendsHelper {
             choices[`${prefix}EndpointId`] = this.withBlank(endpoints, '(pick an endpoint)',
                 e => e.id,
                 e => e.name && e.name != e.id ? `${e.name} · ${e.id}` : e.id);
-            // Offer only as many workers as the chosen endpoint allows.
             let chosen = document.getElementById(`setting_${backendId}_${prefix}EndpointId`)?.value;
             let max = endpoints.find(e => e.id == chosen)?.max_workers;
             if (max > 0) {
@@ -319,12 +309,13 @@ class CloudBackendsHelper {
         return out;
     }
 
-    /** Swaps text inputs for selects (same id/data-name, preserved value) wherever choices exist. Writes nothing when already up to date. */
+    /**
+     * Swaps text inputs for selects (same id and data-name, value preserved) wherever choices exist, writing nothing when already up to date.
+     * A field stays typeable when the account has nothing to offer, and a saved value the live list does not offer (sold out, renamed) is kept as an entry instead of being dropped.
+     */
     applyDropdowns(cardBody, backendId) {
         let choices = this.buildChoices(backendId);
         for (let [field, choice] of Object.entries(choices)) {
-            // Leave the field as-is when the account has nothing to offer, so it stays typeable
-            // rather than becoming a dropdown whose only entry is "none".
             if (!choice || choice.values.filter(v => v != '').length == 0) {
                 continue;
             }
@@ -336,8 +327,6 @@ class CloudBackendsHelper {
             let values = [...choice.values];
             let names = [...choice.names];
             if (current && !values.includes(current)) {
-                // A saved value the live list doesn't offer right now (sold out, renamed) must never be
-                // silently dropped by the conversion.
                 values.push(current);
                 names.push(`${current} (saved value)`);
             }
@@ -366,8 +355,6 @@ class CloudBackendsHelper {
         }
     }
 
-    // ── Section regrouping ───────────────────────────────────────────────────
-
     /**
      * Labels a setting by its name without the provider prefix (EndpointId, not RunPodServerless_EndpointId), as
      * Swarm's own settings read; the section header already names the provider. Only the displayed label and help
@@ -390,14 +377,12 @@ class CloudBackendsHelper {
         }
     }
 
-    /** Gives a text field a list of suggestions it still lets the user type past (used for the worker image). */
+    /** Gives a text field a list of suggestions it still lets the user type past (used for the worker image). Core renders text settings as a textarea, which cannot take a suggestion list, so it is swapped for a one-line input with the same id, data-name and value. */
     addSuggestions(div, items) {
         let field = div.querySelector('[data-name]');
         if (!field || !items?.length) {
             return;
         }
-        // Core renders text settings as a textarea, which can't take a suggestion list; a one-line input with the same id,
-        // data-name and value saves the same way.
         let input = field;
         if (field.tagName == 'TEXTAREA') {
             input = document.createElement('input');
@@ -424,9 +409,9 @@ class CloudBackendsHelper {
     }
 
     /**
-     * Regroups a freshly-rendered card's flat field list into one collapsible section per provider,
-     * each with its own Enabled toggle in the header. Every field div keeps its original data-name
-     * input untouched (just moved in the DOM), so Save/Edit continue to work unmodified.
+     * Regroups a freshly rendered card's flat field list into one collapsible section per provider, each with its own Enabled toggle in the header. Every field div keeps its original data-name input, only moved, so Save and Edit work unmodified.
+     * The header holds a copy of the Enabled checkbox kept in sync with the original, which stays hidden in the page so Save still reads it; the copy follows the original's disabled state, since core's Edit enables only [data-name] inputs.
+     * Status loads on first expand, not on every render or poll, so a collapsed section never spends a provider API call. Each section is anchored at the first matched field's position before anything moves, since a moved field is no longer in the card to anchor against.
      */
     reorganizeCard(cardBody, backendId) {
         let settingDivs = [...cardBody.children].filter(div => div.querySelector('[data-name]'));
@@ -463,19 +448,16 @@ class CloudBackendsHelper {
             let body = createDiv(null, 'cloudbackends-provider-body');
             body.style.display = 'none';
             if (toggleDiv) {
-                // A copy of the Enabled checkbox in the header; the original stays in the body with its label.
                 let toggleInput = toggleDiv.querySelector('[data-name]');
                 let headerToggle = toggleInput.cloneNode(true);
                 headerToggle.removeAttribute('id');
                 headerToggle.removeAttribute('data-name');
                 headerToggle.checked = toggleInput.checked;
-                // Core's Edit enables only [data-name] inputs, so follow the original's disabled state.
                 new MutationObserver(() => { headerToggle.disabled = toggleInput.disabled; }).observe(toggleInput, { attributes: true, attributeFilter: ['disabled'] });
                 headerToggle.addEventListener('click', e => e.stopPropagation());
                 headerToggle.addEventListener('change', () => { toggleInput.checked = headerToggle.checked; });
                 toggleInput.addEventListener('change', () => { headerToggle.checked = toggleInput.checked; });
                 header.appendChild(headerToggle);
-                // The header toggle replaces the row; the row stays in the page so Save still reads it.
                 toggleDiv.style.display = 'none';
             }
             let actions = createDiv(null, `cloudbackends-provider-actions cloudbackends-actions-${provider.prefix.slice(0, -1).toLowerCase()}`);
@@ -485,8 +467,6 @@ class CloudBackendsHelper {
                 let opening = body.style.display == 'none';
                 body.style.display = opening ? 'block' : 'none';
                 caret.innerText = opening ? '▼' : '▶';
-                // Load status lazily on first expand, not on every render/poll, so a collapsed section
-                // never spends a provider API call (the server-side status cache covers repeat expands).
                 if (opening && instanceControls && !statusLoadedOnce) {
                     statusLoadedOnce = true;
                     instanceControls.refresh();
@@ -494,8 +474,6 @@ class CloudBackendsHelper {
             });
             section.appendChild(header);
             section.appendChild(body);
-            // Anchor the section at the first matched field's original position BEFORE moving anything -
-            // once a match is re-parented into `body` it is no longer in `cardBody` to anchor against.
             matches[0].before(section);
             let advancedFields = provider.advanced_fields || [];
             let advanced = createDiv(null, 'cloudbackends-advanced');
@@ -530,9 +508,7 @@ class CloudBackendsHelper {
         this.setupOrphanNotice(cardBody);
     }
 
-    // ── Instance actions (Start/Stop/status) ─────────────────────────────────
-
-    /** Seconds -> compact "1h05m" / "5m12s" / "42s" for an instance status line. */
+    /** Seconds as a compact "1h05m", "5m12s" or "42s". */
     formatDuration(seconds) {
         if (!seconds || seconds <= 0) {
             return '0s';
@@ -549,11 +525,7 @@ class CloudBackendsHelper {
         return `${s}s`;
     }
 
-    /**
-     * Best-effort price line for the Start confirmation, read from the currently-selected GPU/offer
-     * picker field against the fetched catalog. Falls back to a generic warning if nothing is chosen
-     * yet or the catalog hasn't loaded.
-     */
+    /** The price line of the Start confirmation, from the selected GPU against the fetched catalog, or a generic billing warning if none is chosen or the catalog has not loaded. */
     estimatePriceLine(backendId, provider, pres) {
         let itemLabel = provider.item_label || 'Instance';
         let pickedValue = pres ? document.getElementById(`setting_${backendId}_${pres.pickerField}`)?.value : null;
@@ -567,10 +539,9 @@ class CloudBackendsHelper {
     }
 
     /**
-     * Builds the Start/Stop buttons and live status line for an instance-renting section, wired to the
-     * routes the server declared for that provider. Start streams progress over websocket - a cold
-     * start takes minutes, and a single hanging response tells the user nothing. Returns { refresh() }
-     * so the caller can trigger the first load lazily (on section expand).
+     * Builds the Start/Stop buttons and live status line for an instance-renting section, wired to the routes the server declared for that provider.
+     * Start streams progress over websocket, since a cold start takes minutes and a single hanging response tells the user nothing. A provider without an allowed-actions list keeps both buttons enabled once there is a real status.
+     * Returns { refresh() } so the caller can load the status on first expand.
      */
     setupInstanceActions(actionsDiv, backendId, provider) {
         let pres = this.presentation[provider.prefix];
@@ -618,7 +589,6 @@ class CloudBackendsHelper {
                     stopButton.disabled = !allowed.includes('stop');
                 }
                 else {
-                    // No allowed-actions signal from this provider - both are sensible once we have a real status.
                     startButton.disabled = false;
                     stopButton.disabled = false;
                 }
@@ -643,7 +613,6 @@ class CloudBackendsHelper {
                 setBusy(false, `Status: start failed: ${e}`);
             });
             if (socket) {
-                // A dropped connection must not leave the buttons disabled on "Starting...".
                 socket.addEventListener('close', () => {
                     if (!finished) {
                         refresh(true);
@@ -659,13 +628,7 @@ class CloudBackendsHelper {
         return { refresh };
     }
 
-    // ── Serverless actions (workers, discover, validate) ─────────────────────
-
-    /**
-     * Builds the controls for a serverless section: the live list of leased workers (each with a Stop
-     * button), Discover models, and Validate. Everything goes through the extension's API routes.
-     * Returns { refresh() }, called on first expand so a collapsed section never calls the provider.
-     */
+    /** Builds the controls for a serverless section: the live list of leased workers (each with a Stop button), Discover models, and Validate. Returns { refresh() }, called on first expand so a collapsed section never calls the provider. */
     setupServerlessActions(actionsDiv, backendId, provider) {
         let discoverButton = document.createElement('button');
         discoverButton.className = 'basic-button cloudbackends-discover';
@@ -759,9 +722,7 @@ class CloudBackendsHelper {
         statusLine.innerText = total == 0 && starting == 0 ? 'Workers: none running (they start when you generate).' : `Workers: ${total} running${starting ? `, ${starting} starting` : ''} (max ${max}).`;
     }
 
-    // ── Orphans ──────────────────────────────────────────────────────────────
-
-    /** Shows a notice on the card if the user has pods/instances this extension created that nothing has attached. */
+    /** Shows a notice on the card if the user has pods or instances this extension created that nothing has attached. */
     setupOrphanNotice(cardBody) {
         if (cardBody.querySelector('.cloudbackends-orphans')) {
             return;

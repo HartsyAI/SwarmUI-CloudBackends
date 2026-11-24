@@ -5,14 +5,8 @@ using SwarmUI.Backends;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// Builds <see cref="BackendHandler.BackendType"/> records for the individual provider backends
-/// (RunPod Serverless, RunPod GPU Pods, Vast.ai Serverless, Vast.ai Instances) WITHOUT calling
-/// <see cref="BackendHandler.RegisterBackendType"/>.
-///
-/// <see cref="CloudBackendsBackend"/> creates these as hidden (nonreal) children through
-/// <see cref="BackendHandler.AddNewNonrealBackend"/>, so they never appear in "Add new backend" or the BackendType parameter.
-/// </summary>
+/// <summary>Builds the hidden <see cref="BackendHandler.BackendType"/> records for the provider child backends (RunPod Serverless, RunPod GPU Pods, Vast.ai Serverless, Vast.ai Instances) without registering them,
+/// so they never appear in "Add new backend" or the BackendType parameter. <see cref="CloudBackendsBackend"/> creates them as nonreal children through <see cref="BackendHandler.AddNewNonrealBackend"/>.</summary>
 public static class CloudBackendTypes
 {
     /// <summary>Default worker image for RunPod pods: the Hartsy RunPod worker, pinned to the release this version was tested with.</summary>
@@ -49,6 +43,7 @@ public static class CloudBackendTypes
     /// <summary>Type record for the owner-gated swarm backend attached to a started cloud instance (see <see cref="OwnerBoundSwarmBackend"/>).</summary>
     public static BackendHandler.BackendType OwnerBoundSwarm;
 
+    /// <summary>Builds the type records, once.</summary>
     public static void Init()
     {
         RunPodServerless ??= BuildHidden<RunPodServerlessBackend>("runpod_serverless_hidden", "RunPod Serverless");
@@ -58,12 +53,10 @@ public static class CloudBackendTypes
         OwnerBoundSwarm ??= BuildHidden<OwnerBoundSwarmBackend>("cloudbackends_owner_swarm_hidden", "Cloud Instance Swarm");
     }
 
-    /// <summary>Builds a BackendType record for internal (nonreal-child) use only. Mirrors the relevant
-    /// part of <see cref="BackendHandler.RegisterBackendType"/> without adding to the public registry.</summary>
+    /// <summary>Builds a type record for internal use, mirroring <see cref="BackendHandler.RegisterBackendType"/> without adding it to the public registry.
+    /// The settings class is searched on base types too, since a subclass of a core backend (<see cref="OwnerBoundSwarmBackend"/>) inherits its settings class and GetNestedTypes never returns inherited types.</summary>
     static BackendHandler.BackendType BuildHidden<T>(string id, string name) where T : AbstractBackend
     {
-        // Walk base types too: a subclass of a core backend (OwnerBoundSwarmBackend) inherits its
-        // settings class rather than re-nesting one, and GetNestedTypes never returns inherited types.
         Type settingsType = null;
         for (Type t = typeof(T); t is not null && settingsType is null; t = t.BaseType)
         {

@@ -12,15 +12,10 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// A serverless cloud GPU backend (RunPod Serverless, Vast.ai Serverless), owned by one user.
-///
-/// It never generates itself. Each worker is held by a provider-native <b>lease</b> (see <see cref="ICloudProvider"/>)
-/// and gets an owner-bound swarm child attached, which mirrors the worker's own backends; core routes generations
-/// straight to those. This backend only takes a request when no free mirrored backend can, and its job then is to
-/// lease another worker, up to <see cref="BaseSettings.MaxWorkers"/>, and hand the request over. Workers are let go
-/// when idle, by the worker itself (RunPod) or by the lease lapsing (Vast.ai), so an idle endpoint costs nothing.
-/// </summary>
+/// <summary>A serverless cloud GPU backend (RunPod Serverless, Vast.ai Serverless), owned by one user. It never generates itself.
+/// Each worker is held by a provider-native lease (<see cref="ICloudProvider"/>) and gets an owner-bound swarm child attached that mirrors the worker's own backends, and core routes generations straight to those.
+/// This backend only takes a request when no free mirrored backend can, and then leases another worker, up to <see cref="BaseSettings.MaxWorkers"/>, and hands the request over.
+/// Workers are let go when idle, by the worker itself (RunPod) or by the lease lapsing (Vast.ai), so an idle endpoint costs nothing.</summary>
 public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 {
     /// <inheritdoc/>
@@ -43,8 +38,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
 
     /// <summary>Shared client for this extension's own calls to worker gateways (TLS to Vast goes through the relay).</summary>
     public static readonly HttpClient HttpClient = NetworkBackendUtils.MakeHttpClient();
-
-    // ── Runtime state ─────────────────────────────────────────────────────────
 
     /// <summary>Model metadata known for this endpoint, per subtype, or null before it has ever been learned.</summary>
     public ConcurrentDictionary<string, Dictionary<string, JObject>> RemoteModels = null;
@@ -79,10 +72,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// <summary>Throttles <see cref="OnTick"/>, which core fires about once a second.</summary>
     long NextTick = 0;
 
-    // ── Config ────────────────────────────────────────────────────────────────
-
-    /// <summary>Settings every serverless provider shares.</summary>
-    /// <summary>Settings copied in from the card's section; the card's <see cref="CloudBackendsBackend.Settings"/> documents them.</summary>
+    /// <summary>Settings every serverless provider shares, copied in from the card's section; the card's <see cref="CloudBackendsBackend.Settings"/> documents them.</summary>
     public class BaseSettings : AutoConfiguration
     {
         /// <summary>RunPod endpoint ID, or Vast.ai endpoint name.</summary>
@@ -110,13 +100,12 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     /// <summary><see cref="BaseSettings.MaxWorkers"/>, within sane bounds and the provider's own limit.</summary>
     public int MaxWorkers => Math.Clamp(Math.Min(BaseConfig.MaxWorkers, Provider?.WorkerLimit() ?? int.MaxValue), 1, 64);
 
-    /// <summary>What a new lease asks for, from the current settings.</summary>
+    /// <summary>What a new lease asks for, from the current settings. The startup grace follows the startup timeout, since the worker must wait long enough for this side to attach and for its own backend to load.</summary>
     public LeaseRequest MakeLeaseRequest()
     {
         return new LeaseRequest
         {
             IdleSeconds = Math.Clamp(BaseConfig.IdleSeconds, 5, 3600),
-            // The worker must wait long enough for this side to attach and for its own backend to load.
             StartupGraceSeconds = Math.Clamp(BaseConfig.StartupTimeoutSec, 60, 3600),
             MaxLeaseSeconds = MaxLeaseSeconds,
             StartupTimeoutSec = Math.Max(30, BaseConfig.StartupTimeoutSec),
@@ -124,12 +113,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         };
     }
 
-    // ── Abstract hooks for subclasses ─────────────────────────────────────────
-
-    /// <summary>Factory: create a provider initialised with the owner's API key.</summary>
+    /// <summary>Creates a provider on the owner's API key.</summary>
     protected abstract ICloudProvider CreateProvider(string apiKey);
 
-    /// <summary>Retrieve the provider API key for <paramref name="user"/>. Throw a readable error if missing.</summary>
+    /// <summary>The provider API key of <paramref name="user"/>. Throws a readable error if missing.</summary>
     protected abstract string GetApiKey(User user);
 
     /// <summary>Throw <see cref="SwarmReadableErrorException"/> if the session user lacks permission.</summary>
@@ -144,15 +131,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
-    // ── Routing ───────────────────────────────────────────────────────────────
-
     /// <inheritdoc/>
-    /// <remarks>
-    /// Accepts a request only when this backend would be the right one to take it: it belongs to the requester, no
-    /// free local (or already-rented) backend could serve it, no free mirrored backend of a leased worker could
-    /// serve it, and there is room to lease another worker. Everything else is declined silently, because core then
-    /// routes to the better candidate on its own. Declining is also what keeps cost down: accepting starts a lease.
-    /// </remarks>
+    /// <remarks>Accepts a request only when this backend is the right one to take it: it belongs to the requester, no free local (or already-rented) backend could serve it,
+    /// no free mirrored backend of a leased worker could serve it, and there is room to lease another worker. Everything else is declined silently, since core then routes to the better candidate itself.
+    /// Declining is also what keeps cost down, because accepting starts a lease. A request explicitly targeting this type can only be routed here, never to the workers' mirrored backends, so it is always taken.
+    /// At capacity with workers up it waits on their backends; before any worker is up it is accepted so it queues here rather than failing for lack of a candidate.</remarks>
     public override bool IsValidForThisBackend(T2IParamInput input)
     {
         string requester = input.SourceSession?.User?.UserID;
@@ -163,8 +146,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         if (!IsAnyBackendType(input))
         {
-            // Explicitly targeted at this type: core can then only route here, never to the workers' mirrored
-            // backends (they are another type), so this backend takes it and hands it over itself.
             return true;
         }
         if (LocalBackendCanServe(input))
@@ -176,17 +157,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         {
             return false;
         }
-        // At capacity with workers up: the request waits on their backends instead of starting another lease.
-        // Before any worker is up, keep accepting so the request queues here rather than failing for lack of a
-        // candidate; the acquisition already underway will serve it.
         return ShouldTakeRequest(slots.Length, PendingAcquires, MaxWorkers, slots.Any(s => s.RunningGrandchildren.Any()));
     }
 
-    /// <summary>
-    /// Whether this backend should take a request that no free worker backend can serve. At capacity with workers
-    /// up, the request waits on their backends instead of starting another lease. Before any worker is up it is
-    /// taken anyway, so it queues here rather than failing for lack of a candidate; the lease underway serves it.
-    /// </summary>
+    /// <summary>Whether to take a request no free worker backend can serve. At capacity with workers up it waits on their backends instead of starting another lease; before any worker is up it is taken anyway, so it queues here and the lease underway serves it.</summary>
     internal static bool ShouldTakeRequest(int slots, int pendingAcquires, int maxWorkers, bool anyWorkerRunning)
     {
         return !(anyWorkerRunning && slots + pendingAcquires >= maxWorkers);
@@ -199,11 +173,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         return type.Equals("Any", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>
-    /// True if a free backend outside any serverless subtree (a local GPU, or an instance the user already rents) can
-    /// serve this request. Core may pick any valid backend to load a model on, including this one, so without this a
-    /// request could lease a billed worker while a local GPU sits idle.
-    /// </summary>
+    /// <summary>True if a free backend outside any serverless subtree (a local GPU, or an instance the user already rents) can serve this request. Core may pick any valid backend to load a model on, including this one,
+    /// so without this a request could lease a billed worker while a local GPU sits idle. Only a backend known to have the model counts, since one that cannot say might fail to load it.
+    /// Refusal reasons are restored afterwards, so asking other backends never leaves theirs on a request they were never offered.</summary>
     bool LocalBackendCanServe(T2IParamInput input)
     {
         string model = GetModelFromInput(input);
@@ -221,7 +193,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     continue;
                 }
-                // Only defer to a backend known to have the model; one that cannot say might fail to load it.
                 if (model is not null && (backend.Models is null || !backend.Models.TryGetValue("Stable-Diffusion", out List<string> names) || (!names.Contains(model) && !names.Contains($"{model}.safetensors"))))
                 {
                     continue;
@@ -235,16 +206,12 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         finally
         {
-            // Asking other backends must not leave their refusal reasons on a request they were never offered.
             input.RefusalReasons.Clear();
             input.RefusalReasons.UnionWith(reasons);
         }
     }
 
-    /// <summary>
-    /// Whether a backend would accept this request, asked the way core would. A mirrored backend pins its remote
-    /// backend by ID, so handing it a request it would refuse fails outright instead of being re-routed.
-    /// </summary>
+    /// <summary>Whether a backend would accept this request, asked the way core would. A mirrored backend pins its remote backend by ID, so a request it would refuse fails outright instead of being re-routed.</summary>
     static bool CanServe(BackendHandler.T2IBackendData data, T2IParamInput input)
     {
         HashSet<string> features = [.. data.Backend.SupportedFeatures];
@@ -255,15 +222,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         return data.Backend.IsValidForThisBackend(input);
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
-
+    /// <inheritdoc/>
+    /// <remarks>Every cloud backend runs on its owner's own key, with no fallback to anyone else's. Nothing is leased here: a backend that exists because its owner generated something never spends on its own.
+    /// MaxUsages is generous, since a request holds a usage here for its whole handed-off generation and leasing is limited by MaxWorkers instead. OnTick is unsubscribed first, since a re-enable can Init without a Shutdown.</remarks>
     public override async Task Init()
     {
         AddLoadStatus($"Starting {GetType().Name} backend...");
         try
         {
             CheckRequiredConfig();
-            // Every cloud backend runs on its owner's own key; there is deliberately no fallback to anyone else's.
             User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend has no valid owner user ('{OwnerUserId}').");
             ProviderApiKey = GetApiKey(owner);
         }
@@ -290,25 +257,22 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         Lifetime.Dispose();
         Lifetime = new CancellationTokenSource();
         LoadModelCache();
-        // A request holds a usage here for its whole handed-off generation, so this must not be the bottleneck:
-        // leasing itself is limited by MaxWorkers (slots plus leases starting), not by this.
         MaxUsages = Math.Max(4, MaxWorkers * 4);
         CanLoadModels = true;
         Status = BackendStatus.RUNNING;
-        // A re-enable can Init without a matching Shutdown; never subscribe twice.
         Program.TickEvent -= OnTick;
         Program.TickEvent += OnTick;
-        // Nothing is leased here: a backend that exists because its owner generated something never spends on its own.
         AddLoadStatus($"{Provider.ProviderName} backend ready (endpoint: {BaseConfig.EndpointId}, up to {MaxWorkers} worker(s)).");
     }
 
+    /// <inheritdoc/>
+    /// <remarks>Withdraws leases still queued and gives ones already assigned a worker a moment to release themselves (<see cref="AcquireSlotAsync"/> does that on seeing the shutdown) while the provider still exists.
+    /// A lease still starting releases through the provider, so it is only disposed once none are left.</remarks>
     public override async Task Shutdown()
     {
         ShuttingDown = true;
         Program.TickEvent -= OnTick;
         Logs.Info($"[{Provider?.ProviderName ?? GetType().Name}] Backend {BackendData?.ID} shutting down, releasing {Slots.Length} worker(s)...");
-        // Withdraw leases still queued, and give ones already assigned a worker a moment to release themselves
-        // (AcquireSlotAsync does that when it sees ShuttingDown) while the provider still exists.
         Lifetime.Cancel();
         for (int i = 0; i < 120 && PendingAcquires > 0; i++)
         {
@@ -318,7 +282,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         {
             await RemoveSlotAsync(slot, "backend shutting down");
         }
-        // A lease still starting releases itself through the provider, so it is only disposed once none are left.
         if (PendingAcquires == 0)
         {
             Provider?.Dispose();
@@ -327,12 +290,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         Status = BackendStatus.DISABLED;
     }
 
+    /// <inheritdoc/>
     public override IEnumerable<string> SupportedFeatures => RemoteFeatureCombo.IsEmpty ? ["text2image"] : RemoteFeatureCombo.Keys;
 
-    /// <summary>
-    /// Rebuilds the provider if the owner's API key changed, and releases every lease taken under the old key.
-    /// The swap happens under <see cref="SlotLock"/>; the slow releases run after it, so claims are never stalled.
-    /// </summary>
+    /// <summary>Rebuilds the provider if the owner's API key changed, and releases every lease taken under the old key.
+    /// The swap happens under <see cref="SlotLock"/>; the slow releases run after it, so claims are never stalled.</summary>
     async Task RefreshProviderIfKeyChangedAsync()
     {
         User owner = Owner ?? throw new SwarmReadableErrorException($"Cloud backend's owner user ('{OwnerUserId}') no longer exists.");
@@ -364,12 +326,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         oldProvider?.Dispose();
     }
 
-    // ── Leasing workers ───────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Reserves room for one more lease if <see cref="MaxWorkers"/> allows it. Every call that returns true must be
-    /// followed by exactly one <see cref="AcquireSlotAsync"/>, which releases the reservation when it finishes.
-    /// </summary>
+    /// <summary>Reserves room for one more lease if <see cref="MaxWorkers"/> allows it. Every call that returns true must be
+    /// followed by exactly one <see cref="AcquireSlotAsync"/>, which releases the reservation when it finishes.</summary>
     internal bool TryReserveLease()
     {
         lock (ReserveLock)
@@ -383,12 +341,10 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
-    /// <summary>
-    /// Leases one worker (after <see cref="TryReserveLease"/>), waits for its SwarmUI backends, attaches the child, and
-    /// adds the slot. If <paramref name="cancel"/> fires, or shutdown begins, before the provider assigns a worker, the
-    /// lease is withdrawn; after that the worker is kept as a slot, since it is already paid for, unless the backend is
-    /// shutting down, in which case it is released.
-    /// </summary>
+    /// <summary>Leases one worker (after <see cref="TryReserveLease"/>), waits for its SwarmUI backends, attaches the child, and adds the slot.
+    /// If <paramref name="cancel"/> fires, or shutdown begins, before the provider assigns a worker, the lease is withdrawn; after that the worker is kept as a slot, since it is already paid for, unless the backend is shutting down, in which case it is released.
+    /// The slot is added under <see cref="SlotLock"/>, the same lock Shutdown and a key change release under, so a worker is either added before they release every slot or never added. A lease from a provider since replaced
+    /// (the owner changed their API key mid-start) belongs to the old key's account and is released through the provider it came from. Shutdown leaves the provider to the last lease still starting, which disposes it.</summary>
     public async Task<WorkerSlot> AcquireSlotAsync(CancellationToken cancel)
     {
         CloudWorkerInfo worker = null;
@@ -407,9 +363,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             await SlotLock.WaitAsync(CancellationToken.None);
             try
             {
-                // Checked under the same lock Shutdown's removal and a key change's release use, so a worker is either
-                // added before those release every slot, or never added at all. A lease from a provider that has since
-                // been replaced (the owner changed their API key mid-start) belongs to the old key's account: release it.
                 if (!ShuttingDown && ReferenceEquals(Provider, provider))
                 {
                     Slots = [.. Slots, slot];
@@ -430,7 +383,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         catch (Exception) when (worker is not null)
         {
-            // The provider this lease came from, even if the backend has since dropped or replaced its own.
             await provider.ReleaseLeaseAsync(worker);
             throw;
         }
@@ -441,7 +393,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             {
                 remaining = --PendingAcquires;
             }
-            // Shutdown leaves the provider to the last lease still starting, which disposes it here.
             if (remaining == 0 && ShuttingDown && Provider is null)
             {
                 provider?.Dispose();
@@ -449,16 +400,13 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
-    /// <summary>
-    /// Finds a mirrored backend to hand this request to, leasing another worker if every current one is busy and
-    /// there is room. While a new worker is starting, a current worker that frees up first takes the request instead,
-    /// and the new lease is withdrawn if it has not been assigned a worker yet.
-    /// </summary>
+    /// <summary>Finds a mirrored backend to hand this request to, leasing another worker if every current one is busy and there is room. While a new worker is starting, a current worker that frees up first takes the request instead.
+    /// Interrupting the generation withdraws a lease still waiting for a worker; a spare lease still starting when this ends is left to finish in the background, withdrawn or kept as a slot if a worker was already assigned.
+    /// An idle worker that refuses the request will keep refusing it, so after 30s the reason is reported instead of waiting out the timeout. If the provider holds all the workers it can, the request waits for one of them.</summary>
     async Task<T2IBackendAccess> ClaimGeneratorAsync(T2IParamInput input)
     {
         LeaseRequest request = MakeLeaseRequest();
         DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec + 60);
-        // Interrupting the generation withdraws a lease still waiting for a worker, so it never starts one.
         using CancellationTokenSource withdraw = CancellationTokenSource.CreateLinkedTokenSource(input.InterruptToken, Program.GlobalProgramCancel);
         Task<WorkerSlot> acquiring = null;
         DateTime? refusedSince = null;
@@ -471,7 +419,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     return access;
                 }
-                // An idle worker that refuses the request will keep refusing it; say why instead of waiting out the timeout.
                 string refusal = RefusalReason(input);
                 refusedSince = refusal is null ? null : refusedSince ?? DateTime.UtcNow;
                 if (refusedSince is DateTime since && (DateTime.UtcNow - since).TotalSeconds > 30)
@@ -484,14 +431,12 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 }
                 else if (acquiring is not null && acquiring.IsCompleted)
                 {
-                    // Surfaces a failed lease as this request's error. A good one is now a slot, found on the next pass.
                     try
                     {
                         await acquiring;
                     }
                     catch (WorkerLimitReachedException ex)
                     {
-                        // The provider holds all the workers it can; this request waits for one of them.
                         Logs.Debug($"[{CloudProviderName}] {ex.Message}");
                     }
                     acquiring = null;
@@ -509,16 +454,13 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             if (acquiring is not null && !acquiring.IsCompleted)
             {
                 withdraw.Cancel();
-                // Let it finish in the background: withdrawn, or kept as a slot if a worker was already assigned.
                 _ = acquiring.ContinueWith(t => Logs.Debug($"[{CloudProviderName}] Spare lease ended: {t.Exception?.InnerException?.Message ?? "kept as a worker"}"), TaskScheduler.Default);
             }
         }
     }
 
-    /// <summary>
-    /// Why the attached workers refuse a request, when at least one of their backends is running and idle and none will take
-    /// it; null when some could, or when every backend is simply busy or starting (worth waiting for).
-    /// </summary>
+    /// <summary>Why the attached workers refuse a request, when at least one of their backends is running and idle and none will take
+    /// it; null when some could, or when every backend is simply busy or starting (worth waiting for).</summary>
     string RefusalReason(T2IParamInput input)
     {
         BackendHandler.T2IBackendData[] idle = [.. Slots.SelectMany(s => s.RunningGrandchildren).Where(d => !d.CheckIsInUse)];
@@ -534,7 +476,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         return reason;
     }
 
-    /// <summary>Picks and claims a mirrored backend that can serve the request, atomically. Null if none is available.</summary>
+    /// <summary>Picks and claims a mirrored backend that can serve the request, atomically. Null if none is available. At capacity it queues on the least-used worker backend rather than waiting here, since its own queue is the right place.</summary>
     async Task<T2IBackendAccess> TryClaimAsync(T2IParamInput input, bool allowBusy)
     {
         await SlotLock.WaitAsync(Program.GlobalProgramCancel);
@@ -542,7 +484,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         {
             List<BackendHandler.T2IBackendData> candidates = [.. Slots.SelectMany(s => s.RunningGrandchildren).Where(d => CanServe(d, input))];
             BackendHandler.T2IBackendData pick = candidates.Where(d => !d.CheckIsInUse).OrderBy(d => d.Usages).FirstOrDefault();
-            // At capacity, queue on the least-used worker backend rather than wait here: its own queue is the right place.
             if (pick is null && allowBusy)
             {
                 pick = candidates.OrderBy(d => d.Usages).FirstOrDefault();
@@ -554,8 +495,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             SlotLock.Release();
         }
     }
-
-    // ── Releasing workers ─────────────────────────────────────────────────────
 
     /// <summary>Removes a slot: keeps its model list, detaches its child, and ends its lease.</summary>
     public async Task RemoveSlotAsync(WorkerSlot slot, string reason)
@@ -576,12 +515,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         await DetachAndReleaseAsync(slot, reason);
     }
 
-    /// <summary>Detach and release, for a slot already taken out of <see cref="Slots"/>.</summary>
+    /// <summary>Detaches and releases a slot already taken out of <see cref="Slots"/>. Its model lists are copied before detaching (they go with the child) but saved after releasing,
+    /// since saving triggers a model refresh that would reach this worker, whose token is already revoked once its lease ended, and must never stop the release.</summary>
     async Task DetachAndReleaseAsync(WorkerSlot slot, string reason)
     {
         slot.Removing = true;
-        // Copied before detaching (the lists go with the child), saved after releasing: saving triggers a model refresh that
-        // would reach this worker, whose token is already revoked when its lease ended, and must never stop the release.
         List<KeyValuePair<string, Dictionary<string, JObject>>> models = ModelListsOf(slot);
         await CloudChildBackend.DetachAsync(Handler, slot.Child, slot.Provider.ProviderName);
         await slot.Provider.ReleaseLeaseAsync(slot.Worker);
@@ -598,10 +536,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         return Slots.FirstOrDefault(s => s.Worker.WorkerId == id || s.Worker.LeaseId == id);
     }
 
-    /// <summary>
-    /// Every few seconds: renews leases in use (only Vast.ai needs it) and drops slots whose lease has ended, so the
-    /// backend list never keeps a subtree pointed at a worker that is gone.
-    /// </summary>
+    /// <summary>Every few seconds: renews leases in use (only Vast.ai needs it) and drops slots whose lease has ended, so the
+    /// backend list never keeps a subtree pointed at a worker that is gone.</summary>
     void OnTick()
     {
         if (Environment.TickCount64 < NextTick || Slots.Length == 0)
@@ -626,7 +562,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }, $"{CloudProviderName} worker maintenance");
     }
 
-    /// <summary>The work behind <see cref="OnTick"/>.</summary>
+    /// <summary>The work behind <see cref="OnTick"/>. One worker's unexpected failure is logged and does not stop the others being checked.</summary>
     async Task MaintainSlotsAsync()
     {
         ICloudProvider provider = Provider;
@@ -657,7 +593,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             }
             catch (Exception ex)
             {
-                // One worker's unexpected failure must not stop the others from being checked.
                 Logs.Warning($"[{slot.Provider.ProviderName}] Checking worker {slot.Worker.WorkerId} failed: {ex.Message}");
             }
         }
@@ -678,8 +613,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
     }
 
     /// <inheritdoc/>
-    /// <remarks>Renews the lease of the one worker starting the generation, right away rather than on the next tick.
-    /// Renewing other workers here would keep idle ones alive (and billing) on another worker's traffic. Never leases anything.</remarks>
+    /// <remarks>Renews the lease of the one worker starting the generation, right away rather than on the next tick. Renewing others here would keep idle workers alive (and billing) on another worker's traffic. Never leases anything.</remarks>
     public async Task OnChildGenerationStartingAsync(SwarmSwarmBackend control)
     {
         WorkerSlot slot = Slots.FirstOrDefault(s => ReferenceEquals(s.Child?.AbstractBackend, control));
@@ -689,8 +623,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         await RenewQuietlyAsync(slot);
     }
-
-    // ── Talking to a worker ───────────────────────────────────────────────────
 
     /// <summary>POSTs to a leased worker's SwarmUI API through its gateway, with the lease token and a SwarmUI session.</summary>
     /// <param name="slot">The leased worker.</param>
@@ -763,10 +695,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
-    /// <summary>
-    /// Waits until the worker's SwarmUI has at least one backend running and none still loading. A worker that
-    /// answers but has no backend at all is a broken image, reported promptly rather than after the full timeout.
-    /// </summary>
+    /// <summary>Waits until the worker's SwarmUI has at least one backend running and none loading. A failure is reported promptly rather than after the full timeout when the worker has no backend at all (a broken image),
+    /// when every backend failed to start for over a minute, or when its gateway never answers for 3 minutes: it answers as soon as it runs, even while SwarmUI starts, so minutes of silence mean the address is unreachable.
+    /// A freshly assigned worker's proxy often answers nothing for a few seconds. Stops waiting if the backend shut down or the provider was replaced by an API key change (for Vast.ai that also closed its TLS relay); the caller releases the lease.</summary>
     async Task WaitForWorkerBackendsLoadedAsync(WorkerSlot slot, ICloudProvider provider)
     {
         LeaseRequest request = MakeLeaseRequest();
@@ -780,8 +711,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         {
             if (ShuttingDown || !ReferenceEquals(Provider, provider))
             {
-                // Shut down, or the owner's API key changed and the provider this lease came from was replaced (for
-                // Vast.ai that also closed its TLS relay). Stop waiting; the caller releases the lease on its account.
                 throw new SwarmReadableErrorException("This cloud backend shut down, or its API key changed, while a worker was starting; the worker was released.");
             }
             try
@@ -803,7 +732,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     return;
                 }
-                // Every backend failed to start: waiting out the startup timeout will not change that.
                 bool allFailed = backends.Length > 0 && backends.All(b => b["status"]?.ToString() is "errored" or "disabled");
                 allFailedSince = allFailed ? allFailedSince ?? DateTime.UtcNow : null;
                 if (allFailedSince is DateTime since && (DateTime.UtcNow - since).TotalSeconds > 60)
@@ -822,7 +750,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             }
             catch (WorkerNotReadyException)
             {
-                // The worker's gateway answered: it is reachable, and its SwarmUI is still starting.
                 if (!everAnswered)
                 {
                     Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} is reachable; its SwarmUI is still starting.");
@@ -831,13 +758,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             }
             catch (Exception ex)
             {
-                // A freshly assigned worker's proxy often answers nothing for a few seconds.
                 if (ex.Message != lastError)
                 {
                     Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} not answering yet: {ex.Message}");
                 }
                 lastError = ex.Message;
-                // The worker's gateway answers as soon as it runs, even while SwarmUI starts, so minutes of silence mean the address is unreachable.
                 if (!everAnswered && (DateTime.UtcNow - start).TotalSeconds > 180)
                 {
                     throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} was assigned but never answered at {slot.ConnectUrl} (last error: {lastError}). On RunPod, the endpoint must expose port 7801 as HTTP; Validate checks this.");
@@ -849,12 +774,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         throw new SwarmReadableErrorException($"{CloudProviderName} worker {slot.Worker.WorkerId} did not bring up a usable backend within {request.StartupTimeoutSec}s{(lastError is null ? "." : $" (last error: {lastError}).")}");
     }
 
-    /// <summary>
-    /// Replaces <see cref="RemoteFeatureCombo"/> with what a worker's ListBackends response advertises. Every worker of an
-    /// endpoint runs the same image, so the newest report is authoritative: a feature the workers dropped (after an image
-    /// change) stops being advertised, instead of routing requests here that no worker can serve. The set is kept while
-    /// no worker runs, so a sleeping endpoint still advertises what its workers last did.
-    /// </summary>
+    /// <summary>Replaces <see cref="RemoteFeatureCombo"/> with what a worker's ListBackends response advertises. Every worker of an endpoint runs the same image, so the newest report wins and a dropped feature stops being advertised
+    /// instead of routing requests no worker can serve. The set is kept while no worker runs, so a sleeping endpoint still advertises what its workers last did.</summary>
     void UpdateFeaturesFromWorker(JObject backendData)
     {
         HashSet<string> features = ["text2image"];
@@ -875,23 +796,15 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
-    // ── Models ────────────────────────────────────────────────────────────────
-
     /// <inheritdoc/>
-    /// <remarks>
-    /// Never leases anything. With leases, the worker's own backend loads the model as part of the generation it is
-    /// handed, so there is nothing to do here, and waking a billed worker just to "load" would be wasted money.
-    /// </remarks>
+    /// <remarks>Never leases anything: the worker's own backend loads the model as part of the generation it is handed, so waking a billed worker just to "load" would be wasted money.</remarks>
     public override Task<bool> LoadModel(T2IModel model, T2IParamInput input)
     {
         CurrentModelName = model?.Name;
         return Task.FromResult(true);
     }
 
-    /// <summary>
-    /// A copy of a slot's mirrored model lists, or null if it has none. Kept on this backend after the worker goes, which is
-    /// what lets a sleeping endpoint still offer its models, and core refuse models it does not have.
-    /// </summary>
+    /// <summary>A copy of a slot's mirrored model lists, or null if it has none. Kept on this backend after the worker goes, so a sleeping endpoint still offers its models and core can refuse models it does not have.</summary>
     List<KeyValuePair<string, Dictionary<string, JObject>>> ModelListsOf(WorkerSlot slot)
     {
         if (slot.Child?.AbstractBackend is not SwarmSwarmBackend swarm || swarm.RemoteModels is null || !swarm.RemoteModels.Any(kv => kv.Value.Count > 0))
@@ -901,10 +814,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         return [.. swarm.RemoteModels.Select(kv => new KeyValuePair<string, Dictionary<string, JObject>>(kv.Key, kv.Value.ToDictionary(m => m.Key, m => (JObject)m.Value.DeepClone())))];
     }
 
-    /// <summary>
-    /// Stores a model listing in <see cref="RemoteModels"/> and <see cref="AbstractT2IBackend.Models"/>, and persists it.
-    /// Each reported subtype's list is complete, so it replaces the old one: models removed from the endpoint drop out.
-    /// </summary>
+    /// <summary>Stores a model listing in <see cref="RemoteModels"/> and <see cref="AbstractT2IBackend.Models"/>, and persists it.
+    /// Each reported subtype's list is complete, so it replaces the old one and models removed from the endpoint drop out.
+    /// The refresh event reaches every backend, including workers that just went away; the list itself is already saved, so a failure there only logs.</summary>
     void CommitModels(IEnumerable<KeyValuePair<string, Dictionary<string, JObject>>> listing)
     {
         RemoteModels ??= new();
@@ -922,15 +834,11 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
         catch (Exception ex)
         {
-            // Refreshing reaches every backend, including workers that just went away; the list itself is already saved.
             Logs.Debug($"[{CloudProviderName}] Model refresh after updating the model list failed: {ex.Message}");
         }
     }
 
-    /// <summary>
-    /// Marks a cloud model as remote and fills every field core's <see cref="T2IModel.FromNetObject"/> reads without a fallback
-    /// (loaded, standard_width, standard_height): one missing field there breaks the model list for the whole server.
-    /// </summary>
+    /// <summary>Marks a cloud model as remote and fills every field core's <see cref="T2IModel.FromNetObject"/> reads without a fallback (loaded, standard_width, standard_height), since one missing field breaks the model list for the whole server.</summary>
     internal static JObject WithModelDefaults(JObject meta, string name)
     {
         meta["name"] ??= name;
@@ -1044,10 +952,8 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         }
     }
 
-    /// <summary>
-    /// Discovers the endpoint's models (the CloudRefreshModels route): uses a leased worker if there is one, or leases
-    /// one, which bills. The worker then goes idle and is released as usual.
-    /// </summary>
+    /// <summary>Discovers the endpoint's models (the CloudRefreshModels route) on a leased worker if there is one, or leases one, which bills; the worker then goes idle and is released as usual.
+    /// Model types only a local extension adds (audio, LLM, ...) are skipped, since the worker has none of those.</summary>
     public async Task RefreshModelsFromWorkerAsync()
     {
         WorkerSlot slot = await GetDiscoverySlotAsync();
@@ -1068,7 +974,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             }
             catch (SwarmReadableErrorException ex) when (ex.Message.Contains("Invalid sub-type"))
             {
-                // A model type only a local extension adds (audio, LLM, ...): the worker has none of those.
                 Logs.Debug($"[{CloudProviderName}] Worker {slot.Worker.WorkerId} has no '{subtype}' model type; skipping it.");
                 continue;
             }
@@ -1093,10 +998,7 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         Logs.Info($"[{CloudProviderName}] Discovered {listing.Values.Sum(m => m.Count)} model(s) on endpoint '{BaseConfig.EndpointId}'.");
     }
 
-    /// <summary>
-    /// A worker to read the model list from: a running one if any, else a new lease if <see cref="MaxWorkers"/>
-    /// allows, else the one already starting. Discoveries run one at a time, so concurrent ones share a worker.
-    /// </summary>
+    /// <summary>A worker to read the model list from: a running one if any, else a new lease if <see cref="MaxWorkers"/> allows, else the one already starting (used when it is up). Discoveries run one at a time, so concurrent ones share a worker.</summary>
     async Task<WorkerSlot> GetDiscoverySlotAsync()
     {
         await DiscoveryLock.WaitAsync(Program.GlobalProgramCancel);
@@ -1119,7 +1021,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
                 {
                     throw new SwarmReadableErrorException("This cloud backend is shutting down.");
                 }
-                // At capacity with a worker already starting for a generation: use that one when it is up.
                 await Task.Delay(request.PollIntervalMs, Program.GlobalProgramCancel);
             }
             throw new SwarmReadableErrorException($"{CloudProviderName} had no worker for model discovery within {request.StartupTimeoutSec}s.");
@@ -1129,8 +1030,6 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
             DiscoveryLock.Release();
         }
     }
-
-    // ── Status ────────────────────────────────────────────────────────────────
 
     /// <inheritdoc/>
     public JObject GetStatusNet()
@@ -1188,13 +1087,9 @@ public abstract class CloudBackendBase : AbstractT2IBackend, ICloudBackend
         return findings;
     }
 
-    // ── Generation ────────────────────────────────────────────────────────────
-
-    /// <remarks>
-    /// Only reached when no leased worker's backend could take the request (see <see cref="IsValidForThisBackend"/>).
-    /// Hands it to a worker backend, leasing a worker first if needed. The worker backend is claimed properly, so a
-    /// second request arriving mid-generation sees it busy rather than double-booking it.
-    /// </remarks>
+    /// <inheritdoc/>
+    /// <remarks>Only reached when no leased worker's backend could take the request (see <see cref="IsValidForThisBackend"/>). Hands it to a worker backend, leasing a worker first if needed.
+    /// The worker backend is claimed properly, so a second request arriving mid-generation sees it busy rather than double-booking it.</remarks>
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
         if (user_input.SourceSession is not null)

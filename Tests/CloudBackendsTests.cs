@@ -4,6 +4,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using Hartsy.Extensions.CloudBackends.Core;
 using Hartsy.Extensions.CloudBackends.Providers.RunPod;
 using Hartsy.Extensions.CloudBackends.Providers.VastAI;
@@ -12,6 +13,44 @@ using NUnit.Framework;
 using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Tests;
+
+/// <summary>The startup config sent to worker images, which SwarmUI-Worker-Base parses.</summary>
+[TestFixture]
+public class WorkerConfigTests
+{
+    /// <summary>Decodes what <see cref="CloudWorkerConfig.Encode"/> sends.</summary>
+    static JObject Decode(string sent)
+    {
+        string base64 = sent.Replace('-', '+').Replace('_', '/');
+        return JObject.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(base64.PadRight((base64.Length + 3) / 4 * 4, '='))));
+    }
+
+    [Test]
+    public void SendsExactlyWhatTheWorkerImageParses()
+    {
+        // SwarmUI-Worker-Base's test_startup_config_reads_what_the_extension_sends pins the same value.
+        string sent = new CloudWorkerConfig("abcdefghijklmnopqrstuvwxyz012345", 7802, "/workspace").Encode();
+        Assert.That(sent, Is.EqualTo("eyJ3b3JrZXJfdG9rZW4iOiJhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NSIsInB1YmxpY19wb3J0Ijo3ODAyLCJ2b2x1bWVfcGF0aCI6Ii93b3Jrc3BhY2UifQ"));
+    }
+
+    [Test]
+    public void LeavesOutBlankFields()
+    {
+        Assert.That(Decode(new CloudWorkerConfig("", 7801, " ").Encode()).ToString(Newtonsoft.Json.Formatting.None), Is.EqualTo("{\"public_port\":7801}"));
+        Assert.That(Decode(new CloudWorkerConfig(null, 7801, null).Encode()).Count, Is.EqualTo(1));
+    }
+
+    [Test]
+    public void SentValueIsSafeInDockerArgumentsAndMaskedInErrors()
+    {
+        for (int length = 32; length < 36; length++)
+        {
+            string sent = new CloudWorkerConfig(new string('a', length), 7801, "/volume with spaces/\"quoted\"").Encode();
+            Assert.That(sent, Does.Match("^[A-Za-z0-9_-]+$"));
+            Assert.That(CloudApiClient.MaskSecrets($"env SWARMUI_WORKER_CONFIG={sent} is invalid"), Is.EqualTo("env SWARMUI_WORKER_CONFIG=*** is invalid"));
+        }
+    }
+}
 
 /// <summary>When the serverless backend takes a request and leases another worker, and when it lets the request wait.</summary>
 [TestFixture]
@@ -499,21 +538,10 @@ public class HttpRetryRuleTests
     }
 
     [Test]
-    public void ParsesEnvOnePerLineKeepingCommas()
-    {
-        JObject env = CloudApiClient.ParseEnv("CUDA_VISIBLE_DEVICES=0,1\nHF_TOKEN = abc \r\n\nBROKEN\nA=b=c");
-        Assert.That(env["CUDA_VISIBLE_DEVICES"]?.ToString(), Is.EqualTo("0,1"));
-        Assert.That(env["HF_TOKEN"]?.ToString(), Is.EqualTo("abc"));
-        Assert.That(env["A"]?.ToString(), Is.EqualTo("b=c"));
-        Assert.That(env.ContainsKey("BROKEN"), Is.False);
-        Assert.That(CloudApiClient.ParseEnv("  "), Is.Empty);
-    }
-
-    [Test]
     public void MasksTokenShapedTextInProviderErrors()
     {
         string token = new('a', 48);
-        Assert.That(CloudApiClient.MaskSecrets($"env SWARMUI_WORKER_TOKEN={token} is invalid"), Is.EqualTo("env SWARMUI_WORKER_TOKEN=*** is invalid"));
+        Assert.That(CloudApiClient.MaskSecrets($"config worker_token={token} is invalid"), Is.EqualTo("config worker_token=*** is invalid"));
         Assert.That(CloudApiClient.MaskSecrets("short values stay"), Is.EqualTo("short values stay"));
         Assert.That(CloudApiClient.MaskSecrets(null), Is.Null);
         JObject problem = new() { ["errors"] = new JArray($"value {token} rejected", new JObject { ["path"] = "env", ["message"] = "bad" }) };

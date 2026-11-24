@@ -83,12 +83,12 @@ Either way the list is remembered per user and endpoint, across restarts. Use th
 Every setting on the card has a **?** next to it that explains it. Each section works the same way:
 
 - **Dropdowns come from your account.** Once your API key is saved, the Endpoint, Pod, Instance, GPU, Template, Network Volume and Data Center fields list what your account has, with prices. Without a key they stay plain text boxes.
-- **Advanced holds the rest.** Settings only a custom setup needs sit under a collapsed **Advanced** group at the bottom of each section: a template, extra disk, the SwarmUI port, environment variables, and the startup timeout.
+- **Advanced holds the rest.** Settings only a custom setup needs sit under a collapsed **Advanced** group at the bottom of each section: a template, extra disk, the SwarmUI port, and the startup timeout.
 - **Delete On Stop** (pods and instances) is on by default. Stop then deletes a machine the card created, so nothing keeps billing afterwards. A pod or instance you picked yourself is only ever paused.
 - **Failsafes** stop a pod or instance you forgot about. Max Runtime and Max Spend default to 4 hours and $10; **Off** turns either one off.
 - **Keep Running On Shutdown** (RunPod GPU Pods, Advanced) is off by default. When it is on, restarting or updating SwarmUI leaves the pod running instead of stopping it, and the card reattaches to it when SwarmUI comes back: the pod's status, Stop and both failsafes work again, and Max Runtime keeps counting from the pod's first start. A pod that stopped while SwarmUI was down is still cleaned up. Saving or deleting the card stops the pod as before.
 
-<img src="docs/images/swarmui/runpod-pods-advanced.png" width="550" alt="RunPod GPU Pods section with its Advanced group open: template, GPU count, pod volume, volume mount path, SwarmUI port, environment variables and startup timeout">
+<img src="docs/images/swarmui/runpod-pods-advanced.png" width="550" alt="RunPod GPU Pods section with its Advanced group open: template, GPU count, pod volume, volume mount path, SwarmUI port and startup timeout">
 
 The setup guides walk through the settings that matter, in order:
 

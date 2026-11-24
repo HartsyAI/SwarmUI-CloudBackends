@@ -13,21 +13,15 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// The single user-facing "Cloud Backends" entry. Never generates itself: each user gets hidden (nonreal) children, one
+/// <summary>The single user-facing "Cloud Backends" entry. Never generates itself: each user gets hidden (nonreal) children, one
 /// per enabled provider section, created on demand on that user's own API key. Shutdown (including a settings edit) tears
-/// them all down; users get fresh ones on next use.
-/// </summary>
+/// them all down; users get fresh ones on next use.</summary>
 public class CloudBackendsBackend : AbstractT2IBackend
 {
-    /// <summary>
-    /// Every setting the card shows. The extension's script groups them into one section per provider by prefix, gives them
-    /// plain labels, and moves the fields in <see cref="AdvancedFields"/> into a collapsed Advanced group.
-    /// Each child backend gets its section's values copied in by name (see <see cref="BuildChildSettings"/>).
-    /// </summary>
+    /// <summary>Every setting the card shows. The card's script groups them into one section per provider by prefix, gives them plain labels, and moves the fields in <see cref="AdvancedFields"/> into a collapsed Advanced group.
+    /// Each child backend gets its section's values copied in by name (see <see cref="BuildChildSettings"/>). The Vast.ai Instances prefix is VastAIInstance_ because VastAI_ belongs to the Serverless section.</summary>
     public class Settings : AutoConfiguration
     {
-        // ── RunPod Serverless ────────────────────────────────────────────────
         [ConfigComment("Turn RunPod Serverless on or off.")]
         public bool RunPodServerless_Enabled = false;
         [SuggestionPlaceholder(Text = "pick an endpoint, or paste its ID")]
@@ -43,13 +37,12 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ConfigComment("How long to wait for a worker to start before giving up.\nRaise it if a new or large worker image takes long to download.")]
         public int RunPodServerless_StartupTimeoutSec = 900;
 
-        // ── RunPod GPU Pods ──────────────────────────────────────────────────
         [ConfigComment("Turn RunPod GPU Pods on or off.")]
         public bool RunPodPods_Enabled = false;
         [SuggestionPlaceholder(Text = "leave blank to create one")]
         [ConfigComment("Which pod to use.\nLeave on '(create one for me)' and Start Pod creates a pod, and finds it again next time.\nOr pick a pod you already made (it must run the Hartsy RunPod worker, see Worker Token).")]
         public string RunPodPods_PodId = "";
-        [ConfigComment("Only for a pod you made yourself (shown once you pick one under Pod): the SWARMUI_WORKER_TOKEN it was created with.\nThe card makes its own token for pods it creates. Hidden once saved.")]
+        [ConfigComment("Only for a pod you made yourself (shown once you pick one under Pod): the worker token in its worker config.\nThe card makes its own token for pods it creates. Hidden once saved.")]
         [ValueIsSecret]
         public string RunPodPods_WorkerToken = "";
         [ConfigComment("What Stop Pod does.\nOn: deletes a pod the card created. Your models stay on the network volume, and the next Start makes a fresh pod.\nA pod you picked yourself is only ever paused. Off: pauses the pod. RunPod clears its container disk anyway, and a paused pod can come back without a GPU.")]
@@ -78,7 +71,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ManualSettingsOptions(Vals = ["0", "1", "2", "5", "10", "20", "50", "100"], ManualNames = ["Off", "$1", "$2", "$5", "$10", "$20", "$50", "$100"])]
         [ConfigComment("Safety stop: stops the pod once it has cost about this much (price per hour times time running).")]
         public double RunPodPods_MaxSpendUsd = 10;
-        // Advanced:
         [SuggestionPlaceholder(Text = "RunPod template id")]
         [ConfigComment("Create the pod from one of your RunPod pod templates instead of the image above.\nThe template must run the Hartsy RunPod worker.")]
         public string RunPodPods_TemplateId = "";
@@ -91,15 +83,12 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public string RunPodPods_VolumeMountPath = "/runpod-volume";
         [ConfigComment("The port SwarmUI listens on inside the pod. The card passes it to the Hartsy worker.\nChange it only for a custom image that listens elsewhere.")]
         public int RunPodPods_SwarmUIPort = 7801;
-        [ConfigComment("Extra environment variables for new pods, one KEY=VALUE per line.")]
-        public string RunPodPods_PodEnv = "";
         [ManualSettingsOptions(Vals = ["300", "600", "900", "1200", "1800"], ManualNames = ["5 minutes", "10 minutes", "15 minutes", "20 minutes", "30 minutes"])]
         [ConfigComment("How long to wait for the pod to boot and SwarmUI on it to answer.\nRaise it if the first start of a large image times out.")]
         public int RunPodPods_StartupTimeoutSec = 900;
         [ConfigComment("Leave the pod running when SwarmUI shuts down or restarts, and reattach it when SwarmUI is back; the safety stops resume then.\nWhile SwarmUI is down the pod keeps billing and nothing can stop it. Saving or deleting this card still stops the pod.")]
         public bool RunPodPods_KeepRunningOnShutdown = false;
 
-        // ── Vast.ai Serverless ───────────────────────────────────────────────
         [ConfigComment("Turn Vast.ai Serverless on or off.")]
         public bool VastAI_Enabled = false;
         [SuggestionPlaceholder(Text = "pick an endpoint, or type its name")]
@@ -115,14 +104,12 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ConfigComment("How long to wait for a worker to start before giving up.\nRaise it if a new or large worker image takes long to download.")]
         public int VastAI_StartupTimeoutSec = 900;
 
-        // ── Vast.ai Instances ────────────────────────────────────────────────
-        // Prefixed VastAIInstance_ (not VastAI_, which the Serverless section above already owns).
         [ConfigComment("Turn Vast.ai Instances on or off.")]
         public bool VastAIInstance_Enabled = false;
         [SuggestionPlaceholder(Text = "leave blank to create one")]
         [ConfigComment("Which instance to use.\nLeave on '(create one for me)' and Start Instance rents one, and finds it again next time.\nOr pick an instance you already made (it must run the Hartsy Vast.ai worker, see Worker Token).")]
         public string VastAIInstance_InstanceId = "";
-        [ConfigComment("Only for an instance you made yourself (shown once you pick one under Instance): the SWARMUI_WORKER_TOKEN it was created with.\nThe card makes its own token for instances it creates. Hidden once saved.")]
+        [ConfigComment("Only for an instance you made yourself (shown once you pick one under Instance): the worker token in its worker config.\nThe card makes its own token for instances it creates. Hidden once saved.")]
         [ValueIsSecret]
         public string VastAIInstance_WorkerToken = "";
         [ConfigComment("What Stop Instance does.\nOn: destroys an instance the card created, so nothing bills. Keep models on a network volume.\nAn instance you picked yourself is only ever paused. Off: pauses it. Its disk keeps billing, and it can only resume once that machine's GPU is free again.")]
@@ -145,7 +132,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
         [ManualSettingsOptions(Vals = ["0", "1", "2", "5", "10", "20", "50", "100"], ManualNames = ["Off", "$1", "$2", "$5", "$10", "$20", "$50", "$100"])]
         [ConfigComment("Safety stop: stops the instance once it has cost about this much (price per hour times time running).")]
         public double VastAIInstance_MaxSpendUsd = 10;
-        // Advanced:
         [SuggestionPlaceholder(Text = "Vast.ai template hash")]
         [ConfigComment("Create the instance from one of your Vast.ai templates instead of the image above.\nThe template must run the Hartsy Vast.ai worker.")]
         public string VastAIInstance_TemplateHashId = "";
@@ -153,8 +139,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
         public string VastAIInstance_VolumeMountPath = "/workspace";
         [ConfigComment("The port SwarmUI listens on inside the instance. The card opens it and passes it to the Hartsy worker.\nChange it only for a custom image that listens elsewhere.")]
         public int VastAIInstance_SwarmUIPort = 7801;
-        [ConfigComment("Extra environment variables for new instances, one KEY=VALUE per line.")]
-        public string VastAIInstance_Env = "";
         [ManualSettingsOptions(Vals = ["300", "600", "900", "1200", "1800"], ManualNames = ["5 minutes", "10 minutes", "15 minutes", "20 minutes", "30 minutes"])]
         [ConfigComment("How long to wait for the instance to boot and SwarmUI on it to answer.\nRaise it if the first start of a large image times out.")]
         public int VastAIInstance_StartupTimeoutSec = 900;
@@ -164,9 +148,9 @@ public class CloudBackendsBackend : AbstractT2IBackend
     public static readonly HashSet<string> AdvancedFields =
     [
         "RunPodServerless_StartupTimeoutSec",
-        "RunPodPods_TemplateId", "RunPodPods_GpuCount", "RunPodPods_VolumeGb", "RunPodPods_VolumeMountPath", "RunPodPods_SwarmUIPort", "RunPodPods_PodEnv", "RunPodPods_StartupTimeoutSec", "RunPodPods_KeepRunningOnShutdown",
+        "RunPodPods_TemplateId", "RunPodPods_GpuCount", "RunPodPods_VolumeGb", "RunPodPods_VolumeMountPath", "RunPodPods_SwarmUIPort", "RunPodPods_StartupTimeoutSec", "RunPodPods_KeepRunningOnShutdown",
         "VastAI_StartupTimeoutSec",
-        "VastAIInstance_TemplateHashId", "VastAIInstance_VolumeMountPath", "VastAIInstance_SwarmUIPort", "VastAIInstance_Env", "VastAIInstance_StartupTimeoutSec"
+        "VastAIInstance_TemplateHashId", "VastAIInstance_VolumeMountPath", "VastAIInstance_SwarmUIPort", "VastAIInstance_StartupTimeoutSec"
     ];
 
     /// <summary>This backend's settings.</summary>
@@ -222,12 +206,10 @@ public class CloudBackendsBackend : AbstractT2IBackend
     /// <summary>Control backend only - never loads models or generates directly.</summary>
     public override IEnumerable<string> SupportedFeatures => [];
 
-    /// <summary>
-    /// Copies this backend's <c>{prefix}X</c> settings values into a child settings object's matching
+    /// <summary>Copies this backend's <c>{prefix}X</c> settings values into a child settings object's matching
     /// <c>X</c> fields, via FDS save/load, so a provider's fields only have to be declared (with the
     /// prefix) in <see cref="Settings"/> and never hand-copied per field. The <c>{prefix}Enabled</c>
-    /// toggle is skipped - it belongs to this parent, not the child.
-    /// </summary>
+    /// toggle is skipped - it belongs to this parent, not the child.</summary>
     AutoConfiguration BuildChildSettings(ProviderDef def)
     {
         FDSSection all = SettingsRaw.Save(true);
@@ -241,14 +223,12 @@ public class CloudBackendsBackend : AbstractT2IBackend
         return child;
     }
 
+    /// <inheritdoc/>
+    /// <remarks>Children are per-user and spawn on demand on their owner's key, so a settings re-Init only drops the old set. That stops every user's running instance children, since core restarts the whole backend tree on an edit.</remarks>
     public override async Task Init()
     {
         CanLoadModels = false;
         MaxUsages = 1;
-        // Children are per-user and spawn on demand (each runs on its owner's own API key), so a
-        // settings re-Init only needs to drop the old set; users get fresh children on next use.
-        // Note this stops any user's running instance children - core backend edits always restart
-        // the backend tree they configure.
         await TearDownChildren();
         int enabledCount = Providers.Count(IsProviderEnabled);
         Status = BackendStatus.RUNNING;
@@ -259,10 +239,8 @@ public class CloudBackendsBackend : AbstractT2IBackend
         ReattachKeptInstances();
     }
 
-    /// <summary>
-    /// Creates, in the background, the instance backends of users whose machine an earlier run left running under Keep Running On Shutdown,
-    /// so status, Stop and the safety stops cover it again without anyone pressing Start. Creating one only reattaches; it never starts anything.
-    /// </summary>
+    /// <summary>Creates, in the background, the instance backends of users whose machine an earlier run left running under Keep Running On Shutdown,
+    /// so status, Stop and the safety stops cover it again without anyone pressing Start. Creating one only reattaches; it never starts anything.</summary>
     void ReattachKeptInstances()
     {
         foreach (ProviderDef def in Providers.Where(d => d.IsInstance && IsProviderEnabled(d) && KeepsRunningOnShutdown(d)))
@@ -280,12 +258,10 @@ public class CloudBackendsBackend : AbstractT2IBackend
         }
     }
 
-    /// <summary>
-    /// Creates, in the background, the serverless backends of every user who already has that provider's API key, which
+    /// <summary>Creates, in the background, the serverless backends of every user who already has that provider's API key, which
     /// loads their saved cloud model lists. Core checks a model name before any backend sees a request, so without this a
     /// cloud-only model is refused after a restart until something else wakes the user's backend. Leases nothing, and
-    /// instance sections are left alone because starting one bills.
-    /// </summary>
+    /// instance sections are left alone because starting one bills.</summary>
     void WarmUsersWithKeys()
     {
         foreach (ProviderDef def in Providers.Where(d => !d.IsInstance && IsProviderEnabled(d)))
@@ -301,10 +277,9 @@ public class CloudBackendsBackend : AbstractT2IBackend
         }
     }
 
-    /// <summary>IDs of users who have saved an API key of the given type.</summary>
+    /// <summary>IDs of users who have saved an API key of the given type, which core stores as generic data '{user}///${keyType}///key'.</summary>
     static List<string> UsersWithKey(string keyType)
     {
-        // Core stores it as generic data '{user}///${keyType}///key'.
         string suffix = $"///${keyType}///key";
         lock (Program.Sessions.DBLock)
         {
@@ -322,18 +297,12 @@ public class CloudBackendsBackend : AbstractT2IBackend
         return null;
     }
 
-    /// <summary>
-    /// Ensures the given user has a child backend for the given provider, spawning one on their own API
-    /// key if needed. Idempotent and cheap when the child already exists. An errored child is respawned
-    /// only after the user's key changes or a few minutes pass, so a bad key cannot become a retry loop. Returns null without side effects when the section is disabled or
-    /// the user has no key; <paramref name="throwWhenUnavailable"/> upgrades those to readable errors
-    /// for explicit user actions.
-    ///
-    /// Cost safety: a spawned serverless child never auto-refreshes models (that wakes a billed worker;
-    /// the explicit refresh route covers it), and a spawned instance child never auto-starts its
-    /// instance (the explicit start route covers it) - a user generating on some other backend must
-    /// never be billed as a side effect.
-    /// </summary>
+    /// <summary>Ensures the user has a child backend for the provider, spawning one on their own API key if needed; cheap when it already exists.
+    /// An errored child is respawned only after the user's key changes or a few minutes pass, so a bad key cannot become a retry loop.
+    /// Returns null without side effects when the section is disabled or the user has no key, unless <paramref name="throwWhenUnavailable"/> turns those into readable errors for explicit user actions.
+    /// A spawned child never bills as a side effect: a serverless one does not auto-refresh models (that wakes a worker) and an instance one does not auto-start, since the explicit routes cover both.
+    /// Each child is named uniquely to this backend and user, so find-by-name reattaches only their own machine; the local user keeps the original name so a machine made before per-user names is still found.
+    /// Core never assigns the parent of a nonreal backend, so it is set here for the routes to find a user's child. If this backend shut down meanwhile, the new child is removed since nothing would manage it.</summary>
     public async Task<AbstractT2IBackend> EnsureChildForUser(User user, ProviderDef def, bool throwWhenUnavailable = false)
     {
         if (user is null)
@@ -379,8 +348,6 @@ public class CloudBackendsBackend : AbstractT2IBackend
                 await RemoveChild(existing.BackendData.ID, key);
             }
             AutoConfiguration settings = BuildChildSettings(def);
-            // A name unique to this backend and user, so each user's find-by-name reattaches only their own machine. The local
-            // user keeps the original name, so a machine created before per-user names is still found instead of rented again.
             string uniqueName = user.UserID == SessionHandler.LocalUserID ? $"swarmui-cloudbackends-{BackendData.ID}" : $"swarmui-cloudbackends-{BackendData.ID}-{user.UserID}";
             if (settings is RunPodPodsBackend.Settings pods)
             {
@@ -402,13 +369,11 @@ public class CloudBackendsBackend : AbstractT2IBackend
                 {
                     instance.OwnerUserId = user.UserID;
                 }
-                // Core never assigns the parent of a nonreal backend; the routes find a user's child through it.
                 newData.AbstractParent = BackendData;
             });
             ChildMap[key] = data.ID;
             if (Status is BackendStatus.DISABLED or BackendStatus.ERRORED)
             {
-                // This backend shut down while the child was being created; nothing would ever manage it.
                 await RemoveChild(data.ID, key);
                 return null;
             }
@@ -420,11 +385,7 @@ public class CloudBackendsBackend : AbstractT2IBackend
         }
     }
 
-    /// <summary>
-    /// Waits for a just-spawned child to finish Init. The bound stays short deliberately: this only
-    /// ever gates child Init (credential validation, capped at 30s) - a cold instance boot happens
-    /// later inside explicit start calls, never here.
-    /// </summary>
+    /// <summary>Waits for a just-spawned child to finish Init. The bound is short on purpose: this only gates child Init (credential validation, capped at 30s); a cold instance boot happens later in explicit start calls, never here.</summary>
     public static async Task WaitForChildReady(AbstractT2IBackend child, int timeoutSec = 60)
     {
         DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSec);
@@ -485,22 +446,26 @@ public class CloudBackendsBackend : AbstractT2IBackend
         return DateTime.UtcNow - since > ErroredRetryAfter;
     }
 
+    /// <inheritdoc/>
+    /// <remarks>Status is set first, so a child still being created sees it and removes itself.</remarks>
     public override async Task Shutdown()
     {
-        // Set first, so a child still being created sees it and removes itself.
         Status = BackendStatus.DISABLED;
         await TearDownChildren();
     }
 
+    /// <inheritdoc/>
     public override bool IsValidForThisBackend(T2IParamInput input)
     {
         input.RefusalReasons.Add("Cloud Backends is a control backend; its enabled provider(s) generate, not this entry directly.");
         return false;
     }
 
+    /// <inheritdoc/>
     public override Task<Image[]> Generate(T2IParamInput user_input) =>
         throw new NotImplementedException("Cloud Backends is a control backend; it does not generate directly.");
 
+    /// <inheritdoc/>
     public override Task<bool> LoadModel(T2IModel model, T2IParamInput input) =>
         throw new NotImplementedException("Cloud Backends is a control backend; it does not load models directly.");
 }

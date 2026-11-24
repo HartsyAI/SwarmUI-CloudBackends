@@ -75,7 +75,7 @@ When you pick the volume's data center, check that it has the GPU you want: pods
    | Max Runtime | Stop the pod after it has run this long. `4 hours` by default; **Off** turns it off. |
    | Max Spend | Stop the pod once it has cost about this much. `$10` by default; **Off** turns it off. |
 
-   **Advanced** holds settings only a custom setup needs: a RunPod template, GPU count, a pod volume, the volume mount path, the SwarmUI port, extra environment variables, and the startup timeout.
+   **Advanced** holds settings only a custom setup needs: a RunPod template, GPU count, a pod volume, the volume mount path, the SwarmUI port, and the startup timeout.
 
    **Keep Running On Shutdown** (also under **Advanced**) leaves the pod running when SwarmUI shuts down or restarts and reattaches it when SwarmUI is back; with it on, a pod keeps billing while SwarmUI is down.
 
@@ -103,7 +103,7 @@ You can also see and stop your pods in the RunPod console under **Pods**.
 
 ## Using a pod you made yourself
 
-Pick that pod under **Pod**. The pod must run the Hartsy RunPod worker image (`kalebbroo/swarmui-worker-runpod`), expose port `7801` as HTTP, and have `SWARMUI_WORKER_TOKEN` set to a random value of at least 32 characters. Put the same value in **Worker Token**, which shows once a pod is picked. Stop Pod only pauses a pod you made yourself, whatever **Delete On Stop** says. Letting the card create the pod is simpler, because it handles all of that.
+Pick that pod under **Pod**. The pod must run the Hartsy RunPod worker image (`kalebbroo/swarmui-worker-runpod`), expose port `7801` as HTTP, and have `SWARMUI_WORKER_CONFIG` set to `{"worker_token": "<token>"}`, where the token is a random value of at least 32 characters. Put the same token in **Worker Token**, which shows once a pod is picked. Stop Pod only pauses a pod you made yourself, whatever **Delete On Stop** says. Letting the card create the pod is simpler, because it handles all of that.
 
 ## What it costs
 

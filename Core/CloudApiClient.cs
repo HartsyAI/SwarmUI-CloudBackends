@@ -18,22 +18,23 @@ public class CloudApiException(string providerName, int status, string detail) :
     public string Detail = detail;
 }
 
-/// <summary>
-/// Shared JSON-over-HTTP plumbing for cloud provider REST APIs (bearer auth, readable error
-/// translation), plus the helpers every instance-renting provider needs: env parsing, the
-/// wait-for-SwarmUI readiness gate, and a short-TTL status cache.
-/// </summary>
+/// <summary>JSON-over-HTTP client for a cloud provider's REST API: bearer auth, retries, and readable errors.</summary>
+/// <param name="providerName">Provider name used in logs and error messages.</param>
+/// <param name="apiBase">Base URL that request paths are appended to.</param>
+/// <param name="apiKey">API key, sent as a Bearer token.</param>
+/// <param name="errorMapper">Optionally turns a failed (status, detail) into a provider-specific exception, or null to use <see cref="CloudApiException"/>.</param>
 public class CloudApiClient(string providerName, string apiBase, string apiKey, Func<int, string, Exception> errorMapper = null)
 {
     /// <summary>Shared HTTP client for provider REST calls.</summary>
     public static readonly HttpClient Http = NetworkBackendUtils.MakeHttpClient();
 
-    /// <summary>
-    /// Calls the provider's REST API, translating failures into readable errors. A non-JSON success
-    /// body yields null. With <paramref name="allowNotFound"/>, a 404 yields null instead of throwing.
-    /// The provider's <c>errorMapper</c> may claim specific (status, detail) pairs; anything unmapped
-    /// becomes a <see cref="CloudApiException"/>.
-    /// </summary>
+    /// <summary>Calls the provider's REST API and returns the parsed JSON, or null for an empty or non-JSON success body.
+    /// Rate limits are retried, and server errors too for GET and DELETE only. Failures throw a readable error with secrets masked.</summary>
+    /// <param name="method">HTTP method.</param>
+    /// <param name="path">Path and query, appended to the API base.</param>
+    /// <param name="body">JSON request body, or null for none.</param>
+    /// <param name="cancel">Cancels the request.</param>
+    /// <param name="allowNotFound">Return null on a 404 instead of throwing.</param>
     public async Task<JToken> ApiAsync(HttpMethod method, string path, JObject body = null, CancellationToken cancel = default, bool allowNotFound = false)
     {
         HttpRequestMessage MakeRequest()
@@ -47,7 +48,6 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             return request;
         }
         Logs.Debug($"[{providerName}] {method} {path.Split('?')[0]}");
-        // Backs off on rate limits (Vast.ai allows about two requests a second); only reads and deletes retry server errors.
         bool idempotent = method == HttpMethod.Get || method == HttpMethod.Delete;
         using HttpResponseMessage response = await HttpRetry.SendAsync(Http, MakeRequest, $"[{providerName}]", cancel, idempotent);
         string text = await response.Content.ReadAsStringAsync(cancel);
@@ -71,7 +71,6 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             }
         }
         int status = (int)response.StatusCode;
-        // RFC 9457 problem responses carry the useful part in 'detail'; fall back to the raw body.
         string detail = text;
         try
         {
@@ -85,38 +84,13 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         }
         catch (Exception)
         {
-            // Not JSON: the raw body is the detail.
         }
-        // Error bodies can echo a request, e.g. an instance's env with its worker token.
         detail = MaskSecrets(detail);
         throw errorMapper?.Invoke(status, detail) ?? new CloudApiException(providerName, status, detail);
     }
 
-    /// <summary>Parses KEY=VALUE pairs, one per line, into a JSON object.</summary>
-    public static JObject ParseEnv(string raw)
-    {
-        JObject result = [];
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return result;
-        }
-        foreach (string line in raw.Split(['\n', '\r'], StringSplitOptions.RemoveEmptyEntries))
-        {
-            int eq = line.IndexOf('=');
-            if (eq > 0)
-            {
-                result[line[..eq].Trim()] = line[(eq + 1)..].Trim();
-            }
-        }
-        return result;
-    }
-
-    /// <summary>
-    /// Waits until the SwarmUI at <paramref name="publicUrl"/> answers its API. An instance's proxy or
-    /// port mapping answers as soon as the container's networking exists, well before the service inside
-    /// is listening, so this is the real readiness gate. On timeout, throws a readable error ending in
-    /// <paramref name="failureHint"/> (provider-specific advice on what to check).
-    /// </summary>
+    /// <summary>Waits until the SwarmUI at <paramref name="publicUrl"/> answers its API. A provider's proxy answers before the service
+    /// inside is listening, so this is the real readiness gate. Throws a readable error if the deadline passes or the token is refused.</summary>
     /// <param name="publicUrl">The instance's SwarmUI (gateway) address.</param>
     /// <param name="deadline">When to give up.</param>
     /// <param name="failureHint">Provider-specific advice appended to the timeout error.</param>
@@ -131,13 +105,12 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
             cancel.ThrowIfCancellationRequested();
             try
             {
-                // One hung request must not use up the whole startup wait.
                 using CancellationTokenSource attempt = CancellationTokenSource.CreateLinkedTokenSource(cancel);
                 attempt.CancelAfter(TimeSpan.FromSeconds(30));
                 JObject session = await (client ?? Http).PostJson($"{publicUrl.TrimEnd('/')}/API/GetNewSession", [], workerToken is null ? null : req => req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", workerToken), attempt.Token);
                 if (session?["error_id"]?.ToString() == "worker_unauthorized")
                 {
-                    throw new SwarmReadableErrorException($"The SwarmUI at {publicUrl} refused this backend's token. If you created that instance yourself, set its SWARMUI_WORKER_TOKEN to match, or let this backend create the instance.");
+                    throw new SwarmReadableErrorException($"The SwarmUI at {publicUrl} refused this backend's token. If you created that instance yourself, set the worker token in its worker config to match, or let this backend create the instance.");
                 }
                 if (!string.IsNullOrWhiteSpace(session?["session_id"]?.ToString()))
                 {
@@ -158,10 +131,8 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
         throw new SwarmReadableErrorException($"Instance is running but SwarmUI at {publicUrl} did not answer before the startup timeout. {failureHint}{(last is null ? "" : $" Last error: {last.Message}")}");
     }
 
-    /// <summary>
-    /// The field-level reasons in a validation problem ('errors' or 'invalid-params'): "path: message" for structured entries,
-    /// the text for plain ones. Rejected values are never included, and token-shaped text is masked, since they can echo secrets.
-    /// </summary>
+    /// <summary>Summarizes the field-level reasons in a validation problem ('errors' or 'invalid-params') as "path: message", or null if none.
+    /// Rejected values are left out and token-shaped text is masked.</summary>
     internal static string ValidationErrors(JObject problem)
     {
         JArray list = problem["errors"] as JArray ?? problem["invalid-params"] as JArray;
@@ -190,10 +161,7 @@ public class CloudApiClient(string providerName, string apiBase, string apiKey, 
     }
 }
 
-/// <summary>
-/// Short-TTL cache around a provider's instance-status lookup, so a UI status poll does not hammer the
-/// provider's rate-limited API. Force-refresh bypasses it, e.g. right after a Start/Stop action.
-/// </summary>
+/// <summary>Short-lived cache of an instance's status, so UI polling does not hammer the provider's rate-limited API.</summary>
 public class CloudStatusCache
 {
     /// <summary>How long a cached status stays fresh.</summary>
@@ -208,7 +176,7 @@ public class CloudStatusCache
     /// <summary>When <see cref="Cached"/> goes stale.</summary>
     DateTime Expiry = DateTime.MinValue;
 
-    /// <summary>Returns the cached status, or fetches (single-flight) when expired or forced.</summary>
+    /// <summary>Returns the cached status, or calls <paramref name="fetch"/> when it is stale or <paramref name="forceRefresh"/> is set.</summary>
     public async Task<CloudInstanceStatus> GetAsync(bool forceRefresh, Func<Task<CloudInstanceStatus>> fetch, CancellationToken cancel = default)
     {
         if (!forceRefresh && Cached is not null && DateTime.UtcNow < Expiry)

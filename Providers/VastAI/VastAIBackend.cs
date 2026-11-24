@@ -5,25 +5,24 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
 
-/// <summary>
-/// SwarmUI backend for Vast.ai serverless endpoints.
-/// Generation and worker lifecycle live in <see cref="CloudBackendBase"/>; this class supplies the
-/// provider factory, API key lookup, and permission check.
-/// </summary>
+/// <summary>Backend for Vast.ai serverless endpoints. Generation and worker lifecycle live in <see cref="CloudBackendBase"/>; this only supplies the provider, API key lookup and permission check.</summary>
 public class VastAIBackend : CloudBackendBase
 {
-    /// <summary>Vast.ai serverless settings. <see cref="BaseSettings.EndpointId"/> holds the endpoint NAME, which is what /route/ matches on.</summary>
+    /// <summary>Settings for this backend. <see cref="CloudBackendBase.BaseSettings.EndpointId"/> holds the endpoint's name, which is what /route/ matches on.</summary>
     public class Settings : BaseSettings
     {
     }
 
+    /// <inheritdoc/>
     public override BaseSettings BaseConfig => (Settings)SettingsRaw;
 
+    /// <inheritdoc/>
     protected override ICloudProvider CreateProvider(string apiKey)
     {
         return new VastAIProvider(apiKey, BaseConfig.EndpointId?.Trim() ?? "");
     }
 
+    /// <inheritdoc/>
     protected override string GetApiKey(User user)
     {
         string key = user?.GetGenericData("vastai_api", "key")?.Trim();
@@ -34,6 +33,7 @@ public class VastAIBackend : CloudBackendBase
         return key;
     }
 
+    /// <inheritdoc/>
     public override void CheckPermission(Session session)
     {
         if (session?.User is null)
@@ -46,7 +46,8 @@ public class VastAIBackend : CloudBackendBase
         }
     }
 
-    /// <summary>The Vast endpoint is named, not an ID, but it still lives in the shared EndpointId setting.</summary>
+    /// <inheritdoc/>
+    /// <remarks>A Vast endpoint is named rather than identified, but its name still lives in the shared EndpointId setting.</remarks>
     protected override void CheckRequiredConfig()
     {
         if (string.IsNullOrWhiteSpace(BaseConfig.EndpointId))

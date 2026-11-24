@@ -4,11 +4,9 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// Retries provider API calls the provider asked us to back off from (429) or that failed transiently
+/// <summary>Retries provider API calls the provider asked us to back off from (429) or that failed transiently
 /// (500, 502, 503, 504, connection errors). Honors <c>Retry-After</c>, otherwise backs off exponentially with jitter.
-/// Everything else is returned to the caller unchanged, including 4xx errors that need a readable message.
-/// </summary>
+/// Everything else is returned to the caller unchanged, including 4xx errors that need a readable message.</summary>
 public static class HttpRetry
 {
     /// <summary>Most attempts per call, including the first.</summary>
@@ -58,12 +56,10 @@ public static class HttpRetry
         return null;
     }
 
-    /// <summary>
-    /// Sends a request built fresh by <paramref name="makeRequest"/> for each attempt (a request message cannot be
+    /// <summary>Sends a request built fresh by <paramref name="makeRequest"/> for each attempt (a request message cannot be
     /// resent), retrying transient failures. The caller owns the returned response. When not <paramref name="idempotent"/>
     /// (a request that creates something), only a 429 is retried: after a 5xx or a dropped connection the request may
-    /// already have taken effect, and repeating it could, say, rent a second machine.
-    /// </summary>
+    /// already have taken effect, and repeating it could, say, rent a second machine.</summary>
     public static async Task<HttpResponseMessage> SendAsync(HttpClient client, Func<HttpRequestMessage> makeRequest, string logPrefix, CancellationToken cancel, bool idempotent = true)
     {
         for (int attempt = 1; ; attempt++)

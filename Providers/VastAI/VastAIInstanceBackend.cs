@@ -8,13 +8,7 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.VastAI;
 
-/// <summary>
-/// SwarmUI backend for Vast.ai rented instances - the Vast equivalent of <see cref="RunPod.RunPodPodsBackend"/>.
-///
-/// This backend only drives Vast's API to get an instance running with SwarmUI on it. Everything after
-/// that is core Swarm: <see cref="CloudInstanceBackendBase"/> attaches a SwarmSwarmBackend to the
-/// instance's URL, and that handles models, sessions and generation.
-/// </summary>
+/// <summary>Backend for Vast.ai rented instances, the Vast equivalent of <see cref="RunPod.RunPodPodsBackend"/>. It only gets an instance running with SwarmUI on it; <see cref="CloudInstanceBackendBase"/> then attaches to its URL as a Swarm backend, which handles models, sessions and generation.</summary>
 public class VastAIInstanceBackend : CloudInstanceBackendBase
 {
     /// <summary>Settings copied in from the card's Vast.ai Instances section; the card's <see cref="CloudBackendsBackend.Settings"/> documents them.</summary>
@@ -50,18 +44,18 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         /// <summary>Where the volume is mounted inside the instance.</summary>
         public string VolumeMountPath = "/workspace";
 
-        /// <summary>Extra KEY=VALUE environment variables, one per line.</summary>
-        public string Env = "";
-
-        /// <summary>SWARMUI_WORKER_TOKEN of an instance the user created, or blank to let this backend make one.</summary>
+        /// <summary>Worker token of an instance the user created, or blank to let this backend make one.</summary>
         [ValueIsSecret]
         public string WorkerToken = "";
     }
 
+    /// <inheritdoc/>
     public override InstanceSettings InstanceConfig => (Settings)SettingsRaw;
 
+    /// <summary>This backend's settings, typed.</summary>
     Settings InstConfig => (Settings)SettingsRaw;
 
+    /// <inheritdoc/>
     protected override ICloudInstanceProvider CreateProvider(string apiKey)
     {
         Settings config = InstConfig;
@@ -77,12 +71,12 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
             DiskGb = config.DiskGb,
             NetworkVolumeId = config.NetworkVolumeId?.Trim() ?? "",
             VolumeMountPath = config.VolumeMountPath?.Trim() ?? "/workspace",
-            Env = config.Env ?? "",
             WorkerToken = WorkerToken ?? "",
             DeleteOnStop = config.DeleteOnStop
         });
     }
 
+    /// <inheritdoc/>
     protected override string GetApiKey(User user)
     {
         string key = user?.GetGenericData("vastai_api", "key")?.Trim();
@@ -93,6 +87,7 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         return key;
     }
 
+    /// <inheritdoc/>
     public override void CheckPermission(Session session)
     {
         if (session?.User is null)
@@ -105,6 +100,7 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
         }
     }
 
+    /// <inheritdoc/>
     protected override void CheckRequiredConfig()
     {
         Settings config = InstConfig;
@@ -121,14 +117,13 @@ public class VastAIInstanceBackend : CloudInstanceBackendBase
     VastTlsRelay Relay;
 
     /// <inheritdoc/>
-    /// <remarks>Vast instances serve HTTPS with Vast's own CA, which the child cannot verify; it goes through a pinned relay.</remarks>
+    /// <remarks>Vast instances serve HTTPS with Vast's own CA, which the child cannot verify, so it goes through a pinned relay. A failed attach leaves the previous relay listening, so it is closed before being replaced.</remarks>
     protected override string GetChildAddress(string publicUrl)
     {
         if (!publicUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
         {
             return publicUrl;
         }
-        // A failed attach leaves the previous relay listening; close it before replacing it.
         VastTlsRelay old = Relay;
         Relay = new VastTlsRelay(publicUrl);
         if (old is not null)

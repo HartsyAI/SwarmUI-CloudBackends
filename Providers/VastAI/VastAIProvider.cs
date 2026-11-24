@@ -21,20 +21,10 @@ public class VastApiException(int status, string message) : SwarmReadableErrorEx
     public bool EndsSession => Status is 400 or 401 or 403 or 404 or 410;
 }
 
-/// <summary>
-/// <see cref="ICloudProvider"/> for Vast.ai Serverless endpoints running the Hartsy Vast worker image
-/// (github.com/HartsyAI/Vast-Worker-SwarmUI).
-///
-/// A lease is a native Vast <b>session</b>, created the way Vast's own client SDK does it
-/// (vastai/serverless/client/client.py <c>start_endpoint_session</c>): <c>/route/</c> for a signed grant, then
-/// <c>/session/create</c> on the worker. The session counts as that worker's load and each worker takes one,
-/// so further sessions route to or recruit other workers. The worker's <c>/lease</c> route then returns its
-/// HTTPS gateway address and a per-lease token.
-///
-/// Vast adds a full lifetime to a session's expiry on every request made with it, so renewal is conditional:
-/// only when the remaining time falls below half a lifetime. When the client stops renewing, the session
-/// expires, the worker revokes the token, and Vast scales the worker down.
-/// </summary>
+/// <summary><see cref="ICloudProvider"/> for Vast.ai Serverless endpoints running the Hartsy Vast worker image (github.com/HartsyAI/Vast-Worker-SwarmUI).
+/// A lease is a native Vast session, opened as Vast's client SDK does (<c>start_endpoint_session</c> in vastai/serverless/client/client.py): <c>/route/</c> returns a signed grant, then <c>/session/create</c> on the worker opens the session.
+/// A session counts as its worker's load and each worker takes one, so further sessions route to or recruit other workers. The worker's <c>/lease</c> route returns its HTTPS gateway address and a per-lease token.
+/// Every request made with a session adds a full lifetime to its expiry, so renewal happens only when less than half a lifetime remains. Once renewal stops the session expires, the worker revokes the token, and Vast scales the worker down.</summary>
 public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
 {
     /// <summary>Client for Vast's control plane (system trust store).</summary>
@@ -52,10 +42,8 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     /// <summary>The lease protocol this extension speaks.</summary>
     public const int RequiredProtocol = 2;
 
-    /// <summary>
-    /// Shortest session lifetime used, in seconds. Renewals happen at most every 15s and only once half a lifetime
-    /// (+15s) remains, so a shorter lifetime could lapse between renewals and cut off a running generation.
-    /// </summary>
+    /// <summary>Shortest session lifetime used, in seconds. Renewals happen at most every 15s and only once half a lifetime
+    /// (+15s) remains, so a shorter lifetime could lapse between renewals and cut off a running generation.</summary>
     public const int MinSessionLifetime = 60;
 
     /// <summary>Log prefix.</summary>
@@ -70,20 +58,18 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     /// <inheritdoc/>
     public string ProviderName => "Vast.ai";
 
-    // ── Leases ────────────────────────────────────────────────────────────────
-
     /// <inheritdoc/>
+    /// <remarks>Routes for a grant and opens a session on the routed worker, polling until one is available. <c>request_idx</c> holds the place in the engine's queue, so it is kept across retries and reset only when the routed worker is already full.
+    /// Before a session exists nothing is held, so cancelling just stops.</remarks>
     public async Task<CloudWorkerInfo> AcquireWorkerAsync(LeaseRequest request, CancellationToken cancel)
     {
         await ResolveEndpointKeyAsync(cancel);
         DateTime deadline = DateTime.UtcNow.AddSeconds(request.StartupTimeoutSec);
         int pollMs = Math.Clamp(request.PollIntervalMs, 1000, 15000);
-        // request_idx holds our place in the engine's queue; dropping it on a retry sends us to the back.
         int requestIdx = 0;
         string lastStatus = null;
         while (DateTime.UtcNow < deadline)
         {
-            // Before a session exists nothing is held for us, so withdrawing is just stopping.
             cancel.ThrowIfCancellationRequested();
             JObject grant = await RouteAsync(requestIdx, cancel);
             requestIdx = grant["request_idx"]?.Value<int>() ?? requestIdx;
@@ -103,7 +89,6 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
             JObject session = await CreateSessionAsync(workerUrl, grant, lifetime);
             if (session is null)
             {
-                // That worker already holds a session: ask the engine again, which routes elsewhere or recruits.
                 requestIdx = 0;
                 await Task.Delay(pollMs, cancel);
                 continue;
@@ -159,7 +144,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         return body;
     }
 
-    /// <summary>Calls the worker's /lease route through the session (which also extends the session by one lifetime).</summary>
+    /// <summary>Calls the worker's /lease route through the session, which also extends the session by one lifetime.</summary>
     async Task<JObject> LeaseCallAsync(string workerUrl, CloudWorkerInfo worker, CancellationToken cancel)
     {
         JObject envelope = new()
@@ -214,6 +199,8 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     }
 
     /// <inheritdoc/>
+    /// <remarks>A definite answer that the session or its grant is gone ends the lease at once, freeing its place. The check talks to the worker itself, so a network blip and a dead worker look alike:
+    /// one failure keeps the lease, since ending it would interrupt a healthy worker's generation and lease a replacement, and only <see cref="UnreachableChecksBeforeEnd"/> in a row end it.</remarks>
     public async Task<bool> IsLeaseActiveAsync(CloudWorkerInfo worker, CancellationToken cancel)
     {
         try
@@ -224,15 +211,11 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         }
         catch (VastApiException ex) when (ex.EndsSession)
         {
-            // A definite answer that the session or its grant is gone: end the lease now, so its place is freed.
             Logs.Debug($"{Tag} Session {worker.LeaseId} is no longer valid ({ex.Status}); treating the lease as ended.");
             return false;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.IO.IOException or VastApiException)
         {
-            // The check talks to the worker itself, so a network blip and a dead worker look alike. One failure keeps
-            // the lease (ending it would interrupt a healthy worker's generation and lease a replacement); only a run of
-            // them ends it.
             worker.FailedLeaseChecks++;
             bool gone = IsUnreachableForGood(worker.FailedLeaseChecks);
             Logs.Debug($"{Tag} Could not reach the worker for session {worker.LeaseId} ({ex.Message}); {(gone ? "treating the lease as ended" : $"keeping it (failure {worker.FailedLeaseChecks} of {UnreachableChecksBeforeEnd})")}.");
@@ -241,16 +224,14 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     }
 
     /// <inheritdoc/>
-    /// <remarks>Each renewal adds a whole lifetime, so it only happens once less than half a lifetime remains.
-    /// That keeps an in-use worker alive while bounding the paid tail after the last use to 1.5 lifetimes.</remarks>
+    /// <remarks>Each renewal adds a whole lifetime, so it only happens once less than half a lifetime remains, which keeps an in-use worker alive while bounding the paid tail after its last use to 1.5 lifetimes.
+    /// Only one renewal runs per worker at a time and the check is repeated under the lock, since concurrent callers that saw the old expiry would stack paid lifetimes onto an idle worker.</remarks>
     public async Task RenewLeaseAsync(CloudWorkerInfo worker, CancellationToken cancel)
     {
         if (!NeedsRenewal(worker.LeaseExpiration, worker.LeaseLifetime, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0))
         {
             return;
         }
-        // One renewal per worker at a time, re-checked inside: every /lease call adds a whole lifetime, so two
-        // concurrent callers that both saw the old expiry would stack paid lifetimes onto an idle worker.
         await worker.RenewLock.WaitAsync(cancel);
         try
         {
@@ -277,16 +258,15 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         return failedChecks >= UnreachableChecksBeforeEnd;
     }
 
-    /// <summary>
-    /// True once less than half a lifetime (plus a 15s margin for clock skew and the renewal's own round trip) is
-    /// left. Renewing any earlier would stack whole lifetimes onto the expiry and keep a worker billing after use.
-    /// </summary>
+    /// <summary>True once less than half a lifetime (plus a 15s margin for clock skew and the renewal's own round trip) is
+    /// left. Renewing any earlier would stack whole lifetimes onto the expiry and keep a worker billing after use.</summary>
     internal static bool NeedsRenewal(double expiration, double lifetime, double now)
     {
         return expiration - now <= lifetime / 2 + 15;
     }
 
     /// <inheritdoc/>
+    /// <remarks>Ending the session is bounded to 20s, since Stop, key changes and shutdown wait for it. An undelivered end only means the session expires on its own within one lifetime.</remarks>
     public async Task ReleaseLeaseAsync(CloudWorkerInfo worker)
     {
         if (Relays.TryRemove(worker.LeaseId ?? "", out VastTlsRelay relay))
@@ -300,14 +280,12 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         try
         {
             JObject body = new() { ["session_id"] = worker.LeaseId, ["session_auth"] = worker.SessionAuth };
-            // Bounded: Stop, key changes and shutdown wait for this, and an undelivered end only means the session expires on its own.
             using CancellationTokenSource timeout = Utilities.TimedCancel(TimeSpan.FromSeconds(20));
             using HttpResponseMessage response = await VastTls.Http.PostAsync($"{SessionUrl(worker)}/session/end", Json(body), timeout.Token);
             Logs.Debug($"{Tag} Ended session {worker.LeaseId} ({(int)response.StatusCode}).");
         }
         catch (Exception ex)
         {
-            // The session still expires on its own within one lifetime.
             Logs.Verbose($"{Tag} Ending session {worker.LeaseId} failed: {ex.Message}");
         }
     }
@@ -328,8 +306,6 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         }
         Relays.Clear();
     }
-
-    // ── Validation ────────────────────────────────────────────────────────────
 
     /// <inheritdoc/>
     public async Task ValidateAsync(CancellationToken cancel = default)
@@ -376,9 +352,7 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
         return new JObject { ["level"] = level, ["message"] = message };
     }
 
-    // ── Vast.ai routing and console API ───────────────────────────────────────
-
-    /// <summary>Asks the serverless engine for a worker. Returns the signed grant (empty while none is ready).</summary>
+    /// <summary>Asks the serverless engine for a worker. Returns the signed grant, which is empty while none is ready. Sends the key as the official client does, both as a Bearer token and a query parameter.</summary>
     async Task<JObject> RouteAsync(int requestIdx, CancellationToken cancel)
     {
         string key = EndpointApiKey ?? apiKey;
@@ -388,12 +362,10 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
             ["cost"] = SessionCost,
             ["api_key"] = key,
             ["request_idx"] = requestIdx,
-            // Matches the official client (vastai/serverless/client/endpoint.py Endpoint._route).
             ["replay_timeout"] = 60.0
         };
         using HttpResponseMessage response = await HttpRetry.SendAsync(Http, () =>
         {
-            // The official client also sends the key as a query parameter (client/connection.py _make_request).
             HttpRequestMessage request = new(HttpMethod.Post, $"{RouteBase}/route/?api_key={Uri.EscapeDataString(key)}") { Content = Json(payload) };
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
             return request;
@@ -406,11 +378,11 @@ public class VastAIProvider(string apiKey, string endpointName) : ICloudProvider
     }
 
     /// <inheritdoc/>
+    /// <remarks>Only the fields the dropdown needs are returned, since each entry also carries the endpoint's own API key.</remarks>
     public async Task<JArray> ListEndpointsAsync(CancellationToken cancel)
     {
         JToken result = await ConsoleApiAsync(HttpMethod.Get, "/api/v0/endptjobs/", cancel);
         JArray endpoints = [];
-        // Only the fields the dropdown needs: each entry also carries the endpoint's own API key.
         foreach (JObject endpoint in (result?["results"] as JArray ?? result as JArray ?? []).OfType<JObject>())
         {
             string name = endpoint["endpoint_name"]?.ToString();

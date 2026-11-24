@@ -5,12 +5,8 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// A <see cref="SwarmSwarmBackend"/> bound to the <see cref="ICloudBackend"/> that attached
-/// it. Core spawns the generating children of a swarm backend from the same type record as their
-/// parent, so every child in the tree inherits this ownership gate. Without it, core's own
-/// SwarmSwarmBackend would accept any user's generations on an instance billed to one user's key.
-/// </summary>
+/// <summary>A <see cref="SwarmSwarmBackend"/> bound to the <see cref="ICloudBackend"/> that attached it. Core spawns a swarm backend's generating children from the same type record as the parent,
+/// so the whole tree inherits this ownership gate; without it, core's SwarmSwarmBackend would accept any user's generations on an instance billed to one user's key.</summary>
 public class OwnerBoundSwarmBackend : SwarmSwarmBackend
 {
     /// <summary>The cloud backend (serverless or instance) this tree hangs off, through the control swarm's parent. Null if detached.</summary>
@@ -31,9 +27,7 @@ public class OwnerBoundSwarmBackend : SwarmSwarmBackend
     }
 
     /// <inheritdoc/>
-    /// <remarks>Core routes generations straight here, never to the cloud backend that owns the worker, so
-    /// this is the only place that can tell it work is happening. Serverless needs that to keep the worker
-    /// alive for as long as generations actually last.</remarks>
+    /// <remarks>Core routes generations straight here, never to the cloud backend that owns the worker, so this is the only place that can tell it work is happening and keep a serverless worker alive.</remarks>
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
         await (FindCloudRoot()?.OnChildGenerationStartingAsync(TopControl()) ?? Task.CompletedTask);

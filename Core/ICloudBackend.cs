@@ -3,12 +3,7 @@ using SwarmUI.Accounts;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// Common face of every cloud backend this extension manages, whichever of its two shapes it takes
-/// (<see cref="CloudBackendBase"/> for serverless workers, <see cref="CloudInstanceBackendBase"/> for
-/// rented instances). WebAPI routes that span "all cloud backends" query this one interface, so neither
-/// hierarchy can be silently missed.
-/// </summary>
+/// <summary>Common face of every cloud backend, serverless (<see cref="CloudBackendBase"/>) or rented instance (<see cref="CloudInstanceBackendBase"/>), so WebAPI routes that span all cloud backends cannot miss either hierarchy.</summary>
 public interface ICloudBackend
 {
     /// <summary>Human-readable provider name, or null before Init has built the provider.</summary>
@@ -26,12 +21,8 @@ public interface ICloudBackend
     /// <summary>Network-facing status summary of this backend for the CloudGetStatus route.</summary>
     JObject GetStatusNet();
 
-    /// <summary>
-    /// Called by an attached <see cref="OwnerBoundSwarmBackend"/> just before it generates, since core routes
-    /// generations to the child and this backend never sees them. Serverless uses it to keep the worker alive
-    /// for as long as work actually lasts; instances bill by the hour and do not care. Must never wake or rent
-    /// anything: it runs on a path the user did not explicitly ask to spend money on.
-    /// </summary>
+    /// <summary>Called by an attached <see cref="OwnerBoundSwarmBackend"/> just before it generates, since core routes generations to the child and this backend never sees them.
+    /// Serverless keeps the worker alive for as long as work lasts; instances bill by the hour and ignore it. Must never wake or rent anything, as it runs on a path the user did not explicitly ask to spend money on.</summary>
     /// <param name="control">The attached control swarm backend (the top of the subtree) whose worker is about to generate.</param>
     Task OnChildGenerationStartingAsync(SwarmUI.Backends.SwarmSwarmBackend control);
 }

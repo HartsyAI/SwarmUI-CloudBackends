@@ -26,14 +26,8 @@ public class LeaseRequest
     public int PollIntervalMs;
 }
 
-/// <summary>
-/// A serverless cloud GPU provider, as seen by <see cref="CloudBackendBase"/>. Implementations are per-instance,
-/// constructed with the owner's API key and the endpoint baked in.
-///
-/// Every worker is held by exactly one <b>lease</b>: a provider-native handle (a RunPod job, a Vast.ai session)
-/// that keeps that one worker assigned while it is in use and lets it go when it is not. Leases are what let
-/// the provider's own autoscaler see real demand and add workers.
-/// </summary>
+/// <summary>A serverless cloud GPU provider as seen by <see cref="CloudBackendBase"/>, built per backend with the owner's API key and the endpoint.
+/// Every worker is held by one lease, a provider-native handle (a RunPod job, a Vast.ai session) that keeps the worker assigned while in use and lets it go when idle, which is what lets the provider's autoscaler see real demand and add workers.</summary>
 public interface ICloudProvider : IDisposable
 {
     /// <summary>Most workers this provider can hold at once, whatever Max Workers says.</summary>
@@ -42,20 +36,14 @@ public interface ICloudProvider : IDisposable
     /// <summary>Human-readable provider name shown in logs and status responses.</summary>
     string ProviderName { get; }
 
-    /// <summary>
-    /// Leases a worker and returns once its gateway address and token are known. Cancelling <paramref name="cancel"/>
-    /// before a worker has been assigned withdraws the request so nothing is billed; once one has been assigned it
-    /// is returned anyway, because it is already being paid for and is useful capacity.
-    /// </summary>
+    /// <summary>Leases a worker and returns once its gateway address and token are known. Cancelling <paramref name="cancel"/> before a worker is assigned withdraws the request so nothing is billed;
+    /// once one is assigned it is returned anyway, since it is already being paid for.</summary>
     Task<CloudWorkerInfo> AcquireWorkerAsync(LeaseRequest request, CancellationToken cancel);
 
     /// <summary>True while the lease still holds its worker.</summary>
     Task<bool> IsLeaseActiveAsync(CloudWorkerInfo worker, CancellationToken cancel);
 
-    /// <summary>
-    /// Called while the worker is in use. Providers whose worker releases itself on idle (RunPod) do nothing;
-    /// providers whose lease has a client-side lifetime (Vast.ai) extend it only when it is close to running out.
-    /// </summary>
+    /// <summary>Called while the worker is in use. A provider whose worker releases itself on idle (RunPod) does nothing; one whose lease has a client-side lifetime (Vast.ai) extends it only when close to running out.</summary>
     Task RenewLeaseAsync(CloudWorkerInfo worker, CancellationToken cancel);
 
     /// <summary>Ends the lease now. Best-effort; never throws.</summary>
@@ -64,21 +52,15 @@ public interface ICloudProvider : IDisposable
     /// <summary>Cheap validation of credentials and endpoint, called at backend init. Throws readable errors.</summary>
     Task ValidateAsync(CancellationToken cancel = default) => Task.CompletedTask;
 
-    /// <summary>
-    /// Checks the endpoint's provider-side configuration against this backend's settings and returns findings,
-    /// each <c>{ "level": "error"|"warning", "message": ... }</c>. Empty means nothing to report.
-    /// </summary>
+    /// <summary>Checks the endpoint's provider-side configuration against this backend's settings and returns findings,
+    /// each <c>{ "level": "error"|"warning", "message": ... }</c>. Empty means nothing to report.</summary>
     Task<JArray> CheckEndpointAsync(LeaseRequest request, int maxWorkers, CancellationToken cancel) => Task.FromResult(new JArray());
 
-    /// <summary>
-    /// The account's serverless endpoints, for the card's endpoint dropdown: each <c>{ "id", "name", "image", "max_workers" }</c>,
-    /// where <c>id</c> is the value the EndpointId setting takes. Needs only the API key, not an endpoint.
-    /// </summary>
+    /// <summary>The account's serverless endpoints, for the card's endpoint dropdown: each <c>{ "id", "name", "image", "max_workers" }</c>,
+    /// where <c>id</c> is the value the EndpointId setting takes. Needs only the API key, not an endpoint.</summary>
     Task<JArray> ListEndpointsAsync(CancellationToken cancel) => Task.FromResult(new JArray());
 
-    /// <summary>
-    /// The URL this extension should use to reach a leased worker's gateway. Usually <see cref="CloudWorkerInfo.PublicUrl"/>;
-    /// Vast.ai returns a loopback relay that verifies Vast's own certificate authority.
-    /// </summary>
+    /// <summary>The URL this extension should use to reach a leased worker's gateway. Usually <see cref="CloudWorkerInfo.PublicUrl"/>;
+    /// Vast.ai returns a loopback relay that verifies Vast's own certificate authority.</summary>
     Task<string> GetConnectUrlAsync(CloudWorkerInfo worker) => Task.FromResult(worker.PublicUrl.TrimEnd('/'));
 }

@@ -8,13 +8,8 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// TLS to Vast.ai workers. Vast issues every instance a certificate signed by its own root CA
-/// ("Vast.ai Jupyter CA", https://console.vast.ai/static/jvastai_root.cer), which no system trust store
-/// carries. Vast's own SDK client trusts exactly that root and checks the hostname; this does the same.
-/// The root is embedded and pinned by fingerprint rather than downloaded, so a network attacker cannot
-/// substitute it.
-/// </summary>
+/// <summary>TLS to Vast.ai workers. Vast signs every instance's certificate with its own root CA ("Vast.ai Jupyter CA", https://console.vast.ai/static/jvastai_root.cer), which no system trust store carries,
+/// so, like Vast's own SDK client, this trusts exactly that root and checks the hostname. The root is embedded and pinned by fingerprint rather than downloaded, so a network attacker cannot substitute it.</summary>
 public static class VastTls
 {
     /// <summary>Vast.ai's root CA, as published at https://console.vast.ai/static/jvastai_root.cer.</summary>
@@ -60,6 +55,7 @@ public static class VastTls
     /// <summary>The pinned root, loaded once.</summary>
     public static readonly X509Certificate2 Root = LoadRoot();
 
+    /// <summary>Loads <see cref="RootPem"/>, refusing it if its fingerprint is not <see cref="RootSha256"/>.</summary>
     static X509Certificate2 LoadRoot()
     {
         X509Certificate2 cert = X509Certificate2.CreateFromPem(RootPem.Replace("\n        ", "\n"));
@@ -109,12 +105,8 @@ public static class VastTls
     };
 }
 
-/// <summary>
-/// A loopback listener that forwards every connection to one Vast.ai worker over TLS, verified by
-/// <see cref="VastTls.Validate"/>. Core's swarm backend only trusts the system certificate store, so it
-/// connects here in plain HTTP instead, and never leaves the machine unencrypted. It carries HTTP and
-/// WebSocket traffic alike, since it relays bytes after the TLS handshake.
-/// </summary>
+/// <summary>A loopback listener that forwards every connection to one Vast.ai worker over TLS verified by <see cref="VastTls.Validate"/>. Core's swarm backend only trusts the system certificate store,
+/// so it connects here in plain HTTP, and traffic never leaves the machine unencrypted. HTTP and WebSocket both work, since bytes are relayed after the TLS handshake.</summary>
 public sealed class VastTlsRelay : IAsyncDisposable
 {
     /// <summary>The worker's host (its public IP), also the name its certificate must match.</summary>
@@ -188,7 +180,6 @@ public sealed class VastTlsRelay : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // Relay shut down.
             }
             catch (Exception ex)
             {

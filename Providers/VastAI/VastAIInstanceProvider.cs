@@ -12,10 +12,10 @@ public class VastAIInstancePlan
     /// <summary>Existing Vast.ai instance ID to use. If blank, the provider finds or creates one by <see cref="Label"/>.</summary>
     public string InstanceId = "";
 
-    /// <summary>Port SwarmUI listens on inside the instance. Declared to Vast via a Docker -p flag in `env`.</summary>
+    /// <summary>Port SwarmUI listens on inside the instance, declared to Vast by a Docker -p flag in the create <c>env</c>.</summary>
     public int SwarmUIPort = 7801;
 
-    /// <summary>Instance ID remembered from a previous run, used as a reattach hint after live verification. Never blocks a fresh create when stale.</summary>
+    /// <summary>Instance ID remembered from a previous run, used as a reattach hint once verified live. A stale one never blocks a fresh create.</summary>
     public string PersistedId = "";
 
     /// <summary>Label given to instances this backend creates, and used to find one again so a restart reuses it.</summary>
@@ -23,6 +23,7 @@ public class VastAIInstancePlan
 
     /// <summary>Docker image to create the instance from (ignored when a template is set).</summary>
     public string Image = "";
+
     /// <summary>Vast.ai template to create the instance from, instead of an image.</summary>
     public string TemplateHashId = "";
 
@@ -31,49 +32,34 @@ public class VastAIInstancePlan
 
     /// <summary>Container disk for a created instance, in GB.</summary>
     public int DiskGb = 20;
+
     /// <summary>Existing network volume to attach, if any.</summary>
     public string NetworkVolumeId = "";
+
     /// <summary>Where the volume is mounted inside the instance.</summary>
     public string VolumeMountPath = "/workspace";
 
-    /// <summary>Extra environment variables, KEY=VALUE per line/comma. The SwarmUI port mapping is added automatically.</summary>
-    public string Env = "";
-
-    /// <summary>Gateway token for the instance's SwarmUI worker, injected as SWARMUI_WORKER_TOKEN when creating it.</summary>
+    /// <summary>Gateway token for the instance's SwarmUI worker, sent in its worker config when creating it.</summary>
     public string WorkerToken = "";
 
-    /// <summary>Reach the instance over HTTPS with Vast's instance certificate (the Hartsy Vast worker serves it).</summary>
+    /// <summary>Reach the instance over HTTPS with Vast's instance certificate, which the Hartsy Vast worker serves.</summary>
     public bool UseTls = true;
 
     /// <summary>If true, releasing an instance this card found or created (Stop, a failsafe, or shutdown) destroys it; if false it is only stopped, so it can resume. An instance named in <see cref="InstanceId"/> is the user's own and is only ever stopped.</summary>
     public bool DeleteOnStop = true;
 }
 
-/// <summary>
-/// <see cref="ICloudInstanceProvider"/> for Vast.ai rented instances, built on the console REST API at
-/// https://console.vast.ai. Verified against the official `vastai` Python SDK/CLI source
-/// (`vastai/api/instances.py`, `vastai/api/offers.py`, `vastai/api/storage.py`,
-/// `vastai/data/instance.py`), not just prose docs - see <see cref="StatusFromInstance"/>.
-///
-/// Unlike RunPod, Vast has no proxy domain: a port is reached at {public_ipaddr}:{mapped_external_port},
-/// and that external port is randomly assigned and only known after creation. Port
-/// exposure itself is declared inside the `env` dict as a Docker -p flag key ("-p {port}:{port}": "1"),
-/// not a structured ports field the way RunPod's create body has.
-///
-/// Wakeup flow:
-///   1. Resolve an instance: an explicit instance ID, else a previously created one found by label, else create one.
-///   2. Issue a start (harmless if it's already running).
-///   3. Poll until public_ipaddr and the mapped port are both present, which is when networking is real.
-///   4. Check the host forwards the port (else destroy a just-created instance and rent another machine), then confirm SwarmUI itself answers there.
-///
-/// Instances bill continuously while running, so there is no keepalive to hold; shutdown stops (or
-/// destroys) the instance instead.
-/// </summary>
+/// <summary><see cref="ICloudInstanceProvider"/> for Vast.ai rented instances, on the console REST API (https://console.vast.ai), checked against the official `vastai` Python SDK.
+/// Vast has no proxy domain: a port is reached at {public_ipaddr}:{mapped_external_port}, which is assigned randomly after creation, and a port is exposed by a Docker -p flag key in the create <c>env</c> ("-p {port}:{port}": "1") rather than a ports field.
+/// Starting resolves an instance (an explicit ID, else one found by label, else a new one on the cheapest matching offer), issues a start, waits for it to run with an IP and mapped port,
+/// checks that the host actually forwards the port (else destroys a just-created instance and rents another machine), then waits for SwarmUI itself.
+/// Instances bill while running, so there is no keepalive: releasing stops or destroys the instance.</summary>
 public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : ICloudInstanceProvider
 {
     /// <summary>Instance this provider is bound to. Resolved on first wake.</summary>
     public string ActiveInstanceId { get; private set; } = plan.InstanceId?.Trim() ?? "";
 
+    /// <inheritdoc/>
     public string ProviderName => "Vast.ai Instances";
 
     /// <summary>Shared HTTP plumbing, with Vast's well-known failure statuses mapped to actionable messages.</summary>
@@ -101,7 +87,8 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Machines whose hosts never forwarded the port, skipped when picking an offer.</summary>
     readonly HashSet<string> SkippedMachines = [];
 
-    /// <summary>Gets the instance's live status. Returns null if no instance has been resolved yet.</summary>
+    /// <inheritdoc/>
+    /// <remarks>Null until an instance has been resolved. Cached briefly unless <paramref name="forceRefresh"/> is set.</remarks>
     public async Task<CloudInstanceStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default)
     {
         if (string.IsNullOrWhiteSpace(ActiveInstanceId))
@@ -111,13 +98,8 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         return await StatusCache.GetAsync(forceRefresh, async () => StatusFromInstance(await GetInstanceAsync(ActiveInstanceId, cancel)), cancel);
     }
 
-    /// <summary>
-    /// Projects Vast's <c>GET /instances/{id}/</c> response into the provider-neutral status shape
-    /// (field names verified against the official `vastai` SDK's <c>vastai/data/instance.py</c>).
-    /// Vast has no documented status enum worth hardcoding against - the CLI prints `actual_status`
-    /// raw - so it stays opaque/display-only; readiness is gated on connectivity instead (an IP plus
-    /// the mapped port, then SwarmUI itself answering).
-    /// </summary>
+    /// <summary>Projects Vast's <c>GET /instances/{id}/</c> response into the provider-neutral status. The status word is display-only, since Vast documents no enum,
+    /// so readiness is gated on connectivity instead: an IP and mapped port, then SwarmUI answering. The port map is Docker-inspect shaped, <c>ports["7801/tcp"] = [{ "HostPort": "..." }]</c>.</summary>
     CloudInstanceStatus StatusFromInstance(JObject inst)
     {
         if (inst is null)
@@ -126,7 +108,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         string ip = inst["public_ipaddr"]?.ToString();
         int? mappedPort = null;
-        // Vast's port map is Docker-inspect shaped: ports["7801/tcp"] = [{ "HostIp": ..., "HostPort": "..." }, ...]
         if (inst["ports"] is JObject ports && ports[$"{plan.SwarmUIPort}/tcp"] is JArray bindings && bindings.Count > 0)
         {
             string hostPort = bindings[0]?["HostPort"]?.ToString();
@@ -143,20 +124,17 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             GpuCount = ((int?)inst["num_gpus"]) ?? 0,
             CostPerHour = ((double?)inst["dph_total"]) ?? 0,
             UptimeSeconds = (int)((((double?)inst["uptime_mins"]) ?? 0) * 60),
-            // Vast has no proxy domain, just {public_ipaddr}:{mapped_external_port}; the worker serves HTTPS with its Vast-signed certificate.
             PublicUrl = (!string.IsNullOrWhiteSpace(ip) && mappedPort is not null) ? $"{(plan.UseTls ? "https" : "http")}://{ip}:{mappedPort}" : null
         };
     }
 
-    // ── ICloudInstanceProvider ───────────────────────────────────────────────
-
+    /// <inheritdoc/>
     public async Task ValidateAsync(CancellationToken cancel = default)
     {
         if (string.IsNullOrWhiteSpace(ActiveInstanceId) && string.IsNullOrWhiteSpace(plan.Image) && string.IsNullOrWhiteSpace(plan.TemplateHashId))
         {
             throw new SwarmReadableErrorException("Set 'Image' or 'TemplateHashId' so an instance can be created, or set 'InstanceId' to use an existing instance.");
         }
-        // Same endpoint the existing Vast.ai Serverless provider already validates against successfully.
         await ApiAsync(HttpMethod.Get, "/api/v0/users/current/", null, cancel);
         if (!string.IsNullOrWhiteSpace(ActiveInstanceId) && await GetInstanceAsync(ActiveInstanceId, cancel) is null)
         {
@@ -164,6 +142,8 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>Tries up to <see cref="MaxHostAttempts"/> hosts: a created instance whose host never forwards the port is destroyed and another machine rented.</remarks>
     public async Task<CloudInstanceInfo> StartInstanceAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
     {
         for (int attempt = 1; ; attempt++)
@@ -177,15 +157,16 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
     }
 
-    /// <summary>Starts (creating if needed) and waits for the instance. Returns null if it rented an unreachable host and destroyed it, so the caller can try another.</summary>
+    /// <summary>Starts (creating if needed) and waits for the instance. Returns null if it rented an unreachable host and destroyed it, so the caller can try another.
+    /// The start is always issued, tolerating a 400 or 409 for an instance already running, since Vast publishes no list of allowed actions. A restarted instance reads "exited" until its host acts on the start, so that is fatal only after 90s.
+    /// The address is assigned while the image is still pulling, so it waits for "running". Some hosts map the port but never forward it; a port that never accepts a connection means the host, not the worker.
+    /// The mapped port answers before the container is listening, so SwarmUI itself is waited on last.</summary>
     async Task<CloudInstanceInfo> StartOnceAsync(int maxWaitSeconds, int pollIntervalMs, bool mayRedraw, CancellationToken cancel)
     {
         DateTime deadline = DateTime.UtcNow.AddSeconds(maxWaitSeconds);
         string instanceId = await ResolveInstanceAsync(cancel);
         JObject inst = await GetInstanceAsync(instanceId, cancel) ?? throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' no longer exists.");
         Logs.Info($"[VastAI Instances] Instance '{instanceId}' status={inst["actual_status"]}");
-        // Vast has no documented "illegal from this state" action list the way RunPod publishes
-        // actions[], so just always issue the start and tolerate a benign 4xx (already running).
         try
         {
             await ApiAsync(HttpMethod.Put, $"/api/v0/instances/{instanceId}/", new JObject { ["state"] = "running" }, cancel);
@@ -197,7 +178,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         int clampedPollMs = Math.Clamp(pollIntervalMs, 2000, 15000);
         CloudInstanceStatus liveStatus = null;
         string lastState = null;
-        // A restarted instance still reads "exited" until its host acts on the start request.
         DateTime stoppedIsFatalAfter = DateTime.UtcNow.AddSeconds(90);
         while (DateTime.UtcNow < deadline)
         {
@@ -206,7 +186,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             {
                 JObject polled = await GetInstanceAsync(instanceId, cancel);
                 liveStatus = StatusFromInstance(polled);
-                // Vast's own progress text (image pull, errors), which says far more than the status word.
                 string message = polled?["status_msg"]?.ToString()?.Trim();
                 string state = $"{liveStatus?.Status}{(string.IsNullOrWhiteSpace(message) ? "" : $": {message}")}";
                 if (state != lastState)
@@ -218,7 +197,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
                 {
                     throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' stopped while starting ({state}). Check the instance's logs in the Vast.ai console.");
                 }
-                // The address is assigned while the container is still loading (pulling the image), so wait for it to run.
                 if (liveStatus?.PublicUrl is not null && liveStatus.Status == "running")
                 {
                     Logs.Info($"[VastAI Instances] Instance '{instanceId}' is running at {liveStatus.PublicUrl}.");
@@ -239,8 +217,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         {
             throw new SwarmReadableErrorException($"Vast.ai instance '{instanceId}' was not running with public networking (an IP and a mapped port {plan.SwarmUIPort}) within {maxWaitSeconds}s{(lastState is null ? "" : $" (last: {lastState})")}.");
         }
-        // Some hosts map the port but never forward traffic to it. The worker's gateway listens within seconds of the
-        // container running, so a port that never accepts a connection means the host, not the worker.
         if (!await WaitForPortAsync(liveStatus.PublicUrl, Min(deadline, DateTime.UtcNow.AddSeconds(PortReachSeconds)), cancel))
         {
             string machineId = (await GetInstanceAsync(instanceId, cancel))?["machine_id"]?.ToString();
@@ -257,8 +233,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             ActiveInstanceId = "";
             return null;
         }
-        // Wait for SwarmUI itself, not just the port mapping: the mapped port answers as soon as the
-        // container's network namespace exists, well before whatever is inside it has started listening.
         await Api.WaitForSwarmAsync(liveStatus.PublicUrl, deadline, $"Check that SwarmUI is installed and listening on port {plan.SwarmUIPort}, and that '-p {plan.SwarmUIPort}:{plan.SwarmUIPort}' actually applied (some Vast templates strip extra docker options).", cancel, string.IsNullOrWhiteSpace(plan.WorkerToken) ? null : plan.WorkerToken, plan.UseTls ? VastTls.Http : null);
         Logs.Info($"[VastAI Instances] SwarmUI is up on instance '{instanceId}' at {liveStatus.PublicUrl}");
         return new CloudInstanceInfo
@@ -289,19 +263,17 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         return status?.CostPerHour;
     }
 
+    /// <inheritdoc/>
     public void Dispose() { }
 
-    // ── Instance lifecycle ────────────────────────────────────────────────────
-
-    /// <summary>Finds the instance to use: an explicit ID, else a previously created one by label, else creates one.</summary>
+    /// <summary>Finds the instance to use: an explicit ID, else a remembered one, else a previously created one by label, else creates one.
+    /// A remembered ID is only a hint, verified before use. Existing instances are reused so every restart does not leave another billing instance behind.</summary>
     async Task<string> ResolveInstanceAsync(CancellationToken cancel)
     {
         if (!string.IsNullOrWhiteSpace(ActiveInstanceId))
         {
             return ActiveInstanceId;
         }
-        // An instance remembered from a previous run is only a hint - verify it still exists before
-        // trusting it, so a stale memory can never block or misdirect a fresh create.
         if (!string.IsNullOrWhiteSpace(plan.PersistedId))
         {
             if (await GetInstanceAsync(plan.PersistedId, cancel) is not null)
@@ -312,7 +284,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             }
             Logs.Debug($"[VastAI Instances] Remembered instance '{plan.PersistedId}' is gone, ignoring it.");
         }
-        // Reuse before creating: otherwise every restart would leave another instance behind, billing.
         foreach (JObject row in await ListInstancesAsync(cancel))
         {
             if (string.Equals(row["label"]?.ToString(), plan.Label, StringComparison.OrdinalIgnoreCase))
@@ -327,31 +298,24 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         return ActiveInstanceId;
     }
 
-    /// <summary>Creates an instance from the configured offer (or the cheapest matching one if none is set).</summary>
+    /// <summary>Creates an instance on the cheapest matching offer, picked at create time since a specific offer is one machine's slot and goes stale within minutes.
+    /// Its env holds the worker config and the docker <c>-p</c> option that opens the port, since Vast's create has no ports field.
+    /// Without a template it sends <c>runtype: args</c> so the image's own entrypoint runs; Vast's default, "ssh", replaces it with an SSH server and the worker never starts.
+    /// The request is never cancelled once sent, since an instance Vast rents bills and losing its ID would leave it running.</summary>
     public async Task<string> CreateInstanceAsync(CancellationToken cancel = default)
     {
         string gpuName = plan.GpuName?.Trim() ?? "";
-        // A specific offer is one machine's slot and goes stale within minutes, so the cheapest one is picked at create time.
         JArray offers = await SearchOffersAsync(gpuName, gpuName.Length > 0 ? 0 : DefaultMinGpuRamMb, cancel);
         string offerId = offers.FirstOrDefault(o => !SkippedMachines.Contains(o["machine_id"]?.ToString() ?? ""))?["id"]?.ToString()
             ?? throw new SwarmReadableErrorException(gpuName.Length > 0
                 ? $"No Vast.ai machine with a {gpuName} is available to rent right now. Pick another GPU, or '(cheapest available)'."
                 : "No Vast.ai machine matched the default search (one GPU with at least 16 GB of VRAM). Pick a GPU from the list, or try again later.");
-        // Port exposure is a Docker -p flag encoded as an env dict key (Vast has no structured ports
-        // field on create), so it's merged into the same object as any user-supplied env vars.
-        JObject env = CloudApiClient.ParseEnv(plan.Env);
-        // The worker's gateway listens on this port, so it matches the port opened below.
-        env["SWARMUI_PUBLIC_PORT"] ??= $"{plan.SwarmUIPort}";
-        if (!string.IsNullOrWhiteSpace(plan.WorkerToken))
+        CloudWorkerConfig workerConfig = new(plan.WorkerToken, plan.SwarmUIPort, plan.VolumeMountPath);
+        JObject env = new()
         {
-            env["SWARMUI_WORKER_TOKEN"] = plan.WorkerToken;
-        }
-        // Tells the worker image where the volume (and so the models) is mounted.
-        if (env["VOLUME_PATH"] is null && !string.IsNullOrWhiteSpace(plan.VolumeMountPath))
-        {
-            env["VOLUME_PATH"] = plan.VolumeMountPath;
-        }
-        env[$"-p {plan.SwarmUIPort}:{plan.SwarmUIPort}"] = "1";
+            [CloudWorkerConfig.TransportKey] = workerConfig.Encode(),
+            [$"-p {plan.SwarmUIPort}:{plan.SwarmUIPort}"] = "1"
+        };
         JObject body = new()
         {
             ["client_id"] = "me",
@@ -364,10 +328,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         else if (!string.IsNullOrWhiteSpace(plan.Image))
         {
-            // Only without a template: the template carries its own image, as RunPod's template path does.
             body["image"] = plan.Image;
-            // Run the image's own entrypoint. Vast's default ('ssh', as in the vastai CLI) replaces it with an SSH server,
-            // so the worker never starts. A template sets its own launch mode, so it is only sent here, as the CLI does.
             body["runtype"] = "args";
         }
         if (!string.IsNullOrWhiteSpace(plan.Label))
@@ -385,7 +346,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         Logs.Info($"[VastAI Instances] Creating instance '{plan.Label}' from offer '{offerId}'...");
         cancel.ThrowIfCancellationRequested();
-        // Never cancelled once sent: an instance Vast rents bills, and losing its ID would leave it running unreleased.
         JObject created = await ApiAsync(HttpMethod.Put, $"/api/v0/asks/{offerId}/", body, CancellationToken.None) as JObject;
         if (created?["success"]?.Value<bool>() is not true)
         {
@@ -403,10 +363,9 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
     /// <summary>Least VRAM, in MB as Vast reports it, for '(cheapest available)': enough for a 16 GB card, which most models need.</summary>
     public const double DefaultMinGpuRamMb = 15000;
 
-    /// <summary>
-    /// Searches on-demand single-GPU offers, cheapest first, filtered to rentable/verified/non-external listings, and to
-    /// <paramref name="gpuName"/> and <paramref name="minGpuRamMb"/> when given. One GPU, since the worker uses only one.
-    /// </summary>
+    /// <summary>Searches on-demand single-GPU offers (the worker uses one), cheapest first, among rentable, verified, non-external listings, narrowed by <paramref name="gpuName"/> and <paramref name="minGpuRamMb"/> when given.
+    /// Hosts need <see cref="MinDirectPorts"/> direct ports, as Vast's own instance QA requires, since fewer usually means a proxy or VPN that never forwards the mapped port, and a CUDA 13 driver for images that need it.
+    /// Ordering and the GPU name are applied client-side: Vast's /bundles/ validation rejects the CLI's own order shape, and a filter it ignored must never rent the wrong GPU.</summary>
     public async Task<JArray> SearchOffersAsync(string gpuName = null, double minGpuRamMb = 0, CancellationToken cancel = default)
     {
         JObject query = new()
@@ -419,15 +378,10 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             ["rented"] = new JObject { ["eq"] = false },
             ["type"] = "on-demand",
             ["allocated_storage"] = Math.Max(1, plan.DiskGb),
-            // Vast's own instance QA requires 64 direct ports; hosts with fewer are often behind a proxy or VPN that never forwards the mapped port.
             ["direct_port_count"] = new JObject { ["gte"] = MinDirectPorts }
-            // No "order" field: Vast's current /bundles/ validation rejects the official CLI's own
-            // [[field, direction]] shape (confirmed live: "order.0/order.1: Input should be a valid
-            // tuple"), so cheapest-first is done client-side below instead of depending on that contract.
         };
         if (string.IsNullOrWhiteSpace(plan.TemplateHashId) && CloudBackendTypes.NeedsCuda13(plan.Image))
         {
-            // Hosts whose driver cannot load the backend's kernels would rent fine and then never start it.
             query["cuda_max_good"] = new JObject { ["gte"] = 13.0 };
         }
         if (!string.IsNullOrWhiteSpace(gpuName))
@@ -440,16 +394,12 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         JObject resp = await ApiAsync(HttpMethod.Post, "/api/v0/bundles/", query, cancel) as JObject;
         JArray offers = resp?["offers"] as JArray ?? [];
-        // Checked here too, so a filter the search ignored can never rent the wrong GPU.
         return [.. offers.Where(o => string.IsNullOrWhiteSpace(gpuName) || string.Equals(o["gpu_name"]?.ToString(), gpuName, StringComparison.OrdinalIgnoreCase))
             .OrderBy(o => ((double?)o["dph_total"]) ?? double.MaxValue)];
     }
 
-    /// <summary>
-    /// Gathers everything the settings form needs to offer real choices: the GPU models on offer (with their lowest price),
-    /// the account's instances, templates and network volumes. Each part degrades to empty rather than failing the whole
-    /// call, matching RunPodPodsProvider.ListAccountOptionsAsync.
-    /// </summary>
+    /// <summary>Gathers what the settings form offers as choices: GPU models on offer with their lowest price, the account's instances, templates and network volumes.
+    /// A part that fails comes back empty, so one unavailable list does not blank the form. Some API keys may not list volumes, which only leaves that dropdown empty.</summary>
     public async Task<JObject> ListAccountOptionsAsync(CancellationToken cancel = default)
     {
         JArray gpus = [];
@@ -476,7 +426,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         catch (CloudApiException ex) when (ex.Status is 401 or 403)
         {
-            // Some Vast.ai API keys are not allowed to list volumes; that only leaves the volume dropdown empty.
             Logs.Debug($"[VastAI Instances] This API key cannot list network volumes ({ex.Status}); the volume list stays empty.");
         }
         catch (Exception ex)
@@ -520,7 +469,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         };
     }
 
-    /// <summary>One entry per GPU model in <paramref name="offers"/> (sorted cheapest first): its name, VRAM in GB, lowest price per hour and how many machines offer it.</summary>
+    /// <summary>One entry per GPU model in <paramref name="offers"/>: its name, VRAM in GB (Vast reports MB), lowest price per hour and how many machines offer it.</summary>
     internal static JArray GroupOffersByGpu(JArray offers)
     {
         JArray gpus = [];
@@ -529,7 +478,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
             gpus.Add(new JObject
             {
                 ["name"] = group.Key,
-                // Vast reports gpu_ram in MB (confirmed against the official CLI's own display conversion).
                 ["gpu_ram"] = Math.Round((group.Max(o => (double?)o["gpu_ram"]) ?? 0) / 1000),
                 ["min_price"] = group.Min(o => (double?)o["dph_total"]),
                 ["offers"] = group.Count()
@@ -538,7 +486,7 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         return gpus;
     }
 
-    /// <summary>The account's own templates (Vast's template search also returns public ones, so it is filtered to this user).</summary>
+    /// <summary>The account's own templates. Vast's template search also returns public ones, so the result is filtered to this user.</summary>
     public async Task<JArray> ListOwnTemplatesAsync(CancellationToken cancel = default)
     {
         string userId = (await ApiAsync(HttpMethod.Get, "/api/v0/users/current/", null, cancel))?["id"]?.ToString();
@@ -567,18 +515,15 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         return templates;
     }
 
-    /// <summary>Lists the account's instances (one page - plenty for a personal account's find-by-label use).</summary>
+    /// <summary>Lists the account's instances, one page, which is plenty for finding one by label. The v1 endpoint takes its filters as JSON-encoded query parameters, not a body.</summary>
     public async Task<JArray> ListInstancesAsync(CancellationToken cancel = default)
     {
-        // The v1 list endpoint takes its filters as JSON-encoded query PARAMETERS, not a POST body -
-        // confirmed against the official SDK's client.get("/api/v1/instances/", query_args=params).
         string selectFilters = Uri.EscapeDataString(new JObject().ToString(Newtonsoft.Json.Formatting.None));
         string orderBy = Uri.EscapeDataString(new JArray(new JObject { ["col"] = "id", ["dir"] = "asc" }).ToString(Newtonsoft.Json.Formatting.None));
         JToken resp = await ApiAsync(HttpMethod.Get, $"/api/v1/instances/?select_filters={selectFilters}&order_by={orderBy}&limit=50", null, cancel);
         return [.. (resp?["instances"] as JArray ?? []).OfType<JObject>()];
     }
 
-    /// <summary>Gets an instance by ID, or null if it does not exist.</summary>
     /// <summary>Waits until the address accepts a TCP connection, or refuses one (which still proves packets reach the container). False if it only timed out until <paramref name="until"/>.</summary>
     internal static async Task<bool> WaitForPortAsync(string publicUrl, DateTime until, CancellationToken cancel)
     {
@@ -617,13 +562,14 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         return a < b ? a : b;
     }
 
+    /// <summary>Gets an instance by ID, or null if it does not exist.</summary>
     public async Task<JObject> GetInstanceAsync(string id, CancellationToken cancel = default)
     {
         JToken resp = await ApiAsync(HttpMethod.Get, $"/api/v0/instances/{id}/?owner=me", null, cancel, allowNotFound: true);
         return resp?["instances"] as JObject;
     }
 
-    /// <summary>Stops the instance, releasing compute but keeping its disk so it can be started again.</summary>
+    /// <summary>Stops the instance, releasing compute but keeping its disk so it can be started again. A 400 or 409 means it is already stopped; anything else propagates, so a failed stop is reported as possibly still billing.</summary>
     public async Task StopInstanceRawAsync(CancellationToken cancel = default)
     {
         if (string.IsNullOrWhiteSpace(ActiveInstanceId))
@@ -637,7 +583,6 @@ public class VastAIInstanceProvider(string apiKey, VastAIInstancePlan plan) : IC
         }
         catch (CloudApiException ex) when (ex.Status is 400 or 409)
         {
-            // Already stopped. Anything else propagates, so a failed stop is reported as possibly still billing.
             Logs.Verbose($"[VastAI Instances] Instance '{ActiveInstanceId}' stop returned {ex.Status}: {ex.Detail}");
         }
     }

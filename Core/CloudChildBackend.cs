@@ -3,20 +3,14 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Core;
 
-/// <summary>
-/// Attach/detach for the <see cref="OwnerBoundSwarmBackend"/> that a cloud backend hands its remote URL to.
-/// Both cloud shapes use this: instances attach for as long as the instance is rented, serverless attaches
-/// only while a woken worker is alive. The settings below are load-bearing rather than stylistic, so they
-/// live in one place instead of being restated (and drifting) per call site.
-/// </summary>
+/// <summary>Attaches and detaches the <see cref="OwnerBoundSwarmBackend"/> that a cloud backend hands its remote URL to: instances for as long as they are rented, serverless only while a woken worker is alive.
+/// The settings are load-bearing rather than stylistic, so they live here instead of at each call site.</summary>
 internal static class CloudChildBackend
 {
-    /// <summary>
-    /// Hands <paramref name="address"/> to a swarm backend as a non-real child. That child is a control
-    /// instance in its own right: it mirrors the remote's backends, models and features, and spawns its own
-    /// children which perform generation. It is an <see cref="OwnerBoundSwarmBackend"/> rather than core's
-    /// plain SwarmSwarmBackend so the whole tree refuses generations from anyone but the owner.
-    /// </summary>
+    /// <summary>Hands <paramref name="address"/> to a swarm backend as a non-real child: a control instance that mirrors the remote's backends, models and features and spawns its own generating children.
+    /// It is an <see cref="OwnerBoundSwarmBackend"/> rather than core's SwarmSwarmBackend so the whole tree refuses generations from anyone but the owner.
+    /// <c>AllowIdle</c> keeps re-polling the worker's backend list and lets a brief network blip recover as IDLE rather than ERRORED.
+    /// Core never assigns the parent of a nonreal backend, which the ownership walk relies on, so it is set here.</summary>
     /// <param name="owner">The cloud backend the child hangs off.</param>
     /// <param name="address">The worker's SwarmUI (gateway) address.</param>
     /// <param name="title">Display title for the child.</param>
@@ -28,7 +22,6 @@ internal static class CloudChildBackend
         SwarmSwarmBackend.SwarmSwarmBackendSettings settings = new()
         {
             Address = address,
-            // Keeps re-polling the worker's backend list, and lets a brief network blip recover (IDLE, not ERRORED).
             AllowIdle = true,
             AllowForwarding = false,
             AllowWebsocket = true,
@@ -41,7 +34,6 @@ internal static class CloudChildBackend
             swarm.IsSpecialControlled = true;
             swarm.CanLoadModels = false;
             swarm.Title = title;
-            // Core never assigns the parent of a nonreal backend; OwnerBoundSwarmBackend's ownership walk relies on it.
             newData.AbstractParent = owner.BackendData;
             newData.UpdateLastReleaseTime();
         });

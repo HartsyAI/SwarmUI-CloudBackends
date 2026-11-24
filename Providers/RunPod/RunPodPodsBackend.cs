@@ -8,13 +8,7 @@ using SwarmUI.Utils;
 
 namespace Hartsy.Extensions.CloudBackends.Providers.RunPod;
 
-/// <summary>
-/// SwarmUI backend for RunPod on-demand GPU pods.
-///
-/// This backend only drives RunPod's API to get a pod running with SwarmUI on it. Everything after
-/// that is core Swarm: <see cref="CloudInstanceBackendBase"/> attaches a SwarmSwarmBackend to the
-/// pod's URL, and that handles models, sessions and generation.
-/// </summary>
+/// <summary>Backend for RunPod on-demand GPU pods. It only gets a pod running with SwarmUI on it; <see cref="CloudInstanceBackendBase"/> then attaches to the pod's URL as a Swarm backend, which handles models, sessions and generation.</summary>
 public class RunPodPodsBackend : CloudInstanceBackendBase
 {
     /// <summary>Settings copied in from the card's RunPod GPU Pods section; the card's <see cref="CloudBackendsBackend.Settings"/> documents them.</summary>
@@ -62,18 +56,18 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
         /// <summary>Data center for created pods, used only without a network volume.</summary>
         public string DataCenterId = "";
 
-        /// <summary>Extra KEY=VALUE environment variables, one per line.</summary>
-        public string PodEnv = "";
-
-        /// <summary>SWARMUI_WORKER_TOKEN of a pod the user created, or blank to let this backend make one.</summary>
+        /// <summary>Worker token of a pod the user created, or blank to let this backend make one.</summary>
         [ValueIsSecret]
         public string WorkerToken = "";
     }
 
+    /// <inheritdoc/>
     public override InstanceSettings InstanceConfig => (Settings)SettingsRaw;
 
+    /// <summary>This backend's settings, typed.</summary>
     Settings PodConfig => (Settings)SettingsRaw;
 
+    /// <inheritdoc/>
     protected override ICloudInstanceProvider CreateProvider(string apiKey)
     {
         Settings config = PodConfig;
@@ -93,12 +87,12 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
             NetworkVolumeId = config.NetworkVolumeId?.Trim() ?? "",
             CloudType = config.CloudType,
             DataCenterId = config.DataCenterId?.Trim() ?? "",
-            Env = config.PodEnv ?? "",
             WorkerToken = WorkerToken ?? "",
             DeleteOnStop = config.DeleteOnStop
         });
     }
 
+    /// <inheritdoc/>
     protected override string GetApiKey(User user)
     {
         string key = user?.GetGenericData("runpod_api", "key")?.Trim();
@@ -109,6 +103,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
         return key;
     }
 
+    /// <inheritdoc/>
     public override void CheckPermission(Session session)
     {
         if (session?.User is null)
@@ -121,6 +116,7 @@ public class RunPodPodsBackend : CloudInstanceBackendBase
         }
     }
 
+    /// <inheritdoc/>
     protected override void CheckRequiredConfig()
     {
         Settings config = PodConfig;

@@ -12,10 +12,10 @@ public class RunPodPodPlan
     /// <summary>Existing pod ID to use. If blank, the provider finds or creates one by <see cref="PodName"/>.</summary>
     public string PodId = "";
 
-    /// <summary>Port SwarmUI listens on inside the pod. Declared as an http port so RunPod's proxy fronts it.</summary>
+    /// <summary>Port SwarmUI listens on inside the pod, exposed as http so RunPod's proxy fronts it.</summary>
     public int SwarmUIPort = 7801;
 
-    /// <summary>Pod ID remembered from a previous run, used as a reattach hint after live verification. Never blocks a fresh create when stale.</summary>
+    /// <summary>Pod ID remembered from a previous run, used as a reattach hint once verified live. A stale one never blocks a fresh create.</summary>
     public string PersistedId = "";
 
     /// <summary>Name given to created pods, and used to find one again so restarts do not pile up pods.</summary>
@@ -23,50 +23,45 @@ public class RunPodPodPlan
 
     /// <summary>Docker image to create the pod from (ignored when a template is set).</summary>
     public string ImageName = "";
+
     /// <summary>GPU type to create the pod with, or empty for cheapest available.</summary>
     public string GpuTypeId = "";
+
     /// <summary>GPUs per created pod.</summary>
     public int GpuCount = 1;
+
     /// <summary>Container disk for a created pod, in GB.</summary>
     public int ContainerDiskGb = 50;
+
     /// <summary>Pod volume in GB when no network volume is attached.</summary>
     public int VolumeGb = 0;
+
     /// <summary>Where the volume is mounted inside the pod.</summary>
     public string VolumeMountPath = "/workspace";
+
     /// <summary>Network volume to attach, if any.</summary>
     public string NetworkVolumeId = "";
+
     /// <summary>RunPod cloud to create the pod in: SECURE or COMMUNITY.</summary>
     public string CloudType = "SECURE";
+
     /// <summary>Data center to create the pod in, or empty to let RunPod choose.</summary>
     public string DataCenterId = "";
+
     /// <summary>RunPod template to create the pod from, instead of an image.</summary>
     public string TemplateId = "";
-    /// <summary>Extra environment variables for a created pod, as KEY=VALUE lines.</summary>
-    public string Env = "";
 
-    /// <summary>Gateway token for the pod's SwarmUI worker, injected as SWARMUI_WORKER_TOKEN when creating it.</summary>
+    /// <summary>Gateway token for the pod's SwarmUI worker, sent in its worker config when creating it.</summary>
     public string WorkerToken = "";
 
     /// <summary>If true, releasing a pod this card found or created (Stop, a failsafe, or shutdown) terminates it; if false it is only stopped, so it can resume. A pod named in <see cref="PodId"/> is the user's own and is only ever stopped.</summary>
     public bool DeleteOnStop = true;
 }
 
-/// <summary>
-/// <see cref="ICloudProvider"/> for RunPod on-demand GPU pods, built on REST API v2 at
-/// https://api.runpod.io/v2.
-///
-/// v2 is the current API: REST v1 (rest.runpod.io/v1) is deprecated and retires 2026-11-15, and the
-/// GraphQL API retires in early 2027, so neither is a safe target for new code.
-///
-/// Wakeup flow:
-///   1. Resolve a pod: an explicit pod ID, else a previously created pod found by name, else create one.
-///   2. If the pod is not RUNNING, trigger the start action.
-///   3. Poll until status is RUNNING with live runtime, which is when its networking is real.
-///   4. Build https://{podId}-{port}.proxy.runpod.net and open a SwarmUI session on it.
-///
-/// Pods bill continuously while running, so there is no keepalive to hold; shutdown stops (or
-/// terminates) the pod instead.
-/// </summary>
+/// <summary><see cref="ICloudInstanceProvider"/> for RunPod on-demand GPU pods, on REST API v2 (https://api.runpod.io/v2). REST v1 retires 2026-11-15 and GraphQL in early 2027.
+/// Starting resolves a pod (an explicit ID, else one found by name, else a new one), starts it if needed, waits for it to be RUNNING with live runtime,
+/// then waits for SwarmUI on its proxy URL, https://{podId}-{port}.proxy.runpod.net.
+/// Pods bill while running, so there is no keepalive: releasing stops or terminates the pod.</summary>
 public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInstanceProvider
 {
     /// <summary>Statuses a pod never leaves on its own.</summary>
@@ -78,6 +73,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Pod this provider is bound to. Resolved on first wake.</summary>
     public string ActiveInstanceId { get; private set; } = plan.PodId?.Trim() ?? "";
 
+    /// <inheritdoc/>
     public string ProviderName => "RunPod GPU Pods";
 
     /// <summary>Shared HTTP plumbing, with RunPod's well-known failure statuses mapped to actionable messages.</summary>
@@ -93,11 +89,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>Short-lived cache of the pod's status.</summary>
     readonly CloudStatusCache StatusCache = new();
 
-    /// <summary>
-    /// Gets the pod's live status (state, GPU, cost/hr, uptime, allowed actions). Returns null if no pod
-    /// has been resolved yet (nothing created or bound via PodId). Cached briefly unless <paramref
-    /// name="forceRefresh"/> is set, e.g. right after a Start/Stop action.
-    /// </summary>
+    /// <inheritdoc/>
+    /// <remarks>Null until a pod has been resolved. Cached briefly unless <paramref name="forceRefresh"/> is set.</remarks>
     public async Task<CloudInstanceStatus> GetStatusAsync(bool forceRefresh = false, CancellationToken cancel = default)
     {
         if (string.IsNullOrWhiteSpace(ActiveInstanceId))
@@ -107,7 +100,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return await StatusCache.GetAsync(forceRefresh, async () => StatusFromPod(await GetPodAsync(ActiveInstanceId, cancel)), cancel);
     }
 
-    /// <summary>Projects RunPod's <c>GET /pods/{id}</c> response (see https://docs.runpod.io/api-reference-v2/pods/get-a-pod) into the provider-neutral status shape.</summary>
+    /// <summary>Projects RunPod's <c>GET /pods/{id}</c> response (https://docs.runpod.io/api-reference-v2/pods/get-a-pod) into the provider-neutral status.
+    /// RunPod sends "gpu" and "runtime" as JSON null before provisioning, and a null JValue still throws on <c>?[...]</c>, so they are cast instead.</summary>
     CloudInstanceStatus StatusFromPod(JObject pod)
     {
         if (pod is null)
@@ -118,20 +112,16 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         {
             InstanceId = ActiveInstanceId,
             Status = pod["status"]?.ToString() ?? "UNKNOWN",
-            // RunPod sends these as JSON null (not omitted) before the pod finishes provisioning a GPU/
-            // runtime - a JValue holding null still throws on `?[...]`, so cast rather than chain ?.
             GpuName = (pod["gpu"] as JObject)?["id"]?.ToString(),
             GpuCount = (pod["gpu"] as JObject)?["count"]?.Value<int>() ?? 0,
             CostPerHour = pod["cost"]?.Value<double>() ?? 0,
             UptimeSeconds = (pod["runtime"] as JObject)?["uptime"]?.Value<int>() ?? 0,
             AllowedActions = [.. (pod["actions"] as JArray ?? []).Select(a => a.ToString())],
-            // The API never returns a proxy URL; it is constructed from the pod id and the internal port.
             PublicUrl = $"https://{ActiveInstanceId}-{plan.SwarmUIPort}.proxy.runpod.net"
         };
     }
 
-    // ── ICloudProvider ────────────────────────────────────────────────────────
-
+    /// <inheritdoc/>
     public async Task ValidateAsync(CancellationToken cancel = default)
     {
         if (string.IsNullOrWhiteSpace(ActiveInstanceId) && string.IsNullOrWhiteSpace(plan.ImageName) && string.IsNullOrWhiteSpace(plan.TemplateId))
@@ -145,6 +135,7 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         }
     }
 
+    /// <inheritdoc/>
     public Task<CloudInstanceInfo> StartInstanceAsync(int maxWaitSeconds, int pollIntervalMs, CancellationToken cancel = default)
     {
         return StartOrConnectAsync(maxWaitSeconds, pollIntervalMs, mayStart: true, cancel);
@@ -156,7 +147,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return string.IsNullOrWhiteSpace(ActiveInstanceId) ? null : await StartOrConnectAsync(maxWaitSeconds, pollIntervalMs, mayStart: false, cancel);
     }
 
-    /// <summary>Resolves (or creates) the pod, starts it if <paramref name="mayStart"/>, then waits for its SwarmUI. Without <paramref name="mayStart"/> it only waits.</summary>
+    /// <summary>Resolves (or creates) the pod, starts it if <paramref name="mayStart"/>, then waits for its SwarmUI. Without <paramref name="mayStart"/> it only waits.
+    /// A live runtime is the readiness gate for the pod itself (it is null until RUNNING), but the proxy answers 502 while the container boots, so SwarmUI is waited on too.</summary>
     async Task<CloudInstanceInfo> StartOrConnectAsync(int maxWaitSeconds, int pollIntervalMs, bool mayStart, CancellationToken cancel)
     {
         DateTime deadline = DateTime.UtcNow.AddSeconds(maxWaitSeconds);
@@ -172,7 +164,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         {
             throw new SwarmReadableErrorException($"RunPod pod '{podId}' is {status}. Press Start to resume it, or Stop to release it.");
         }
-        // v2 publishes the currently-legal transitions per pod, so ask rather than assume.
         if (!status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
         {
             if (mayStart && PodAllows(pod, "start"))
@@ -197,7 +188,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 {
                     throw new SwarmReadableErrorException($"RunPod pod '{podId}' entered state {status} while starting. Check the pod's logs in the RunPod console.");
                 }
-                // runtime is null until the pod is actually RUNNING, so it is the honest readiness gate.
                 if (status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase)
                     && pod["runtime"] is JObject runtime && (runtime["uptime"]?.Value<int>() ?? 0) > 0)
                 {
@@ -224,13 +214,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         {
             throw new SwarmReadableErrorException($"RunPod pod '{podId}' did not reach a running state within {maxWaitSeconds}s.");
         }
-        // The API never returns a proxy URL; it is constructed from the pod id and the internal port.
         string publicUrl = $"https://{podId}-{plan.SwarmUIPort}.proxy.runpod.net";
-        // Wait for SwarmUI itself, not just the pod: the proxy answers 502 while the container boots,
-        // and handing an unready URL to the Swarm backend would just make it fail its own connect.
         await Api.WaitForSwarmAsync(publicUrl, deadline, $"Check that the pod runs the Hartsy RunPod worker image and that port {plan.SwarmUIPort} is exposed as http.", cancel, NullIfEmpty(plan.WorkerToken));
-        // Cast, don't chain ?.: RunPod sends "gpu" as JSON null (not omitted) in early pod states, and a
-        // JValue holding null still throws on `?[...]` (only a C#-null JToken reference short-circuits).
         string gpu = (pod?["gpu"] as JObject)?["id"]?.ToString();
         int gpuCount = (pod?["gpu"] as JObject)?["count"]?.Value<int>() ?? plan.GpuCount;
         Logs.Info($"[RunPodPods] SwarmUI is up on pod '{podId}' at {publicUrl}");
@@ -245,7 +230,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
     /// <summary>True if RunPod reports the pod with a GPU count of zero, as happens when a stopped pod resumes after its GPU was rented out.</summary>
     internal static bool IsRunningWithoutGpu(JObject pod)
     {
-        // "gpu" is JSON null in early states; only a reported count of 0 counts.
         return pod["gpu"] is JObject gpu && gpu["count"] is JValue count && count.Type == JTokenType.Integer && count.Value<int>() == 0;
     }
 
@@ -288,23 +272,18 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return StatusFromPod(pod);
     }
 
-    /// <summary>
-    /// True for a pod that still exists, whatever its state: running, still starting (SwarmUI can exit mid-start), or stopped since (from the
-    /// RunPod console, or by the pod itself). The card holds it until Stop or a failsafe releases it, so a stopped pod is still terminated.
-    /// </summary>
+    /// <summary>True for a pod that still exists, whatever its state: running, still starting (SwarmUI can exit mid-start), or stopped since (from the
+    /// RunPod console, or by the pod itself). The card holds it until Stop or a failsafe releases it, so a stopped pod is still terminated.</summary>
     internal static bool IsAdoptable(JObject pod)
     {
         return pod is not null && !string.Equals(pod["status"]?.ToString(), "TERMINATED", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <inheritdoc/>
     public void Dispose() { }
 
-    // ── Pod lifecycle ─────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// True if an existing pod runs the configured image (or no image is configured, or it cannot be told). A pod left from
-    /// before the image was changed is not reused: it is left as it is, since removing it is the owner's call.
-    /// </summary>
+    /// <summary>True if an existing pod runs the configured image (or no image is configured, or it cannot be told). A pod left from
+    /// before the image was changed is not reused: it is left as it is, since removing it is the owner's call.</summary>
     bool RunsConfiguredImage(JObject pod)
     {
         string podImage = (pod["image"] ?? pod["imageName"])?.ToString();
@@ -317,15 +296,14 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return false;
     }
 
-    /// <summary>Finds the pod to use: an explicit ID, else a previously created pod by name, else creates one.</summary>
+    /// <summary>Finds the pod to use: an explicit ID, else a remembered one, else a previously created pod by name, else creates one.
+    /// A remembered ID is only a hint, verified before use. Existing pods are reused so every restart does not leave another billing pod behind.</summary>
     async Task<string> ResolvePodAsync(CancellationToken cancel)
     {
         if (!string.IsNullOrWhiteSpace(ActiveInstanceId))
         {
             return ActiveInstanceId;
         }
-        // A pod remembered from a previous run is only a hint - verify it still exists and is not
-        // terminal before trusting it, so a stale memory can never block or misdirect a fresh create.
         if (!string.IsNullOrWhiteSpace(plan.PersistedId))
         {
             JObject remembered = await GetPodAsync(plan.PersistedId, cancel);
@@ -337,7 +315,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             }
             Logs.Debug($"[RunPodPods] Remembered pod '{plan.PersistedId}' is gone or terminal, ignoring it.");
         }
-        // Reuse before creating: otherwise every restart would leave another pod behind, billing.
         foreach (JToken t in await ListPodsAsync(cancel))
         {
             if (t is JObject p && string.Equals(p["name"]?.ToString(), plan.PodName, StringComparison.OrdinalIgnoreCase)
@@ -352,15 +329,12 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return ActiveInstanceId;
     }
 
-    /// <summary>
-    /// Creates a pod. v2 places exactly one GPU type per call with no server-side fallback, so this
-    /// follows RunPod's documented read-then-create pattern: order candidates from the catalog, then
-    /// try them until one is accepted.
-    /// </summary>
+    /// <summary>Creates a pod. v2 places one GPU type per call with no server-side fallback, so this orders candidates from the catalog and tries them until one is accepted.
+    /// A network volume pins the data center. A 400 or 403 moves to the next candidate (it can mean no capacity or a bad request), and the last reason is reported if all fail.
+    /// The request is never cancelled once sent, since a pod RunPod creates bills and losing its ID would leave it running.</summary>
     public async Task<string> CreatePodAsync(CancellationToken cancel = default)
     {
         string dataCenterId = plan.DataCenterId;
-        // A network volume can only attach to a pod in its own data center, so let the volume decide.
         if (!string.IsNullOrWhiteSpace(plan.NetworkVolumeId))
         {
             string volumeDc = await LookupVolumeDataCenterAsync(plan.NetworkVolumeId, cancel);
@@ -382,7 +356,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             try
             {
                 cancel.ThrowIfCancellationRequested();
-                // Never cancelled once sent: a pod RunPod creates bills, and losing its ID would leave it running unreleased.
                 JObject created = await ApiAsync(HttpMethod.Post, "/pods", body, CancellationToken.None) as JObject;
                 string id = created?["id"]?.ToString();
                 if (string.IsNullOrWhiteSpace(id))
@@ -394,8 +367,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             }
             catch (CloudApiException ex) when (ex.Status == 400 || ex.Status == 403)
             {
-                // 400 covers both a bad request and no capacity, so move to the next candidate; if every
-                // candidate fails the same way, the last detail is reported as the likely real cause.
                 lastDetail = ex.Detail;
                 Logs.Debug($"[RunPodPods] '{gpuId}' unavailable or rejected ({ex.Status}): {ex.Detail}");
             }
@@ -403,7 +374,9 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         throw new SwarmReadableErrorException($"Could not create a RunPod pod on any candidate GPU ({string.Join(", ", candidates)}). Last reason: {lastDetail ?? "unknown"}. If this repeats for every GPU it usually means the request itself is wrong rather than capacity being short.");
     }
 
-    /// <summary>Builds the create body. Only known v2 fields are sent, since the API rejects unknown ones.</summary>
+    /// <summary>Builds the create body. Only known v2 fields are sent, since the API rejects unknown ones.
+    /// A CUDA 13 image sets <c>minCudaVersion</c> on the gpu object (a top-level field is rejected) so the pod cannot land on a host whose driver cannot load the backend's kernels.
+    /// The worker config tells the worker its token, where the volume (and so the models) is mounted, and the port its gateway listens on. It is the pod's only env entry.</summary>
     JObject BuildCreateBody(string gpuTypeId, string dataCenterId)
     {
         JObject body = new()
@@ -411,7 +384,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             ["name"] = plan.PodName,
             ["cloud"] = string.IsNullOrWhiteSpace(plan.CloudType) ? "SECURE" : plan.CloudType.ToUpperFast(),
             ["disk"] = Math.Max(1, plan.ContainerDiskGb),
-            // SwarmUI's port must be http for RunPod's proxy to route to it.
             ["ports"] = new JArray($"{plan.SwarmUIPort}/http", "22/tcp"),
             ["gpu"] = new JObject { ["id"] = gpuTypeId, ["count"] = Math.Max(1, plan.GpuCount) }
         };
@@ -424,8 +396,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             body["image"] = plan.ImageName;
             if (CloudBackendTypes.NeedsCuda13(plan.ImageName))
             {
-                // Without this the pod can land on a host whose driver cannot load the backend's kernels. The v2 API
-                // takes it on the gpu object (a top-level field is rejected as an unknown property).
                 ((JObject)body["gpu"])["minCudaVersion"] = "13.0";
             }
         }
@@ -447,29 +417,13 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                 ["persistent"] = new JObject { ["size"] = Math.Max(10, plan.VolumeGb), ["path"] = plan.VolumeMountPath }
             };
         }
-        JObject env = CloudApiClient.ParseEnv(plan.Env);
-        if (!string.IsNullOrWhiteSpace(plan.WorkerToken))
-        {
-            env["SWARMUI_WORKER_TOKEN"] = plan.WorkerToken;
-        }
-        // Tells the worker image where the volume (and so the models) is mounted.
-        if (env["VOLUME_PATH"] is null && !string.IsNullOrWhiteSpace(plan.VolumeMountPath))
-        {
-            env["VOLUME_PATH"] = plan.VolumeMountPath;
-        }
-        // The worker's gateway listens on this port, so it matches the port exposed above.
-        env["SWARMUI_PUBLIC_PORT"] ??= $"{plan.SwarmUIPort}";
-        if (env.HasValues)
-        {
-            body["env"] = env;
-        }
+        CloudWorkerConfig workerConfig = new(plan.WorkerToken, plan.SwarmUIPort, plan.VolumeMountPath);
+        body["env"] = new JObject { [CloudWorkerConfig.TransportKey] = workerConfig.Encode() };
         return body;
     }
 
-    /// <summary>
-    /// GPU types to attempt, in order. An explicit choice is used alone; otherwise the catalog is asked
-    /// for types that are actually available for pods (in <paramref name="dataCenterId"/>, when the pod is pinned to one), cheapest first.
-    /// </summary>
+    /// <summary>GPU types to attempt, in order. An explicit choice is used alone; otherwise the catalog is asked
+    /// for types that are actually available for pods (in <paramref name="dataCenterId"/>, when the pod is pinned to one), cheapest first.</summary>
     public async Task<List<string>> GpuCandidatesAsync(string dataCenterId, CancellationToken cancel = default)
     {
         if (!string.IsNullOrWhiteSpace(plan.GpuTypeId))
@@ -488,10 +442,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return ordered;
     }
 
-    /// <summary>
-    /// The five cheapest GPU types in a catalog listing that are available, and when <paramref name="dataCenterId"/> is set,
-    /// available in that data center. A pinned pod (a network volume pins it) can only be placed there, so GPUs elsewhere would only be refused.
-    /// </summary>
+    /// <summary>The five cheapest GPU types in a catalog listing that are available, and when <paramref name="dataCenterId"/> is set,
+    /// available in that data center. A pinned pod (a network volume pins it) can only be placed there, so GPUs elsewhere would only be refused.</summary>
     internal static List<string> OrderGpuCandidates(JArray gpus, string cloud, string dataCenterId)
     {
         List<(string Id, double Price)> usable = [];
@@ -520,12 +472,8 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         return [.. usable.OrderBy(g => g.Price).Select(g => g.Id).Take(5)];
     }
 
-    /// <summary>
-    /// Gathers everything the settings form needs to offer real choices: GPU types that are actually
-    /// available for pods right now with their hourly price, the account's network volumes and
-    /// templates, and the data centers. Individual sections degrade to empty rather than failing the
-    /// whole call, so one unavailable catalog does not blank the entire form.
-    /// </summary>
+    /// <summary>Gathers what the settings form offers as choices: available GPU types with hourly price (cheapest first), pods, network volumes, pod-capable templates and data centers.
+    /// A section that fails comes back empty, so one unavailable catalog does not blank the form. A volume's data center is read from v2's 'dataCenter' or v1's 'dataCenterId'.</summary>
     public async Task<JObject> ListAccountOptionsAsync(string cloud, CancellationToken cancel = default)
     {
         JArray gpus = [];
@@ -557,7 +505,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                     ["data_centers"] = new JArray((gpu["dataCenters"] as JArray ?? []).Select(d => d["id"]?.ToString()).Where(d => d is not null))
                 });
             }
-            // Cheapest first is the order someone renting a GPU actually wants to scan.
             gpus = new JArray(found.OrderBy(g => g["price_per_hr"]?.Value<double>() ?? double.MaxValue));
         }
         catch (Exception ex)
@@ -579,7 +526,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
                     ["id"] = v["id"]?.ToString(),
                     ["name"] = v["name"]?.ToString(),
                     ["size_gb"] = v["size"]?.Value<int>(),
-                    // v2 names this 'dataCenter'; v1 used 'dataCenterId'. Accept either.
                     ["data_center"] = (v["dataCenter"] ?? v["dataCenterId"])?.ToString()
                 });
             }
@@ -594,7 +540,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             JToken tpls = await ApiAsync(HttpMethod.Get, "/templates", null, cancel);
             foreach (JToken t in tpls?["templates"] as JArray ?? tpls as JArray ?? [])
             {
-                // Serverless templates can't create a pod, so they would only clutter the list.
                 if (t is not JObject tpl || (tpl["serverless"] ?? tpl["isServerless"])?.Type == JTokenType.Boolean && (tpl["serverless"] ?? tpl["isServerless"]).Value<bool>())
                 {
                     continue;
@@ -672,7 +617,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
             {
                 if (t is JObject v && string.Equals(v["id"]?.ToString(), volumeId, StringComparison.OrdinalIgnoreCase))
                 {
-                    // v2 names this 'dataCenter'; v1 used 'dataCenterId'. Accept either.
                     return (v["dataCenter"] ?? v["dataCenterId"])?.ToString();
                 }
             }
@@ -749,7 +693,6 @@ public class RunPodPodsProvider(string apiKey, RunPodPodPlan plan) : ICloudInsta
         foreach (JObject pod in (await ListPodsAsync(cancel)).OfType<JObject>())
         {
             string name = pod["name"]?.ToString() ?? "";
-            // REST API v2 field names, the same ones StatusFromPod and ListAccountOptionsAsync read.
             string status = pod["status"]?.ToString() ?? "";
             if ((name.StartsWith(ManagedNamePrefix, StringComparison.OrdinalIgnoreCase) || knownIds.Contains(pod["id"]?.ToString() ?? "")) && status.Equals("RUNNING", StringComparison.OrdinalIgnoreCase))
             {
